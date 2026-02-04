@@ -1,0 +1,84 @@
+# ============================================================================
+# ThoughtFlow Ruff Configuration
+# https://docs.astral.sh/ruff/
+# ============================================================================
+
+# Target Python 3.9+
+target-version = "py39"
+
+# Line length matches Black default
+line-length = 88
+
+# Exclude common non-source directories
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+    ".mypy_cache",
+    ".ruff_cache",
+    "site",
+]
+
+[lint]
+# Enable recommended rule sets
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate (commented-out code)
+    "PL",     # Pylint
+    "RUF",    # Ruff-specific rules
+]
+
+# Ignore specific rules
+ignore = [
+    "E501",    # Line too long (handled by formatter)
+    "PLR0913", # Too many arguments
+    "PLR2004", # Magic value comparison
+]
+
+# Allow autofix for all enabled rules
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.per-file-ignores]
+# Tests can use assert and have unused arguments (fixtures)
+"tests/**/*.py" = ["S101", "ARG001", "PLR2004"]
+# __init__.py files often have unused imports for re-exporting
+"__init__.py" = ["F401"]
+
+[lint.isort]
+known-first-party = ["thoughtflow"]
+force-single-line = false
+lines-after-imports = 2
+
+[format]
+# Use double quotes for strings
+quote-style = "double"
+
+# Indent with spaces
+indent-style = "space"
+
+# Respect magic trailing commas
+skip-magic-trailing-comma = false
+
+# Unix-style line endings
+line-ending = "lf"
+
+# Format docstrings
+docstring-code-format = true
