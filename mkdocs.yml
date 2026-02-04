@@ -1,0 +1,88 @@
+# ============================================================================
+# ThoughtFlow Documentation Configuration
+# https://www.mkdocs.org/
+# ============================================================================
+
+site_name: ThoughtFlow
+site_description: A minimal, explicit, Pythonic substrate for LLM and agent systems
+site_author: James A. Rolfsen
+site_url: https://thoughtflow.dev
+
+repo_name: jrolf/thoughtflow
+repo_url: https://github.com/jrolf/thoughtflow
+edit_uri: edit/main/docs/
+
+copyright: Copyright &copy; 2025 James A. Rolfsen
+
+theme:
+  name: material
+  palette:
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quick Start: quickstart.md
+  - Concepts:
+    - Agent: concepts/agent.md
+    - Adapters: concepts/adapters.md
+    - Tools: concepts/tools.md
+    - Memory: concepts/memory.md
+    - Tracing: concepts/tracing.md
+  - API Reference: api/
+  - Contributing: contributing.md
+  - Changelog: changelog.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: true
+            show_root_heading: true
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/jrolf/thoughtflow
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/thoughtflow/

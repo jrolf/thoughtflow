@@ -1,0 +1,144 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "thoughtflow"
+version = "0.1.0"
+description = "A minimal, explicit, Pythonic substrate for building reproducible, portable, testable LLM and agent systems."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "James A. Rolfsen", email = "james@think.dev" }
+]
+maintainers = [
+    { name = "James A. Rolfsen", email = "james@think.dev" }
+]
+keywords = [
+    "llm",
+    "agents",
+    "ai",
+    "orchestration",
+    "openai",
+    "anthropic",
+    "langchain-alternative",
+    "machine-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# Core has ZERO dependencies - stdlib only
+dependencies = []
+
+[project.optional-dependencies]
+# Provider adapters (optional)
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.18"]
+local = ["ollama>=0.1"]
+all-providers = [
+    "thoughtflow[openai]",
+    "thoughtflow[anthropic]",
+    "thoughtflow[local]",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+    "mypy>=1.0",
+    "pre-commit>=3.0",
+]
+
+# Documentation
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.0",
+    "mkdocstrings[python]>=0.24",
+]
+
+# Everything
+all = [
+    "thoughtflow[all-providers]",
+    "thoughtflow[dev]",
+    "thoughtflow[docs]",
+]
+
+[project.urls]
+Homepage = "https://github.com/jrolf/thoughtflow"
+Documentation = "https://thoughtflow.dev"
+Repository = "https://github.com/jrolf/thoughtflow"
+Issues = "https://github.com/jrolf/thoughtflow/issues"
+Changelog = "https://github.com/jrolf/thoughtflow/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/thoughtflow"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
+
+# ============================================================================
+# Tool Configurations
+# ============================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.coverage.run]
+source = ["src/thoughtflow"]
+branch = true
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+show_error_codes = true
+files = ["src/thoughtflow"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
