@@ -161,3 +161,10 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .DS_Store
+
+# ============================================================================
+# Human-AI Pair Programming Context
+# ============================================================================
+# This folder contains reference materials, notes, and files used to provide
+# context during AI-assisted development sessions. Not part of the codebase.
+.context/
