@@ -2,317 +2,388 @@
 
 This guide explains how to write effective tests for ThoughtFlow.
 
+**Important**: All tests use only Python standard library for test logic. The only external dependency is `pytest` itself. No additional test frameworks or external imports are required.
+
 ---
 
-## Test Structure
+## Test Docstring Requirements
+
+Every test in ThoughtFlow **must** have a docstring that explains:
+
+1. **WHAT** - What behavior is being tested
+2. **WHY** - Why this test exists (what breaks if this fails)
+3. **REMOVAL** - When this test should be removed
+
+### Template
+
+```python
+def test_example():
+    """
+    [WHAT] Brief description of behavior being tested.
+    
+    [WHY] This test exists because... (explain the importance)
+    
+    [REMOVAL] Remove this test if/when... (future guidance)
+    """
+```
+
+### Examples
+
+```python
+def test_stamps_are_chronologically_sortable(self):
+    """
+    EventStamp IDs must be sortable alphabetically such that 
+    alphabetical order equals chronological order.
+    
+    This is a CRITICAL invariant that enables efficient event ordering
+    without decoding timestamps. Database indexes depend on this property.
+    
+    Remove this test if: We change the stamp format (breaking change).
+    """
+
+def test_memory_rehydrates_from_events(self):
+    """
+    MEMORY must be fully reconstructable from its event list.
+    
+    This is the core event-sourcing invariant that enables:
+    - Cloud sync (send events, rebuild state)
+    - Debugging (replay exact state)
+    - Portability (serialize/deserialize)
+    
+    Remove this test if: We abandon event-sourcing architecture.
+    """
+
+def test_thought_is_callable(self):
+    """
+    THOUGHT must support: mem = thought(mem)
+    
+    This callable interface is the CORE contract of the class.
+    All agent workflows depend on this pattern.
+    
+    Remove this test if: We change the THOUGHT interface (major version).
+    """
+```
+
+---
+
+## Test File Structure
 
 ### File Naming
 
 ```
 tests/
 ├── unit/
-│   └── test_<module_name>.py
+│   └── test_<module_name>.py    # e.g., test_memory.py, test_thought.py
 └── integration/
-    └── test_<adapter>_adapter.py
+    └── test_<provider>_*.py     # e.g., test_llm_providers.py
 ```
 
 ### Test Organization
 
+Group tests by behavior using test classes:
+
 ```python
-# tests/unit/test_agent.py
+# tests/unit/test_memory.py
 
-class TestAgent:
-    """Tests for the Agent class."""
+class TestMemoryInitialization:
+    """Tests for MEMORY initialization and setup."""
 
-    def test_something(self):
-        """Agent should do something."""
+    def test_creates_unique_id(self, memory):
+        """Each MEMORY must have a unique ID..."""
         pass
 
-class TestTracedAgent:
-    """Tests for the TracedAgent wrapper."""
+    def test_starts_with_empty_state(self, memory):
+        """New MEMORY instances must start empty..."""
+        pass
 
-    def test_something_else(self):
-        """TracedAgent should do something else."""
+
+class TestMessageOperations:
+    """Tests for message-related MEMORY operations."""
+
+    def test_add_msg_stores_message(self, memory):
+        """add_msg must store retrievable messages..."""
+        pass
+
+
+class TestSerialization:
+    """Tests for MEMORY serialization/deserialization."""
+
+    def test_snapshot_captures_state(self, memory):
+        """snapshot must capture complete state..."""
         pass
 ```
 
 ---
 
-## Anatomy of a Test
+## Test Naming Convention
 
+Format: `test_<what>_<condition>_<expected_behavior>`
+
+**Good names:**
 ```python
-def test_message_to_dict_includes_role_and_content(self) -> None:
-    """Message.to_dict() should return dict with role and content."""
-    # Arrange - Set up test data
-    msg = Message(role="user", content="Hello!")
-
-    # Act - Perform the action
-    result = msg.to_dict()
-
-    # Assert - Verify the result
-    assert result == {"role": "user", "content": "Hello!"}
+def test_memory_add_msg_with_invalid_role_raises_error(self):
+def test_thought_retry_with_parse_failure_includes_repair_prompt(self):
+def test_action_execution_with_error_logs_to_memory(self):
+def test_stamps_generated_concurrently_are_unique(self):
 ```
 
-### Test Naming
-
-Format: `test_<what>_<condition>_<expected>`
-
-Good names:
-```python
-def test_agent_call_with_empty_messages_raises_error(self):
-def test_message_from_dict_handles_optional_fields(self):
-def test_session_add_event_increments_count(self):
-```
-
-Bad names:
+**Bad names:**
 ```python
 def test_1(self):
-def test_agent(self):
+def test_memory(self):
 def test_it_works(self):
+def test_happy_path(self):
 ```
 
 ---
 
-## Using Fixtures
+## Testing ThoughtFlow Primitives
 
-Fixtures provide reusable test data and setup.
+### Testing MEMORY
 
-### Built-in Fixtures
-
-From `tests/conftest.py`:
+Use the `memory` fixture for fresh instances:
 
 ```python
-def test_with_sample_messages(self, sample_messages):
-    """Use the sample_messages fixture."""
-    assert len(sample_messages) == 2
-    assert sample_messages[0]["role"] == "system"
-
-def test_with_mock_adapter(self, mock_adapter):
-    """Use the mock_adapter fixture."""
-    agent = Agent(mock_adapter)
-    # mock_adapter.calls tracks all calls made
+def test_variable_history_preserved(self, memory):
+    """
+    set_var must append to history, not overwrite.
+    
+    This enables audit trails and undo operations.
+    
+    Remove this test if: We implement hard overwrites.
+    """
+    memory.set_var('x', 1)
+    memory.set_var('x', 2)
+    memory.set_var('x', 3)
+    
+    history = memory.get_var_history('x')
+    values = [h[1] for h in history]
+    
+    assert values == [1, 2, 3]
 ```
 
-### Creating Fixtures
+### Testing THOUGHT (with MockLLM)
+
+Always use `MockLLM` for unit tests - never make real API calls:
 
 ```python
-# tests/conftest.py
-
-@pytest.fixture
-def sample_tool():
-    """Create a sample tool for testing."""
-    class SampleTool(Tool):
-        name = "sample"
-        description = "A sample tool"
-
-        def call(self, payload, params=None):
-            return ToolResult.ok(output="result")
-
-    return SampleTool()
-
-@pytest.fixture
-def empty_registry():
-    """Create an empty tool registry."""
-    return ToolRegistry()
+def test_thought_stores_result_in_output_var(self, mock_llm, memory):
+    """
+    THOUGHT must store the LLM result in output_var when specified.
+    
+    This enables accessing results via memory.get_var().
+    
+    Remove this test if: We change output storage mechanism.
+    """
+    llm = mock_llm(responses=["Hello, I'm the LLM!"])
+    thought = THOUGHT(
+        name="test",
+        llm=llm,
+        prompt="Hello",
+        output_var="greeting",
+    )
+    
+    thought(memory)
+    
+    assert memory.get_var("greeting") == "Hello, I'm the LLM!"
 ```
 
-### Fixture Scope
+### Testing THOUGHT Retry Logic
 
 ```python
-@pytest.fixture(scope="function")  # Default: new instance per test
-def per_test_fixture():
-    return SomeObject()
+def test_retry_on_parse_failure(self, mock_llm, memory):
+    """
+    THOUGHT must retry when parsing fails.
+    
+    LLMs sometimes produce invalid output that needs correction.
+    
+    Remove this test if: We remove retry logic.
+    """
+    # First response is invalid, second is valid
+    llm = mock_llm(responses=[
+        "Not valid JSON",
+        '{"value": 42}',
+    ])
+    thought = THOUGHT(
+        name="test",
+        llm=llm,
+        prompt="Give me JSON",
+        output_var="result",
+        parse='json',
+        max_retries=2,
+    )
+    
+    thought(memory)
+    
+    assert llm.call_count == 2
+    assert memory.get_var("result") == {"value": 42}
+```
 
-@pytest.fixture(scope="class")  # Shared within test class
-def per_class_fixture():
-    return SomeObject()
+### Testing ACTION
 
-@pytest.fixture(scope="module")  # Shared within module
-def per_module_fixture():
-    return SomeObject()
+```python
+def test_action_logs_execution(self, memory):
+    """
+    ACTION must log its execution to memory.
+    
+    Logs enable debugging and audit trails.
+    
+    Remove this test if: We remove execution logging.
+    """
+    action = ACTION(name="test_action", fn=lambda: "ok")
+    action(memory)
+    
+    logs = memory.get_logs()
+    log_content = ' '.join(l['content'] for l in logs)
+    
+    assert 'test_action' in log_content.lower() or len(logs) > 0
+```
 
-@pytest.fixture(scope="session")  # Shared across all tests
-def per_session_fixture():
-    return SomeObject()
+---
+
+## Mock LLM Usage Patterns
+
+### Basic Mock
+
+```python
+def test_basic_call(self, mock_llm, memory):
+    llm = mock_llm(responses=["Response"])
+    # Use llm...
+```
+
+### Multiple Responses (for retry testing)
+
+```python
+def test_retry_scenario(self, mock_llm, memory):
+    llm = mock_llm(responses=[
+        "Invalid first response",
+        '{"valid": true}',  # Will be used on retry
+    ])
+```
+
+### Verifying Call Arguments
+
+```python
+def test_prompt_sent_correctly(self, mock_llm, memory):
+    llm = mock_llm(responses=["Response"])
+    thought = THOUGHT(name="t", llm=llm, prompt="My prompt")
+    
+    thought(memory)
+    
+    # Verify what was sent to the LLM
+    last_call = llm.calls[-1]
+    msgs = last_call['msgs']
+    assert any('My prompt' in str(m.get('content', '')) for m in msgs)
+```
+
+### Checking Call Count
+
+```python
+def test_no_llm_call_for_memory_query(self, mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(
+        name="query",
+        operation="memory_query",
+        query_vars=['x'],
+        llm=llm,  # Provided but shouldn't be used
+    )
+    
+    thought(memory)
+    
+    assert llm.call_count == 0  # Should not have called LLM
 ```
 
 ---
 
 ## Testing Patterns
 
-### Testing Return Values
+### Arrange-Act-Assert
 
 ```python
-def test_message_user_creates_user_message(self):
-    """Message.user() should create a user message."""
-    msg = Message.user("Hello!")
-
-    assert msg.role == "user"
-    assert msg.content == "Hello!"
+def test_message_to_dict(self, memory):
+    """Message retrieval should return proper dict format."""
+    # Arrange - Set up test data
+    memory.add_msg('user', 'Hello!', channel='webapp')
+    
+    # Act - Perform the action
+    msgs = memory.get_msgs()
+    
+    # Assert - Verify the result
+    assert msgs[0]['role'] == 'user'
+    assert msgs[0]['content'] == 'Hello!'
 ```
 
 ### Testing Exceptions
 
 ```python
-def test_registry_get_unknown_raises_keyerror(self):
-    """ToolRegistry.get() should raise KeyError for unknown tools."""
-    registry = ToolRegistry()
-
-    with pytest.raises(KeyError) as exc_info:
-        registry.get("nonexistent")
-
-    assert "nonexistent" in str(exc_info.value)
+def test_invalid_role_raises_error(self, memory):
+    """
+    add_msg must reject invalid roles.
+    
+    This prevents issues with LLM APIs that expect specific roles.
+    
+    Remove this test if: We remove role validation.
+    """
+    with pytest.raises(ValueError, match="Invalid role"):
+        memory.add_msg('invalid_role', 'Content', channel='webapp')
 ```
 
 ### Testing Side Effects
 
 ```python
-def test_session_add_event_appends_to_list(self):
-    """Session.add_event() should append to events list."""
-    session = Session()
-    event = Event(event_type=EventType.CALL_START)
-
-    session.add_event(event)
-
-    assert len(session.events) == 1
-    assert session.events[0] is event
-```
-
-### Testing with Mocks
-
-```python
-def test_agent_calls_adapter(self, mock_adapter, sample_messages):
-    """Agent.call() should invoke the adapter."""
-    agent = Agent(mock_adapter)
-
-    # This will raise NotImplementedError in placeholder
-    # Once implemented:
-    # result = agent.call(sample_messages)
-    # assert len(mock_adapter.calls) == 1
-    # assert mock_adapter.calls[0]["messages"] == sample_messages
-    pass
+def test_action_increments_exec_count(self, memory):
+    """
+    ACTION must track execution count.
+    
+    This enables monitoring and rate limiting.
+    
+    Remove this test if: We remove execution tracking.
+    """
+    action = ACTION(name="counter", fn=lambda: "ok")
+    
+    assert action.exec_count == 0
+    action(memory)
+    assert action.exec_count == 1
+    action(memory)
+    assert action.exec_count == 2
 ```
 
 ---
 
 ## Parameterized Tests
 
-Test multiple inputs with one test:
+Test multiple inputs efficiently:
 
 ```python
-@pytest.mark.parametrize("role", ["system", "user", "assistant", "tool"])
-def test_message_accepts_valid_roles(self, role):
-    """Message should accept all valid roles."""
-    msg = Message(role=role, content="test")
-    assert msg.role == role
+@pytest.mark.parametrize("role", ["user", "assistant", "system"])
+def test_accepts_valid_roles(self, memory, role):
+    """MEMORY should accept all valid message roles."""
+    memory.add_msg(role, "content", channel="webapp")
+    assert memory.get_msgs()[0]['role'] == role
 
-@pytest.mark.parametrize("input,expected", [
-    ("hello", "HELLO"),
-    ("World", "WORLD"),
-    ("", ""),
-    ("123", "123"),
+@pytest.mark.parametrize("parse_mode,input_text,expected", [
+    ('text', 'Hello', 'Hello'),
+    ('json', '{"x": 1}', {'x': 1}),
+    ('list', '[1, 2, 3]', [1, 2, 3]),
 ])
-def test_uppercase_variations(self, input, expected):
-    """Test uppercase with various inputs."""
-    assert input.upper() == expected
-```
-
-### Complex Parameters
-
-```python
-@pytest.mark.parametrize("messages,expected_count", [
-    ([], 0),
-    ([{"role": "user", "content": "hi"}], 1),
-    ([{"role": "system", "content": "..."}, {"role": "user", "content": "hi"}], 2),
-])
-def test_message_list_length(self, messages, expected_count):
-    """Test with various message lists."""
-    assert len(messages) == expected_count
-```
-
----
-
-## Testing Async Code
-
-```python
-import pytest
-
-@pytest.mark.asyncio
-async def test_async_complete(self):
-    """Test async completion method."""
-    adapter = MockAsyncAdapter()
-
-    result = await adapter.complete_async(messages)
-
-    assert result.content == "response"
-```
-
-Requires `pytest-asyncio`:
-```bash
-pip install pytest-asyncio
-```
-
----
-
-## Testing Private Methods
-
-**Don't test private methods directly.** Test through the public API.
-
-```python
-# Don't do this:
-def test_internal_helper(self):
-    agent = Agent(adapter)
-    result = agent._internal_helper()  # Testing private method
-
-# Do this instead:
-def test_public_method_uses_helper_correctly(self):
-    agent = Agent(adapter)
-    result = agent.call(messages)  # Test through public API
-    # Assert the overall behavior is correct
-```
-
----
-
-## Test Organization Tips
-
-### Group Related Tests
-
-```python
-class TestMessageCreation:
-    """Tests for creating Message objects."""
-
-    def test_create_with_role_and_content(self): ...
-    def test_create_with_optional_name(self): ...
-    def test_create_with_metadata(self): ...
-
-
-class TestMessageSerialization:
-    """Tests for Message serialization."""
-
-    def test_to_dict_basic(self): ...
-    def test_to_dict_with_all_fields(self): ...
-    def test_from_dict_basic(self): ...
-```
-
-### Use Descriptive Docstrings
-
-```python
-def test_session_save_creates_json_file(self, tmp_path):
-    """
-    Session.save() should create a JSON file at the specified path
-    containing all session data including events and metadata.
-    """
-    pass
+def test_parse_modes(self, mock_llm, memory, parse_mode, input_text, expected):
+    """THOUGHT should parse different formats correctly."""
+    llm = mock_llm(responses=[input_text])
+    thought = THOUGHT(name="t", llm=llm, prompt="", output_var="r", parse=parse_mode)
+    thought(memory)
+    assert memory.get_var("r") == expected
 ```
 
 ---
 
 ## Integration Tests
 
+Integration tests require real API keys and are skipped by default.
+
 ### Setup
 
 ```python
-# tests/integration/test_openai_adapter.py
+# tests/integration/test_llm_providers.py
 
 import os
 import pytest
@@ -321,43 +392,87 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         os.getenv("THOUGHTFLOW_INTEGRATION_TESTS") != "1",
-        reason="Integration tests disabled",
-    ),
-    pytest.mark.skipif(
-        not os.getenv("OPENAI_API_KEY"),
-        reason="OPENAI_API_KEY not set",
+        reason="Integration tests disabled. Set THOUGHTFLOW_INTEGRATION_TESTS=1",
     ),
 ]
+
+@pytest.mark.skipif(
+    not os.getenv("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set",
+)
+class TestOpenAIIntegration:
+    def test_basic_completion(self):
+        """
+        Verify LLM can make a real OpenAI API call.
+        
+        This validates HTTP request formatting and response parsing.
+        
+        Remove this test if: OpenAI changes their API significantly.
+        """
+        llm = LLM(model="openai:gpt-4o-mini", key=os.getenv("OPENAI_API_KEY"))
+        result = llm.call("What is 2+2? Reply with just the number.", {"max_tokens": 10})
+        assert "4" in result[0]
 ```
 
-### Writing Integration Tests
+---
+
+## What NOT to Test
+
+### Don't test private methods
 
 ```python
-class TestOpenAIAdapterIntegration:
-    """Integration tests for OpenAI adapter."""
+# Don't do this:
+def test_internal_helper(self, memory):
+    result = memory._internal_helper()  # Testing private method
 
-    def test_simple_completion(self):
-        """Should successfully complete a simple message."""
-        adapter = OpenAIAdapter()
-        messages = [{"role": "user", "content": "Say 'test' and nothing else."}]
-
-        response = adapter.complete(messages)
-
-        assert "test" in response.content.lower()
-        assert response.usage is not None
-
-    def test_with_system_prompt(self):
-        """Should respect system prompts."""
-        adapter = OpenAIAdapter()
-        messages = [
-            {"role": "system", "content": "Always respond in uppercase."},
-            {"role": "user", "content": "hello"},
-        ]
-
-        response = adapter.complete(messages)
-
-        assert response.content.isupper()
+# Do this instead:
+def test_public_method_uses_helper_correctly(self, memory):
+    memory.add_msg('user', 'Hello', channel='webapp')
+    # Assert the overall behavior is correct
 ```
+
+### Don't test exact LLM output
+
+```python
+# Don't do this (non-deterministic):
+def test_llm_response(self):
+    result = llm.call("Hello")
+    assert result == "Hello there!"  # LLM output varies
+
+# Do this instead:
+def test_llm_response_structure(self, mock_llm, memory):
+    llm = mock_llm(responses=["Expected response"])
+    # Test your code's handling of the response
+```
+
+### Don't test implementation details
+
+```python
+# Don't do this:
+def test_memory_uses_dict_internally(self, memory):
+    assert isinstance(memory._internal_store, dict)
+
+# Do this instead:
+def test_memory_stores_and_retrieves(self, memory):
+    memory.set_var('x', 1)
+    assert memory.get_var('x') == 1
+```
+
+---
+
+## Checklist for New Tests
+
+- [ ] Test is in correct directory (unit vs integration)
+- [ ] Test file named `test_<module>.py`
+- [ ] Test has a descriptive name following `test_<what>_<condition>_<expected>`
+- [ ] Test has a docstring with WHAT, WHY, and REMOVAL guidance
+- [ ] Test follows Arrange-Act-Assert pattern
+- [ ] Test is independent (no shared state between tests)
+- [ ] Test is deterministic (same result every time)
+- [ ] Test runs quickly (< 1 second for unit tests)
+- [ ] Test uses fixtures for common setup
+- [ ] Test uses MockLLM instead of real API calls (for unit tests)
+- [ ] Test uses only Python standard library (no external imports)
 
 ---
 
@@ -376,20 +491,23 @@ assert item in collection
 assert "substring" in string
 
 # Type
-assert isinstance(result, Message)
+assert isinstance(result, MEMORY)
 
 # Length
 assert len(items) == 3
 
-# Approximate equality (floats)
-assert result == pytest.approx(3.14, rel=0.01)
-
-# None
+# Identity
 assert result is None
 assert result is not None
 
+# Approximate equality (floats)
+assert result == pytest.approx(3.14, rel=0.01)
+
 # Exception
 with pytest.raises(ValueError):
+    do_something()
+
+with pytest.raises(ValueError, match="expected message"):
     do_something()
 ```
 
@@ -399,41 +517,23 @@ with pytest.raises(ValueError):
 
 ```bash
 # Run specific test file
-pytest tests/unit/test_agent.py -v
+pytest tests/unit/test_memory.py -v
+
+# Run specific test class
+pytest tests/unit/test_memory.py::TestMemoryInitialization -v
 
 # Run specific test
-pytest tests/unit/test_agent.py::TestAgent::test_agent_requires_adapter -v
+pytest tests/unit/test_memory.py::TestMemoryInitialization::test_creates_unique_id -v
 
 # Run with print output
-pytest tests/unit/test_agent.py -v -s
+pytest tests/unit/test_memory.py -v -s
 
 # Run and stop on first failure
-pytest tests/unit/test_agent.py -v -x
+pytest tests/unit/test_memory.py -v -x
+
+# Run with coverage
+pytest tests/unit/test_memory.py --cov=src/thoughtflow/memory
 ```
-
----
-
-## Test Coverage
-
-```bash
-# See uncovered lines
-pytest tests/unit/ --cov=src/thoughtflow --cov-report=term-missing
-
-# Aim for >80% coverage on new code
-```
-
----
-
-## Checklist for New Tests
-
-- [ ] Test is in correct directory (unit vs integration)
-- [ ] Test file named `test_<module>.py`
-- [ ] Test has descriptive name and docstring
-- [ ] Test follows Arrange-Act-Assert pattern
-- [ ] Test is independent (no shared state)
-- [ ] Test is deterministic (same result every time)
-- [ ] Test runs quickly (< 1 second for unit tests)
-- [ ] Test uses fixtures for common setup
 
 ---
 
