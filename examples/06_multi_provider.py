@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ThoughtFlow Example 05: Multi-Provider LLM
+ThoughtFlow Example 06: Multi-Provider LLM
 
 Demonstrates how to use ThoughtFlow's LLM class with different providers
 using the same unified interface.
@@ -12,7 +12,7 @@ Prerequisites:
     export GROQ_API_KEY=gsk_...
 
 Run:
-    python examples/05_multi_provider.py
+    python examples/06_multi_provider.py
 """
 
 import os
