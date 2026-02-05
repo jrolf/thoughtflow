@@ -1,27 +1,32 @@
 """
-Memory hooks for ThoughtFlow.
+Memory module for ThoughtFlow.
 
-Memory integration is handled as a service boundary, not a magical built-in.
-Memory is optional, pluggable, explicit at call-time, and recordable in traces.
+The MEMORY class is the event-sourced state container for managing events,
+logs, messages, reflections, and variables in ThoughtFlow workflows.
 
 Example:
-    >>> from thoughtflow.memory import MemoryHook
+    >>> from thoughtflow.memory import MEMORY
     >>>
-    >>> class VectorMemory(MemoryHook):
-    ...     def retrieve(self, query, k=5):
-    ...         # Retrieve relevant memories
-    ...         return memories
-    ...
-    ...     def store(self, content, metadata=None):
-    ...         # Store new memory
-    ...         pass
+    >>> memory = MEMORY()
+    >>> memory.add_msg('user', 'Hello!', channel='webapp')
+    >>> memory.add_msg('assistant', 'Hi there!', channel='webapp')
+    >>> memory.set_var('session_id', 'abc123', desc='Current session')
+    >>>
+    >>> # Get messages
+    >>> memory.get_msgs(include=['user'])
+    >>>
+    >>> # Prepare context for LLM
+    >>> context = memory.prepare_context(format='openai')
+    >>>
+    >>> # Save/load state
+    >>> memory.save('memory.pkl')
+    >>> memory.to_json('memory.json')
 """
 
 from __future__ import annotations
 
-from thoughtflow.memory.base import MemoryHook, MemoryEvent
+from thoughtflow.memory.base import MEMORY
 
 __all__ = [
-    "MemoryHook",
-    "MemoryEvent",
+    "MEMORY",
 ]

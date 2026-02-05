@@ -1,84 +1,69 @@
 """
 Unit tests for the Agent module.
+
+NOTE: The Agent class has been deprecated in favor of THOUGHT.
+These tests verify the deprecation behavior.
 """
 
 from __future__ import annotations
 
+import warnings
 import pytest
 
-from thoughtflow.agent import Agent, AgentProtocol, TracedAgent
+from thoughtflow.agent import Agent
 
 
-class TestAgentProtocol:
-    """Tests for the AgentProtocol."""
+class TestAgentDeprecation:
+    """Tests for Agent deprecation behavior."""
 
-    def test_protocol_is_runtime_checkable(self) -> None:
-        """AgentProtocol should be usable with isinstance()."""
+    def test_agent_raises_deprecation_warning(self) -> None:
+        """
+        Agent initialization should raise DeprecationWarning.
+        
+        This alerts users that Agent is deprecated and they
+        should migrate to THOUGHT instead.
+        
+        Remove this test if: We remove the Agent class entirely.
+        """
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            try:
+                Agent()
+            except NotImplementedError:
+                pass  # Expected
+            
+            # Check that DeprecationWarning was raised
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "deprecated" in str(w[0].message).lower()
 
-        class CustomAgent:
-            def call(self, msg_list, params=None):
-                return "response"
+    def test_agent_raises_not_implemented_error(self) -> None:
+        """
+        Agent should raise NotImplementedError after deprecation warning.
+        
+        This prevents accidental usage of the deprecated class.
+        
+        Remove this test if: We remove the Agent class entirely.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # Ignore the deprecation warning
+            with pytest.raises(NotImplementedError, match="deprecated"):
+                Agent()
 
-        agent = CustomAgent()
-        assert isinstance(agent, AgentProtocol)
-
-    def test_non_conforming_object_fails_protocol(self) -> None:
-        """Objects without call() should not match the protocol."""
-
-        class NotAnAgent:
-            def process(self, msg_list):
-                return "response"
-
-        not_agent = NotAnAgent()
-        assert not isinstance(not_agent, AgentProtocol)
-
-
-class TestAgent:
-    """Tests for the Agent class."""
-
-    def test_agent_requires_adapter(self, mock_adapter) -> None:
-        """Agent should be initialized with an adapter."""
-        agent = Agent(mock_adapter)
-        assert agent.adapter is mock_adapter
-
-    def test_agent_call_raises_not_implemented(
-        self, mock_adapter, sample_messages
-    ) -> None:
-        """Agent.call() should raise NotImplementedError (placeholder)."""
-        agent = Agent(mock_adapter)
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            agent.call(sample_messages)
-
-        assert "placeholder" in str(exc_info.value).lower()
-
-
-class TestTracedAgent:
-    """Tests for the TracedAgent wrapper."""
-
-    def test_traced_agent_wraps_agent(self, mock_adapter) -> None:
-        """TracedAgent should wrap an Agent and Session."""
-        from thoughtflow.trace import Session
-
-        agent = Agent(mock_adapter)
-        session = Session()
-
-        traced = TracedAgent(agent, session)
-
-        assert traced.agent is agent
-        assert traced.session is session
-
-    def test_traced_agent_call_raises_not_implemented(
-        self, mock_adapter, sample_messages
-    ) -> None:
-        """TracedAgent.call() should raise NotImplementedError (placeholder)."""
-        from thoughtflow.trace import Session
-
-        agent = Agent(mock_adapter)
-        session = Session()
-        traced = TracedAgent(agent, session)
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            traced.call(sample_messages)
-
-        assert "placeholder" in str(exc_info.value).lower()
+    def test_agent_deprecation_message_mentions_thought(self) -> None:
+        """
+        Agent deprecation message should mention THOUGHT as replacement.
+        
+        This helps users understand what to migrate to.
+        
+        Remove this test if: We change the migration path.
+        """
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            try:
+                Agent()
+            except NotImplementedError:
+                pass
+            
+            warning_msg = str(w[0].message).lower()
+            assert "thought" in warning_msg

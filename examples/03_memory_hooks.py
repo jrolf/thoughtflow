@@ -1,115 +1,121 @@
 #!/usr/bin/env python3
 """
-ThoughtFlow Example 03: Memory Hooks
+ThoughtFlow Example 03: MEMORY Usage
 
-Demonstrates how to integrate memory with ThoughtFlow agents.
-Memory is explicit - you control when to retrieve and store.
+Demonstrates the MEMORY class for managing conversation state,
+variables, logs, and reflections.
 
 Prerequisites:
-    pip install thoughtflow[openai]
-    export OPENAI_API_KEY=sk-...
+    pip install thoughtflow
 
 Run:
     python examples/03_memory_hooks.py
 """
 
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
-from thoughtflow.memory import MemoryHook
-
-
-class SimpleMemory(MemoryHook):
-    """A simple in-memory implementation for demonstration."""
-
-    def __init__(self):
-        self.memories = []
-
-    def retrieve(self, query, k=5, filters=None):
-        """Simple keyword matching (real impl would use embeddings)."""
-        matches = []
-        query_lower = query.lower()
-
-        for memory in self.memories:
-            content_lower = memory["content"].lower()
-            if query_lower in content_lower or any(
-                word in content_lower for word in query_lower.split()
-            ):
-                matches.append(memory)
-
-        return matches[:k]
-
-    def store(self, content, metadata=None):
-        """Store a new memory."""
-        memory_id = f"mem_{len(self.memories)}"
-        self.memories.append(
-            {"id": memory_id, "content": content, "metadata": metadata or {}}
-        )
-        print(f"  [Memory] Stored: {content[:50]}...")
-        return memory_id
+from thoughtflow import MEMORY
 
 
 def main():
-    # Create memory instance
-    memory = SimpleMemory()
+    # Create a MEMORY instance
+    memory = MEMORY()
+    print(f"Memory ID: {memory.id}")
 
-    # Store some initial memories
-    print("--- Storing Initial Memories ---")
-    memory.store(
-        "User's name is Alice and she works as a software engineer.",
-        metadata={"type": "user_info"},
+    # --- Adding Messages with Channels ---
+    print("\n--- Adding Messages ---")
+    memory.add_msg("system", "You are a helpful assistant.", channel="webapp")
+    memory.add_msg("user", "My name is Alice and I'm a software engineer.", channel="webapp")
+    memory.add_msg("assistant", "Nice to meet you, Alice! How can I help you today?", channel="webapp")
+    
+    print("Messages added:")
+    for msg in memory.get_msgs():
+        print(f"  [{msg['role']}] {msg['content'][:50]}...")
+
+    # --- Setting Variables ---
+    print("\n--- Setting Variables ---")
+    memory.set_var("user_name", "Alice", desc="User's name")
+    memory.set_var("occupation", "software engineer", desc="User's job title")
+    memory.set_var("preferences", {"language": "Python", "framework": "FastAPI"}, desc="User preferences")
+    
+    print("Variables set:")
+    print(f"  user_name: {memory.get_var('user_name')}")
+    print(f"  occupation: {memory.get_var('occupation')}")
+    print(f"  preferences: {memory.get_var('preferences')}")
+
+    # --- Variable History ---
+    print("\n--- Variable History (Updating Variables) ---")
+    memory.set_var("preferences", {"language": "Python", "framework": "Django"})  # Update
+    memory.set_var("preferences", {"language": "Python", "framework": "Flask"})   # Update again
+    
+    print("Preference history:")
+    for stamp, value in memory.get_var_history("preferences"):
+        print(f"  {stamp[:10]}... -> {value}")
+
+    # --- Logs and Reflections ---
+    print("\n--- Logs and Reflections ---")
+    memory.add_log("User started a new session")
+    memory.add_log("User mentioned their background in software")
+    memory.add_ref("User seems experienced in Python development")
+    memory.add_ref("User is exploring different web frameworks")
+    
+    print("Logs:")
+    for log in memory.get_logs():
+        print(f"  {log['content']}")
+    
+    print("\nReflections:")
+    for ref in memory.get_refs():
+        print(f"  {ref['content']}")
+
+    # --- Prepare Context for LLM ---
+    print("\n--- Preparing Context for LLM ---")
+    context = memory.prepare_context(
+        recent_count=3,
+        format='openai'
     )
-    memory.store(
-        "Alice prefers Python over JavaScript for backend development.",
-        metadata={"type": "preference"},
-    )
-    memory.store(
-        "Last conversation was about machine learning frameworks.",
-        metadata={"type": "history"},
-    )
+    print("Context messages for LLM:")
+    for msg in context:
+        content_preview = msg['content'][:60] + "..." if len(msg['content']) > 60 else msg['content']
+        print(f"  {msg['role']}: {content_preview}")
 
-    # Simulate a conversation with memory retrieval
-    print("\n--- Simulating Conversation with Memory ---")
+    # --- Render Memory State ---
+    print("\n--- Render as Conversation ---")
+    print(memory.render(output_format='conversation', max_total_length=500))
 
-    user_input = "What programming language should I use?"
+    # --- Get All Variables ---
+    print("\n--- All Variables ---")
+    all_vars = memory.get_all_vars()
+    for key, value in all_vars.items():
+        print(f"  {key}: {value}")
 
-    # Step 1: Retrieve relevant memories
-    print(f"\nUser: {user_input}")
-    print("\n[Retrieving relevant memories...]")
+    # --- Variable Deletion ---
+    print("\n--- Variable Deletion ---")
+    memory.del_var("occupation")
+    print(f"occupation after deletion: {memory.get_var('occupation')}")
+    print(f"is_var_deleted('occupation'): {memory.is_var_deleted('occupation')}")
+    
+    # Can re-set after deletion
+    memory.set_var("occupation", "tech lead")
+    print(f"occupation after re-setting: {memory.get_var('occupation')}")
 
-    relevant_memories = memory.retrieve(user_input, k=3)
-    for mem in relevant_memories:
-        print(f"  - {mem['content']}")
+    # --- Save/Load State ---
+    print("\n--- Save/Load State ---")
+    # Save to JSON
+    json_str = memory.to_json()
+    print(f"JSON export length: {len(json_str)} chars")
+    
+    # Create new memory from JSON
+    memory2 = MEMORY.from_json(json_str)
+    print(f"Loaded memory ID: {memory2.id}")
+    print(f"Loaded user_name: {memory2.get_var('user_name')}")
 
-    # Step 2: Build context-aware message list
-    context = "\n".join([m["content"] for m in relevant_memories])
-
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {
-            "role": "system",
-            "content": f"Relevant context from memory:\n{context}",
-        },
-        {"role": "user", "content": user_input},
-    ]
-
-    print("\n[Message list with memory context:]")
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"][:60] + "..." if len(msg["content"]) > 60 else msg["content"]
-        print(f"  {role}: {content}")
-
-    # Step 3: Would call agent here
-    # response = agent.call(messages)
-
-    # Step 4: Store the interaction
-    print("\n[Storing interaction in memory...]")
-    memory.store(
-        f"User asked about programming languages. Recommendation was based on their Python preference.",
-        metadata={"type": "interaction"},
-    )
-
-    print("\n--- Memory State ---")
-    print(f"Total memories: {len(memory.memories)}")
+    # --- Snapshot for Cloud Sync ---
+    print("\n--- Snapshot (for cloud sync) ---")
+    snapshot = memory.snapshot()
+    print(f"Snapshot keys: {list(snapshot.keys())}")
+    print(f"Event count: {len(snapshot['events'])}")
+    
+    # Rehydrate from events
+    memory3 = MEMORY.from_events(snapshot['events'].values(), memory.id)
+    print(f"Rehydrated memory has {len(memory3.events)} events")
 
 
 if __name__ == "__main__":

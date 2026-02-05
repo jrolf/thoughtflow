@@ -2,39 +2,50 @@
 """
 ThoughtFlow Example 01: Hello World
 
-The simplest possible ThoughtFlow example - create an agent and make a call.
+The simplest possible ThoughtFlow example - create an LLM and make a call.
 
 Prerequisites:
-    pip install thoughtflow[openai]
+    pip install thoughtflow
     export OPENAI_API_KEY=sk-...
 
 Run:
     python examples/01_hello_world.py
 """
 
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
+import os
+from thoughtflow import LLM, MEMORY, THOUGHT
 
 
 def main():
-    # 1. Create an adapter for your provider
-    # (Uses OPENAI_API_KEY environment variable by default)
-    adapter = OpenAIAdapter()
+    # 1. Create an LLM instance with your provider
+    # Format: "service:model" (e.g., "openai:gpt-4o", "anthropic:claude-3-sonnet")
+    api_key = os.environ.get("OPENAI_API_KEY", "your-api-key")
+    llm = LLM("openai:gpt-4o", key=api_key)
 
-    # 2. Create an agent
-    agent = Agent(adapter)
+    # 2. Create a MEMORY to store conversation state
+    memory = MEMORY()
 
-    # 3. Prepare messages (the universal currency in ThoughtFlow)
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What is ThoughtFlow in one sentence?"},
-    ]
+    # 3. Add a user message to memory
+    memory.add_msg("user", "What is ThoughtFlow in one sentence?", channel="cli")
 
-    # 4. Call the agent
-    print("Calling agent...")
-    response = agent.call(messages)
+    # 4. Create a THOUGHT that responds to the user
+    thought = THOUGHT(
+        name="respond",
+        llm=llm,
+        prompt="You are a helpful assistant. Respond to the user's question: {last_user_msg}",
+    )
 
-    print(f"\nResponse: {response}")
+    # 5. Execute the thought (this calls the LLM and stores the result)
+    print("Calling LLM...")
+    memory = thought(memory)
+
+    # 6. Get the result
+    result = memory.get_var("respond_result")
+    print(f"\nResponse: {result}")
+
+    # You can also see the full conversation
+    print("\n--- Full Conversation ---")
+    print(memory.render(output_format='conversation'))
 
 
 if __name__ == "__main__":

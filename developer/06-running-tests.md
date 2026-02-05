@@ -2,6 +2,8 @@
 
 This guide explains how to run and work with the ThoughtFlow test suite.
 
+**Important**: All test operations use only Python standard library tools. The only external dependency is `pytest` itself (a dev dependency). No additional test tools require external imports.
+
 ---
 
 ## Quick Start
@@ -11,13 +13,13 @@ This guide explains how to run and work with the ThoughtFlow test suite.
 pytest tests/unit/ -v
 
 # Run a specific test file
-pytest tests/unit/test_agent.py -v
+pytest tests/unit/test_memory.py -v
 
 # Run a specific test class
-pytest tests/unit/test_agent.py::TestAgent -v
+pytest tests/unit/test_memory.py::TestMemoryInitialization -v
 
 # Run a specific test
-pytest tests/unit/test_agent.py::TestAgent::test_agent_requires_adapter -v
+pytest tests/unit/test_memory.py::TestMemoryInitialization::test_creates_unique_id -v
 ```
 
 ---
@@ -26,14 +28,17 @@ pytest tests/unit/test_agent.py::TestAgent::test_agent_requires_adapter -v
 
 ```
 tests/
-├── conftest.py         # Shared fixtures
-├── unit/               # Fast, deterministic tests
-│   ├── test_agent.py
-│   ├── test_message.py
-│   └── test_trace.py
-└── integration/        # Tests requiring external services
-    ├── test_openai_adapter.py
-    └── test_anthropic_adapter.py
+├── conftest.py              # Shared fixtures (MEMORY, MockLLM, etc.)
+├── unit/                    # Fast, deterministic tests
+│   ├── test_util.py         # EventStamp, valid_extract, compression
+│   ├── test_llm.py          # LLM class (mocked HTTP)
+│   ├── test_memory.py       # MEMORY class
+│   ├── test_thought.py      # THOUGHT class
+│   ├── test_action.py       # ACTION class
+│   ├── test_message.py      # Message utilities
+│   └── test_trace.py        # Tracing utilities
+└── integration/             # Tests requiring external services
+    └── test_llm_providers.py  # Real API tests (OpenAI, Anthropic, etc.)
 ```
 
 ### Unit Tests vs Integration Tests
@@ -66,51 +71,123 @@ pytest tests/unit/ -x
 pytest tests/unit/ --lf
 ```
 
+### Testing Specific Components
+
+```bash
+# Test MEMORY class
+pytest tests/unit/test_memory.py -v
+
+# Test THOUGHT class
+pytest tests/unit/test_thought.py -v
+
+# Test ACTION class
+pytest tests/unit/test_action.py -v
+
+# Test utilities (EventStamp, valid_extract, compression)
+pytest tests/unit/test_util.py -v
+
+# Test LLM class (with mocked HTTP)
+pytest tests/unit/test_llm.py -v
+```
+
 ### Filtering Tests
 
 ```bash
 # Run tests matching a keyword
-pytest tests/unit/ -k "agent"
+pytest tests/unit/ -k "memory"
 pytest tests/unit/ -k "test_message and not serialize"
 
-# Run tests in a specific file
-pytest tests/unit/test_message.py
-
-# Run a specific test class
-pytest tests/unit/test_message.py::TestMessage
-
-# Run a specific test method
-pytest tests/unit/test_message.py::TestMessage::test_create_message
+# Run tests by marker
+pytest tests/unit/ -m "not slow"
 ```
 
 ---
 
 ## Running Integration Tests
 
-Integration tests require:
-1. API keys set as environment variables
-2. `THOUGHTFLOW_INTEGRATION_TESTS=1` environment variable
+Integration tests make **real HTTP calls** to LLM providers. They are skipped by default to avoid:
+- Unexpected API costs
+- Failures due to missing API keys
+- Network-dependent test results
+
+### Enable Integration Tests
+
+Set the required environment variables:
 
 ```bash
-# Set up environment
+# Required to enable integration tests
+export THOUGHTFLOW_INTEGRATION_TESTS=1
+
+# API keys (set the ones you have)
 export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
-export THOUGHTFLOW_INTEGRATION_TESTS=1
+export GROQ_API_KEY="gsk_..."
+export GOOGLE_API_KEY="..."
+export OPENROUTER_API_KEY="sk-or-..."
 
 # Run integration tests
 pytest tests/integration/ -v
+```
 
-# Run only OpenAI tests
-pytest tests/integration/test_openai_adapter.py -v
+### Run Specific Provider Tests
 
-# Run only Anthropic tests
-pytest tests/integration/test_anthropic_adapter.py -v
+```bash
+# OpenAI only
+THOUGHTFLOW_INTEGRATION_TESTS=1 pytest tests/integration/test_llm_providers.py::TestOpenAIIntegration -v
+
+# Anthropic only
+THOUGHTFLOW_INTEGRATION_TESTS=1 pytest tests/integration/test_llm_providers.py::TestAnthropicIntegration -v
+
+# End-to-end workflows
+THOUGHTFLOW_INTEGRATION_TESTS=1 pytest tests/integration/test_llm_providers.py::TestEndToEndWorkflows -v
 ```
 
 ### One-liner (Temporary Environment)
 
 ```bash
-THOUGHTFLOW_INTEGRATION_TESTS=1 OPENAI_API_KEY=sk-... pytest tests/integration/test_openai_adapter.py -v
+THOUGHTFLOW_INTEGRATION_TESTS=1 OPENAI_API_KEY=sk-... pytest tests/integration/test_llm_providers.py::TestOpenAIIntegration -v
+```
+
+---
+
+## Understanding Test Output
+
+### Successful Test Run
+
+```
+tests/unit/test_memory.py::TestMemoryInitialization::test_creates_unique_id PASSED
+tests/unit/test_memory.py::TestMemoryInitialization::test_starts_with_empty_state PASSED
+tests/unit/test_memory.py::TestMessageOperations::test_add_msg_stores_message PASSED
+...
+==================== 45 passed in 0.52s ====================
+```
+
+### Failed Test Output
+
+```
+FAILED tests/unit/test_memory.py::TestMessageOperations::test_add_msg_stores_message
+============== FAILURES ==============
+___ TestMessageOperations.test_add_msg_stores_message ___
+
+    def test_add_msg_stores_message(self, memory):
+        """
+        add_msg must store a message that can be retrieved.
+        ...
+        """
+        memory.add_msg('user', 'Hello!', channel='webapp')
+        msgs = memory.get_msgs()
+
+>       assert len(msgs) == 1
+E       AssertionError: assert 0 == 1
+
+tests/unit/test_memory.py:85: AssertionError
+```
+
+### Skipped Tests
+
+```
+tests/integration/test_llm_providers.py::TestOpenAIIntegration::test_basic_completion SKIPPED
+  Reason: OPENAI_API_KEY not set
 ```
 
 ---
@@ -120,7 +197,7 @@ THOUGHTFLOW_INTEGRATION_TESTS=1 OPENAI_API_KEY=sk-... pytest tests/integration/t
 ### Generate Coverage Report
 
 ```bash
-# Run with coverage
+# Run with coverage (terminal output)
 pytest tests/unit/ --cov=src/thoughtflow
 
 # With line numbers of missing coverage
@@ -131,6 +208,14 @@ pytest tests/unit/ --cov=src/thoughtflow --cov-report=html
 
 # Open report (macOS)
 open htmlcov/index.html
+```
+
+### Coverage by Module
+
+```bash
+# See coverage for specific modules
+pytest tests/unit/test_memory.py --cov=src/thoughtflow/memory --cov-report=term-missing
+pytest tests/unit/test_thought.py --cov=src/thoughtflow/thought --cov-report=term-missing
 ```
 
 ### Coverage Configuration
@@ -155,32 +240,50 @@ exclude_lines = [
 
 ## Using Fixtures
 
-Fixtures are defined in `tests/conftest.py`:
+Fixtures are defined in `tests/conftest.py`. All fixtures use only Python standard library.
+
+### Core Fixtures
 
 ```python
-# Available fixtures:
-
+# Fresh MEMORY instance
 @pytest.fixture
-def sample_messages():
-    """Sample message list for testing."""
-    return [
-        {"role": "system", "content": "You are helpful."},
-        {"role": "user", "content": "Hello!"},
-    ]
+def memory():
+    from thoughtflow import MEMORY
+    return MEMORY()
 
+# MEMORY with pre-populated state
 @pytest.fixture
-def mock_adapter():
-    """Mock adapter that returns canned responses."""
-    return MockAdapter()
+def populated_memory(memory):
+    memory.add_msg('system', 'You are helpful.', channel='test')
+    memory.add_msg('user', 'Hello!', channel='test')
+    memory.set_var('user_name', 'Alice')
+    return memory
+
+# MockLLM class for testing without HTTP
+@pytest.fixture
+def mock_llm():
+    return MockLLM  # Returns the class, not instance
+
+# Pre-instantiated MockLLM
+@pytest.fixture
+def mock_llm_instance():
+    return MockLLM()
 ```
 
 ### Using Fixtures in Tests
 
 ```python
-def test_agent_with_messages(mock_adapter, sample_messages):
-    """Test that uses fixtures."""
-    agent = Agent(mock_adapter)
-    # Use sample_messages and mock_adapter...
+def test_memory_stores_messages(memory):
+    """Test using the memory fixture."""
+    memory.add_msg('user', 'Hello!', channel='webapp')
+    assert len(memory.get_msgs()) == 1
+
+def test_thought_with_mock_llm(mock_llm, memory):
+    """Test using both mock_llm and memory fixtures."""
+    llm = mock_llm(responses=["Hello!"])
+    thought = THOUGHT(name="test", llm=llm, prompt="Hi")
+    thought(memory)
+    assert llm.call_count == 1
 ```
 
 ---
@@ -191,49 +294,47 @@ def test_agent_with_messages(mock_adapter, sample_messages):
 
 ```bash
 # Show print statements
-pytest tests/unit/test_agent.py -v -s
+pytest tests/unit/test_memory.py -v -s
 
 # Or equivalently
-pytest tests/unit/test_agent.py -v --capture=no
+pytest tests/unit/test_memory.py -v --capture=no
 ```
 
 ### Drop into Debugger
 
 ```python
 # Add this in your test
-def test_something():
-    x = compute_something()
+def test_something(memory):
+    memory.set_var('x', 1)
     breakpoint()  # Drops into pdb
-    assert x == expected
+    assert memory.get_var('x') == 1
 ```
 
 ```bash
 # Run the test
-pytest tests/unit/test_agent.py::test_something -v -s
+pytest tests/unit/test_memory.py::test_something -v -s
 ```
 
 ### Using pdb Commands
 
 Once in the debugger:
 ```
-(Pdb) p x          # Print variable
-(Pdb) pp x         # Pretty print
-(Pdb) l            # List code around current line
-(Pdb) n            # Next line
-(Pdb) s            # Step into function
-(Pdb) c            # Continue to next breakpoint
-(Pdb) q            # Quit debugger
+(Pdb) p memory.get_var('x')  # Print variable
+(Pdb) pp memory.events       # Pretty print
+(Pdb) l                      # List code around current line
+(Pdb) n                      # Next line
+(Pdb) s                      # Step into function
+(Pdb) c                      # Continue to next breakpoint
+(Pdb) q                      # Quit debugger
 ```
 
 ---
 
 ## Test Markers
 
-### Skip Tests
+### Built-in Markers
 
 ```python
-import pytest
-
 @pytest.mark.skip(reason="Not implemented yet")
 def test_future_feature():
     pass
@@ -241,17 +342,13 @@ def test_future_feature():
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix only")
 def test_unix_specific():
     pass
-```
 
-### Expected Failures
-
-```python
 @pytest.mark.xfail(reason="Known bug #123")
 def test_known_bug():
     pass
 ```
 
-### Custom Markers
+### Custom Markers (defined in conftest.py)
 
 ```python
 @pytest.mark.integration
@@ -285,38 +382,19 @@ pytest -m "integration and not slow"
 Test multiple inputs with a single test:
 
 ```python
-import pytest
+@pytest.mark.parametrize("role", ["user", "assistant", "system"])
+def test_memory_accepts_valid_roles(self, memory, role):
+    """MEMORY should accept all valid roles."""
+    memory.add_msg(role, "content", channel="webapp")
+    assert memory.get_msgs()[0]['role'] == role
 
 @pytest.mark.parametrize("input,expected", [
     ("hello", "HELLO"),
     ("World", "WORLD"),
-    ("123", "123"),
     ("", ""),
 ])
-def test_uppercase(input, expected):
-    from thoughtflow.message import Message
-    # Test with each input/expected pair
+def test_uppercase(self, input, expected):
     assert input.upper() == expected
-```
-
----
-
-## Testing Exceptions
-
-```python
-import pytest
-
-def test_raises_not_implemented():
-    agent = Agent(mock_adapter)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        agent.call([])
-
-    assert "placeholder" in str(exc_info.value).lower()
-
-def test_raises_value_error():
-    with pytest.raises(ValueError, match="must be positive"):
-        do_something(-1)
 ```
 
 ---
@@ -343,31 +421,44 @@ To replicate CI locally:
 
 ```bash
 # Run all checks
-pre-commit run --all-files
+ruff check src/ tests/
+ruff format --check src/ tests/
+mypy src/
 
 # Then run tests
-pytest tests/unit/ -v
+pytest tests/unit/ -v --cov=src/thoughtflow
 ```
 
 ---
 
-## Test Best Practices
+## Analyzing Test Results
 
-### Do
+### Summary Statistics
 
-- ✅ One assertion per test (when possible)
-- ✅ Test names describe what's being tested
-- ✅ Use fixtures for common setup
-- ✅ Keep tests independent (no shared state)
-- ✅ Test edge cases and error conditions
+```bash
+# Quick summary
+pytest tests/unit/ -v --tb=no
 
-### Don't
+# Count tests by result
+pytest tests/unit/ -v --tb=no | grep -E "passed|failed|skipped"
+```
 
-- ❌ Test private methods directly
-- ❌ Test exact LLM output (non-deterministic)
-- ❌ Rely on test execution order
-- ❌ Use `time.sleep()` in unit tests
-- ❌ Access external services in unit tests
+### Identifying Slow Tests
+
+```bash
+# Show slowest 10 tests
+pytest tests/unit/ --durations=10
+```
+
+### Test Report (JSON format)
+
+```bash
+# Generate JSON report
+pytest tests/unit/ --json-report --json-report-file=report.json
+
+# Or use built-in JUnit XML (works with many CI systems)
+pytest tests/unit/ --junitxml=report.xml
+```
 
 ---
 
@@ -396,6 +487,15 @@ pytest tests/unit/ -v
 ### Fixture not found
 
 Make sure `conftest.py` is in the `tests/` directory and the fixture is defined there.
+
+### Mock LLM not working
+
+```python
+# Use the fixture correctly - it returns a CLASS
+def test_with_mock(mock_llm, memory):
+    llm = mock_llm(responses=["Expected response"])  # Instantiate it
+    # Not: llm = mock_llm  # This is wrong
+```
 
 ---
 
