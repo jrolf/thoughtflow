@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-ThoughtFlow Example 03: MEMORY Usage
+ThoughtFlow Example 03: MEMORY State Management
 
 Demonstrates the MEMORY class for managing conversation state,
-variables, logs, and reflections.
+variables, logs, and reflections. MEMORY is the event-sourced
+state container that maintains all context for your agent.
 
 Prerequisites:
     pip install thoughtflow
 
 Run:
-    python examples/03_memory_hooks.py
+    python examples/03_memory.py
 """
 
 from thoughtflow import MEMORY
