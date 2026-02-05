@@ -866,25 +866,19 @@ action_copy = ACTION.from_dict(action_data, fn_registry)
 
 LLMs are messy. They add prose, code fences, markdown, and formatting you didn't ask for. `valid_extract` handles all of it:
 
+**Basic extraction from messy output:**
+
 ```python
 from thoughtflow import valid_extract, ValidExtractError
 
-# ═══════════════════════════════════════════════════════════════════════════
-# BASIC EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Messy LLM output with code fences and prose
-llm_output = """
-Sure! Here's the data you asked for:
-
-```python
-{'name': 'Alice', 'age': 28, 'skills': ['Python', 'ML']}
-```
-
+# Messy LLM output with prose and formatting
+llm_output = '''
+Sure! Here is the data you asked for:
+{"name": "Alice", "age": 28, "skills": ["Python", "ML"]}
 Let me know if you need anything else!
-"""
+'''
 
-# Clean extraction with schema validation
+# Define extraction rules with schema
 rules = {
     "kind": "python",
     "format": {
@@ -896,11 +890,11 @@ rules = {
 
 result = valid_extract(llm_output, rules)
 # result = {'name': 'Alice', 'age': 28, 'skills': ['Python', 'ML']}
+```
 
-# ═══════════════════════════════════════════════════════════════════════════
-# OPTIONAL KEYS
-# ═══════════════════════════════════════════════════════════════════════════
+**Optional keys (marked with `?`):**
 
+```python
 rules = {
     "kind": "python",
     "format": {
@@ -915,11 +909,11 @@ llm_output = "{'name': 'Bob', 'email': 'bob@example.com'}"
 result = valid_extract(llm_output, rules)
 # result = {'name': 'Bob', 'email': 'bob@example.com'}
 # No error even though phone and address are missing
+```
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NESTED STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════
+**Nested structures:**
 
+```python
 rules = {
     "kind": "python",
     "format": {
@@ -933,11 +927,11 @@ rules = {
         "metadata": {}
     }
 }
+```
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LIST ELEMENT VALIDATION
-# ═══════════════════════════════════════════════════════════════════════════
+**List element validation:**
 
+```python
 # [schema] means every element must match schema
 rules = {
     "kind": "python",
@@ -956,23 +950,23 @@ llm_output = """
 """
 result = valid_extract(llm_output, rules)
 # Each item validated against the schema
+```
 
-# ═══════════════════════════════════════════════════════════════════════════
-# JSON PARSING
-# ═══════════════════════════════════════════════════════════════════════════
+**JSON parsing:**
 
+```python
 rules = {
     "kind": "json",  # Parse as JSON instead of Python
     "format": {"status": "", "data": []}
 }
 
-llm_output = '```json\n{"status": "ok", "data": [1, 2, 3]}\n```'
+llm_output = '{"status": "ok", "data": [1, 2, 3]}'
 result = valid_extract(llm_output, rules)
+```
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ERROR HANDLING
-# ═══════════════════════════════════════════════════════════════════════════
+**Error handling:**
 
+```python
 try:
     result = valid_extract("no valid data here", rules)
 except ValidExtractError as e:
