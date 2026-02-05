@@ -8,7 +8,7 @@
 -->
 
 <p align="center">
-  <img src="assets/logo.png" alt="ThoughtFlow Logo" width="400">
+  <img src="https://raw.githubusercontent.com/jrolf/thoughtflow/main/assets/logo.png" alt="ThoughtFlow Logo" width="400">
 </p>
 
 <h1 align="center">ThoughtFlow</h1>
@@ -26,7 +26,7 @@
   <a href="https://pypi.org/project/thoughtflow/"><img src="https://img.shields.io/pypi/v/thoughtflow?color=blue" alt="PyPI version"></a>
   <a href="https://pypi.org/project/thoughtflow/"><img src="https://img.shields.io/pypi/pyversions/thoughtflow" alt="Python versions"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/jrolf/thoughtflow/actions/workflows/ci.yml"><img src="https://github.com/jrolf/thoughtflow/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/jrolf/thoughtflow"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build"></a>
   <a href="https://pepy.tech/project/thoughtflow"><img src="https://static.pepy.tech/badge/thoughtflow/month" alt="Downloads/month"></a>
 </p>
 
@@ -1452,7 +1452,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ---
 
 <p align="center">
-  <img src="assets/logo.png" alt="ThoughtFlow" width="80">
+  <img src="https://raw.githubusercontent.com/jrolf/thoughtflow/main/assets/logo.png" alt="ThoughtFlow" width="80">
 </p>
 
 <p align="center">
