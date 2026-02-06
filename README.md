@@ -111,7 +111,7 @@ print(f"Response: {result}")
 # Output: "The meaning of life is a profound philosophical question..."
 
 # 8. View the full conversation
-print(memory.render(output_format="conversation"))
+print(memory.render(format="conversation"))
 ```
 
 **The universal pattern is `memory = thought(memory)`.** That's not a simplification — that's the actual API. Everything flows through MEMORY.
@@ -486,7 +486,7 @@ memory_copy = memory.copy()
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Render as conversation (great for debugging)
-print(memory.render(output_format="conversation"))
+print(memory.render(format="conversation"))
 # Output:
 # User: Hello from the web!
 # Assistant: Hi there! How can I help?
@@ -494,10 +494,10 @@ print(memory.render(output_format="conversation"))
 # ...
 
 # Render as JSON
-print(memory.render(output_format="json", include=("msgs", "logs")))
+print(memory.render(format="json", include=("msgs", "logs")))
 
 # Render as plain text
-print(memory.render(output_format="plain"))
+print(memory.render(format="plain"))
 
 # Filter by role, channel, content
 print(memory.render(
@@ -1112,7 +1112,7 @@ all_msgs = memory.get_msgs(include=["user", "assistant"])
 
 # Render for LLM context with channel info
 context = memory.render(
-    output_format="conversation",
+    format="conversation",
     include_roles=("user", "assistant"),
     max_total_length=4000
 )
