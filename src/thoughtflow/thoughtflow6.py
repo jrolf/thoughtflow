@@ -2210,7 +2210,7 @@ class MEMORY:
     def render(
         self,
         include=('msgs',),           # Tuple/list of event types to include: 'msgs', 'logs', 'refs', 'vars', 'events'
-        output_format='plain',       # 'plain', 'markdown', 'json', 'table', 'conversation'
+        format='plain',       # 'plain', 'markdown', 'json', 'table', 'conversation'
         role_filter=None,            # List of roles to include (None = all)
         mode_filter=None,            # List of modes to include (None = all)
         channel_filter=None,         # Channel to filter by (None = all)
@@ -2237,13 +2237,13 @@ class MEMORY:
         - Advanced filtering (by role, mode, channel, content, time, event type)
         - Metadata inclusion and pretty-printing
         - Output length limiting and message condensing/snipping
-        - LLM-optimized conversation export (via output_format='conversation'), 
+        - LLM-optimized conversation export (via format='conversation'), 
           which produces a clean text blob of user/assistant messages with 
           configurable length and formatting options.
 
         Args:
             include: Which event types to include ('msgs', 'logs', 'refs', 'vars', 'events')
-            output_format: 'plain', 'markdown', 'json', 'table', or 'conversation'
+            format: 'plain', 'markdown', 'json', 'table', or 'conversation'
             role_filter: List of roles to include (None = all)
             mode_filter: List of modes to include (None = all)
             channel_filter: Channel to filter by (None = all)
@@ -2271,16 +2271,16 @@ class MEMORY:
             print(mem.render())  # Default: plain text, all messages
 
             # Render only user messages in markdown
-            print(mem.render(role_filter=['user'], output_format='markdown'))
+            print(mem.render(role_filter=['user'], format='markdown'))
 
             # Render as a table, including logs and refs
-            print(mem.render(include=('msgs', 'logs', 'refs'), output_format='table'))
+            print(mem.render(include=('msgs', 'logs', 'refs'), format='table'))
 
             # Render with a content keyword filter and max length
             print(mem.render(content_filter='hello', max_length=50))
 
             # Export as LLM-optimized conversation
-            print(mem.render(output_format='conversation', max_total_length=2000))
+            print(mem.render(format='conversation', max_total_length=2000))
             
             # Filter by channel
             print(mem.render(channel_filter='telegram'))
@@ -2360,7 +2360,7 @@ class MEMORY:
             events = events[-event_limit:]  # Most recent N
 
         # --- Conversation/LLM-optimized format ---
-        if output_format == 'conversation':
+        if format == 'conversation':
             # Only include messages and filter by include_roles
             conv_msgs = [ev for ev in events if ev.get('role') in include_roles]
             # Already sorted by stamp
@@ -2411,7 +2411,7 @@ class MEMORY:
         total_length = 0
         snip_notice = " [snipped]"  # For snipped messages
 
-        if output_format == 'json':
+        if format == 'json':
             # Output as JSON (list of dicts)
             if not include_metadata:
                 # Remove metadata fields
@@ -2424,7 +2424,7 @@ class MEMORY:
             if max_length and len(output) > max_length:
                 output = output[:max_length] + snip_notice
 
-        elif output_format in ('plain', 'markdown', 'table'):
+        elif format in ('plain', 'markdown', 'table'):
             # Build lines for each event
             lines = []
             for ev in events:
@@ -2450,7 +2450,7 @@ class MEMORY:
                     stamp = ev.get('stamp', '')
                     channel = ev.get('channel', '')
                     meta = " ({})".format(dt) if dt else ""
-                    if output_format == 'table':
+                    if format == 'table':
                         meta = "\t{}\t{}\t{}".format(dt or '', stamp or '', channel or '')
 
                 # Condense message if needed
@@ -2471,7 +2471,7 @@ class MEMORY:
                 total_length += len(line) + 1  # +1 for newline
 
             # Format as table if requested
-            if output_format == 'table':
+            if format == 'table':
                 # Table header
                 header = "Type\tContent\tDatetime\tStamp\tChannel"
                 table_lines = [header]
@@ -2492,7 +2492,7 @@ class MEMORY:
                 output = sep.join(lines)
 
         else:
-            raise ValueError("Unknown output_format: {}".format(output_format))
+            raise ValueError("Unknown format: {}".format(format))
 
         return output
 
@@ -2653,10 +2653,10 @@ True
 >>> print(mem.render())
 
 # Render only user messages in markdown format
->>> print(mem.render(role_filter=['user'], output_format='markdown'))
+>>> print(mem.render(role_filter=['user'], format='markdown'))
 
 # Render as a table, including logs and reflections
->>> print(mem.render(include=('msgs', 'logs', 'refs'), output_format='table'))
+>>> print(mem.render(include=('msgs', 'logs', 'refs'), format='table'))
 
 # Filter by channel
 >>> print(mem.render(channel_filter='telegram'))
@@ -2665,7 +2665,7 @@ True
 >>> print(mem.render(content_filter='hello', max_length=50))
 
 # Export as LLM-optimized conversation (for prompt construction)
->>> print(mem.render(output_format='conversation', max_total_length=2000))
+>>> print(mem.render(format='conversation', max_total_length=2000))
 
 ------------------------------------------------------------
 8. Advanced Filtering and Formatting
@@ -2696,7 +2696,7 @@ True
 >>> mem.set_var('weather', 'sunny and warm', desc='Latest weather info')
 >>> mem.add_ref('User is interested in outdoor activities.')
 >>> mem.add_log('Weather query processed successfully.')
->>> print(mem.render(output_format='conversation'))
+>>> print(mem.render(format='conversation'))
 
 # Export all events and rehydrate
 >>> all_events = mem.get_events()
