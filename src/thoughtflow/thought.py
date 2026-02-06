@@ -944,7 +944,7 @@ ThoughtClassTests = """
 # --- THOUGHT Class Tests ---
 
 # Test 1: Basic THOUGHT instantiation and attributes
->>> from thoughtflow6 import THOUGHT, MEMORY, event_stamp
+>>> from thoughtflow import THOUGHT, MEMORY, event_stamp
 >>> t = THOUGHT(name="test_thought", prompt="Hello {name}", max_retries=3)
 >>> t.name
 'test_thought'
