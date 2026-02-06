@@ -456,25 +456,90 @@ class MEMORY:
         
         return events
 
-    def last_user_msg(self):
-        """Get the content of the last user message."""
+    def last_user_msg(self, content_only=False):
+        """
+        Get the last user message.
+        
+        Args:
+            content_only: If True, return just the content string. 
+                          If False (default), return the full event dict.
+        
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no messages.
+        """
         msgs = self.get_msgs(include=['user'])
-        return msgs[-1]['content'] if msgs else ''
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
 
-    def last_asst_msg(self):
-        """Get the content of the last assistant message."""
+    def last_asst_msg(self, content_only=False):
+        """
+        Get the last assistant message.
+        
+        Args:
+            content_only: If True, return just the content string. 
+                          If False (default), return the full event dict.
+        
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no messages.
+        """
         msgs = self.get_msgs(include=['assistant'])
-        return msgs[-1]['content'] if msgs else ''
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
 
-    def last_sys_msg(self):
-        """Get the content of the last system message."""
+    def last_sys_msg(self, content_only=False):
+        """
+        Get the last system message.
+        
+        Args:
+            content_only: If True, return just the content string. 
+                          If False (default), return the full event dict.
+        
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no messages.
+        """
         msgs = self.get_msgs(include=['system'])
-        return msgs[-1]['content'] if msgs else ''
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
 
-    def last_log_msg(self):
-        """Get the content of the last log message."""
+    def last_log_msg(self, content_only=False):
+        """
+        Get the last log message.
+        
+        Args:
+            content_only: If True, return just the content string. 
+                          If False (default), return the full event dict.
+        
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no logs.
+        """
         logs = self.get_logs()
-        return logs[-1]['content'] if logs else ''
+        if not logs:
+            return '' if content_only else None
+        return logs[-1]['content'] if content_only else logs[-1]
+
+    def last_ref(self, content_only=False):
+        """
+        Get the last reflection.
+        
+        Args:
+            content_only: If True, return just the content string. 
+                          If False (default), return the full event dict.
+        
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no reflections.
+        """
+        refs = self.get_refs()
+        if not refs:
+            return '' if content_only else None
+        return refs[-1]['content'] if content_only else refs[-1]
 
     def prepare_context(
         self,

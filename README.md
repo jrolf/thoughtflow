@@ -374,10 +374,14 @@ user_msgs = memory.get_msgs(include=["user"])             # Only user messages
 web_msgs = memory.get_msgs(channel="webapp")              # Only webapp channel
 recent = memory.get_msgs(limit=5)                         # Last 5 messages
 
-# Quick access to most recent
-memory.last_user_msg()    # "Also checking on mobile"
-memory.last_asst_msg()    # "Hi there! How can I help?"
-memory.last_sys_msg()     # Last system message (if any)
+# Quick access to most recent (returns full event dict by default)
+memory.last_user_msg()                    # Returns: {'stamp': '...', 'content': 'Also checking on mobile', ...}
+memory.last_asst_msg()                    # Returns: {'stamp': '...', 'content': 'Hi there!', ...}
+memory.last_sys_msg()                     # Returns: {'stamp': '...', 'content': '...', ...}
+
+# Or get just the content string
+memory.last_user_msg(content_only=True)   # Returns: "Also checking on mobile"
+memory.last_asst_msg(content_only=True)   # Returns: "Hi there! How can I help?"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LOGS & REFLECTIONS — internal agent reasoning
@@ -392,10 +396,17 @@ memory.add_log("Response generated successfully")
 memory.add_ref("User seems interested in weather patterns")
 memory.add_ref("Should ask clarifying questions about location")
 
-# Retrieve logs and reflections
-memory.get_logs()         # All log entries
-memory.get_refs()         # All reflections
-memory.last_log_msg()     # Most recent log
+# Retrieve logs and reflections (returns lists of event dicts)
+memory.get_logs()                         # All log entries as list of dicts
+memory.get_refs()                         # All reflections as list of dicts
+
+# Quick access to most recent (returns full event dict by default)
+memory.last_log_msg()                     # Returns: {'stamp': '...', 'content': '...', ...}
+memory.last_ref()                         # Returns: {'stamp': '...', 'content': '...', ...}
+
+# Or get just the content string
+memory.last_log_msg(content_only=True)    # Returns: "Response generated successfully"
+memory.last_ref(content_only=True)        # Returns: "Should ask clarifying questions..."
 
 # ═══════════════════════════════════════════════════════════════════════════
 # VARIABLES — with FULL HISTORY tracking
