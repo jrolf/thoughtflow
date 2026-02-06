@@ -318,7 +318,7 @@ class THOUGHT:
                 self.last_response = response
 
                 # Get channel from config for message tracking
-                channel = self.config.get("channel", "system")
+                channel = self.config.get("channel", "api")
                 
                 # Add assistant message to memory (if possible)
                 if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):

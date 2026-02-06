@@ -54,23 +54,18 @@
 ## 🚀 Installation
 
 ```bash
-# Core library (ZERO dependencies - stdlib only!)
 pip install thoughtflow
-
-# With OpenAI support
-pip install thoughtflow[openai]
-
-# With Anthropic support
-pip install thoughtflow[anthropic]
-
-# With local model support (Ollama)
-pip install thoughtflow[local]
-
-# With all providers
-pip install thoughtflow[all-providers]
 ```
 
-**That's it.** The core library has **zero dependencies** — it uses only Python's standard library. Provider adapters are optional extras that bring in only what you need.
+**That's it.** The core library has **zero dependencies** — it uses only Python's standard library.
+
+```bash
+# Upgrade to the latest version
+pip install --upgrade thoughtflow
+
+# Pin to a specific version for stability
+pip install thoughtflow==0.0.4
+```
 
 ---
 
@@ -82,20 +77,24 @@ Here's a complete working example. Copy, paste, run:
 import os
 from thoughtflow import LLM, MEMORY, THOUGHT
 
-# 1. Create an LLM instance with your provider
+# 1. Get your API key from environment variables
+#    Set it first: export OPENAI_API_KEY="sk-..."
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("Please set OPENAI_API_KEY environment variable")
+
+# 2. Create an LLM instance
 #    Format: "provider:model"
-api_key = os.environ.get("OPENAI_API_KEY", "your-api-key")
 llm = LLM("openai:gpt-4o", key=api_key)
 
-# 2. Create a MEMORY to store conversation state
+# 3. Create a MEMORY to store conversation state
 #    MEMORY is an event-sourced container that tracks everything
 memory = MEMORY()
 
-# 3. Add a user message to memory
-#    Messages can have channels for multi-platform agents
-memory.add_msg("user", "What is the meaning of life?", channel="cli")
+# 4. Add a user message to memory
+memory.add_msg("user", "What is the meaning of life?")
 
-# 4. Create a THOUGHT - the atomic unit of cognition
+# 5. Create a THOUGHT - the atomic unit of cognition
 #    A THOUGHT combines: Prompt + Context + LLM + Parsing + Validation
 thought = THOUGHT(
     name="respond",
@@ -103,22 +102,16 @@ thought = THOUGHT(
     prompt="You are a wise philosopher. Answer: {last_user_msg}",
 )
 
-# 5. Execute the thought
-#    This is THE pattern: memory = thought(memory)
-print("Calling LLM...")
+# 6. Execute the thought — this is THE pattern
 memory = thought(memory)
 
-# 6. Get the result
-#    Results are stored in memory as variables
+# 7. Get the result
 result = memory.get_var("respond_result")
 print(f"Response: {result}")
-# Output: "Response: The meaning of life is a profound philosophical question that..."
+# Output: "The meaning of life is a profound philosophical question..."
 
-# 7. View the full conversation
+# 8. View the full conversation
 print(memory.render(output_format="conversation"))
-# Output:
-# User: What is the meaning of life?
-# Assistant: The meaning of life is a profound philosophical question that...
 ```
 
 **The universal pattern is `memory = thought(memory)`.** That's not a simplification — that's the actual API. Everything flows through MEMORY.
