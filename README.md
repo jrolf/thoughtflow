@@ -227,16 +227,16 @@ Switching to ThoughtFlow? Here's what you can remove from your project:
 ThoughtFlow gives you **four concepts**. Master these, and you've mastered the framework.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
+┌───────────────────────────────────────────────────────────────────────┐
+│                                                                       │
 │   ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐      │
 │   │   LLM   │ ──▶  │ THOUGHT │ ──▶  │ MEMORY  │ ◀──  │ ACTION  │      │
 │   └─────────┘      └─────────┘      └─────────┘      └─────────┘      │
-│        │                │                │                │            │
-│   Any model        Cognition         State            External         │
-│   Any provider     unit              container        operations       │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+│        │                │                │                │           │
+│   Any model        Cognition         State            External        │
+│   Any provider     unit              container        operations      │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 | Primitive | What It Does | The Pattern |
