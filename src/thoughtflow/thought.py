@@ -611,11 +611,11 @@ class THOUGHT:
                     val = getattr(memory, var, None)
                 if val is not None:
                     ctx[var] = val
-        # Add some common context keys if available
+        # Add some common context keys if available (content_only=True for prompt templates)
         if hasattr(memory, "last_user_msg") and callable(getattr(memory, "last_user_msg", None)):
-            ctx["last_user_msg"] = memory.last_user_msg()
+            ctx["last_user_msg"] = memory.last_user_msg(content_only=True)
         if hasattr(memory, "last_asst_msg") and callable(getattr(memory, "last_asst_msg", None)):
-            ctx["last_asst_msg"] = memory.last_asst_msg()
+            ctx["last_asst_msg"] = memory.last_asst_msg(content_only=True)
         if hasattr(memory, "get_msgs") and callable(getattr(memory, "get_msgs", None)):
             ctx["messages"] = memory.get_msgs(repr="list")
         # Add all memory.vars if present
