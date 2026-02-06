@@ -281,6 +281,19 @@ class THOUGHT:
 
         return memory
 
+    def _build_repair_suffix(self, why):
+        """
+        Build the repair suffix for retry attempts.
+        Subclasses can override this to customize repair prompts.
+        
+        Args:
+            why (str): Reason the previous attempt failed.
+        
+        Returns:
+            str: Suffix to append to the prompt for retry.
+        """
+        return "\n(Please return only the requested format; your last answer failed: {})".format(why)
+
     def _execute_llm_call(self, memory, vars, **kwargs):
         """
         Execute an LLM call operation with retry logic.
@@ -351,7 +364,7 @@ class THOUGHT:
                     if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                         memory.add_log("Thought '{}' validation failed: {}".format(self.name, why))
                     # Create repair suffix for next retry (modify working_prompt, not original)
-                    repair_suffix = "\n(Please return only the requested format; your last answer failed: {}.)" .format(why)
+                    repair_suffix = self._build_repair_suffix(why)
                     if isinstance(original_prompt, str):
                         working_prompt = original_prompt.rstrip() + repair_suffix
                     elif isinstance(original_prompt, dict):
@@ -364,7 +377,7 @@ class THOUGHT:
                 if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                     memory.add_log("Thought '{}' error: {}".format(self.name, last_error))
                 # Create repair suffix for next retry (modify working_prompt, not original)
-                repair_suffix = "\n(Please return only the requested format; your last answer failed: {}.)".format(last_error)
+                repair_suffix = self._build_repair_suffix(last_error)
                 if isinstance(original_prompt, str):
                     working_prompt = original_prompt.rstrip() + repair_suffix
                 elif isinstance(original_prompt, dict):

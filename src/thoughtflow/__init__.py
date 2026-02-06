@@ -11,7 +11,16 @@ Core Primitives:
     - LLM: Multi-provider interface for language model calls
     - MEMORY: Event-sourced state container (messages, logs, reflections, variables)
     - THOUGHT: Unit of cognition (Prompt + Context + LLM + Parsing + Validation)
+    - DECIDE: Constrained decisions from finite choices (subclass of THOUGHT)
+    - PLAN: Structured multi-step execution plans (subclass of THOUGHT)
     - ACTION: External operation wrapper with consistent logging
+
+Action Primitives (elemental agent verbs):
+    - Communication: SAY, ASK, NOTIFY
+    - Information Retrieval: SEARCH, FETCH, SCRAPE, READ
+    - Persistence: WRITE, POST
+    - Temporal Control: SLEEP, WAIT, NOOP
+    - Execution: RUN, CALL
 
 Basic Usage:
     >>> from thoughtflow import LLM, MEMORY, THOUGHT
@@ -33,9 +42,33 @@ from __future__ import annotations
 
 # Core primitives
 from thoughtflow.llm import LLM
-from thoughtflow.memory.base import MEMORY
+from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
+from thoughtflow.thoughts import DECIDE, PLAN
 from thoughtflow.action import ACTION
+
+# Action primitives
+from thoughtflow.actions import (
+    # Communication
+    SAY,
+    ASK,
+    NOTIFY,
+    # Information Retrieval
+    SEARCH,
+    FETCH,
+    SCRAPE,
+    READ,
+    # Persistence
+    WRITE,
+    POST,
+    # Temporal Control
+    SLEEP,
+    WAIT,
+    NOOP,
+    # Execution
+    RUN,
+    CALL,
+)
 
 # Utilities
 from thoughtflow._util import (
@@ -48,15 +81,10 @@ from thoughtflow._util import (
     ValidExtractError,
 )
 
-# Deprecated (for backward compatibility)
-from thoughtflow.agent import Agent, TracedAgent
-
 # Keep message types for potential utility
 from thoughtflow.message import Message, MessageList
 
-# Submodule access (keep tools, trace, eval for advanced usage)
-from thoughtflow import tools
-from thoughtflow import memory
+# Submodule access (trace, eval for advanced usage)
 from thoughtflow import trace
 from thoughtflow import eval
 
@@ -74,7 +102,28 @@ __all__ = [
     "LLM",
     "MEMORY",
     "THOUGHT",
+    "DECIDE",
+    "PLAN",
     "ACTION",
+    # Action Primitives - Communication
+    "SAY",
+    "ASK",
+    "NOTIFY",
+    # Action Primitives - Information Retrieval
+    "SEARCH",
+    "FETCH",
+    "SCRAPE",
+    "READ",
+    # Action Primitives - Persistence
+    "WRITE",
+    "POST",
+    # Action Primitives - Temporal Control
+    "SLEEP",
+    "WAIT",
+    "NOOP",
+    # Action Primitives - Execution
+    "RUN",
+    "CALL",
     # Utilities
     "EventStamp",
     "event_stamp",
@@ -86,12 +135,7 @@ __all__ = [
     # Types
     "Message",
     "MessageList",
-    # Deprecated
-    "Agent",
-    "TracedAgent",
     # Submodules
-    "tools",
-    "memory",
     "trace",
     "eval",
     # Metadata

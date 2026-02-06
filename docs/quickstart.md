@@ -97,39 +97,6 @@ session.save("trace.json")
 
 ---
 
-## Using Tools
-
-Define tools that your agent can use:
-
-```python
-from thoughtflow.tools import Tool, ToolResult
-
-class Calculator(Tool):
-    name = "calculator"
-    description = "Perform basic arithmetic"
-
-    def get_schema(self):
-        return {
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string", "description": "Math expression"}
-            },
-            "required": ["expression"]
-        }
-
-    def call(self, payload, params=None):
-        try:
-            result = eval(payload["expression"])  # Note: use safe eval in production!
-            return ToolResult.ok(result)
-        except Exception as e:
-            return ToolResult.fail(str(e))
-
-# Register tools with your agent
-calculator = Calculator()
-```
-
----
-
 ## Switching Providers
 
 ThoughtFlow makes it easy to switch between providers:
@@ -160,5 +127,4 @@ response = openai_agent.call(messages)
 
 - [Agent Concepts](concepts/agent.md) - Deep dive into the Agent contract
 - [Adapters](concepts/adapters.md) - Learn about provider adapters
-- [Tools](concepts/tools.md) - Add capabilities to your agents
 - [Tracing](concepts/tracing.md) - Debug and evaluate your agents

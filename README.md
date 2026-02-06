@@ -65,6 +65,9 @@ pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
 pip install thoughtflow==0.0.4
+
+# Check your installed version
+python -c "import thoughtflow; print(thoughtflow.__version__)"
 ```
 
 ---
@@ -241,9 +244,11 @@ ThoughtFlow gives you **four concepts**. Master these, and you've mastered the f
 | **LLM** | Unified interface to call any language model | `response = llm.call(messages)` |
 | **MEMORY** | Event-sourced state container for everything | `memory.add_msg("user", "Hello!")` |
 | **THOUGHT** | Atomic unit of cognition with retry/parsing | `memory = thought(memory)` |
+| **DECIDE** | Constrained decisions from finite choices | `memory = decide(memory)` |
+| **PLAN** | Structured multi-step execution plans | `memory = plan(memory)` |
 | **ACTION** | External operations with consistent logging | `memory = action(memory, **kwargs)` |
 
-That's it. Four concepts. No 47-page tutorial to understand the basics.
+That's it. Six core primitives. No 47-page tutorial to understand the basics.
 
 ---
 
@@ -740,7 +745,167 @@ thought.last_response    # Raw LLM response
 
 ---
 
-### 4. `ACTION` — External Operations
+### 4. `DECIDE` — Constrained Decision Steps
+
+DECIDE is a specialized THOUGHT that constrains LLM output to a finite set of choices. Perfect for routing, classification, and branching logic:
+
+```python
+from thoughtflow import LLM, MEMORY, DECIDE
+
+llm = LLM("openai:gpt-4o", key="...")
+memory = MEMORY()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SIMPLE LIST OF CHOICES
+# ═══════════════════════════════════════════════════════════════════════════
+
+sentiment = DECIDE(
+    name="classify_sentiment",
+    llm=llm,
+    choices=["positive", "negative", "neutral"],
+    prompt="Classify the sentiment of: {text}",
+)
+
+memory.set_var("text", "I absolutely love this product!")
+memory = sentiment(memory)
+print(memory.get_var("classify_sentiment_result"))  # "positive"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DICT WITH DESCRIPTIONS (shown to LLM)
+# ═══════════════════════════════════════════════════════════════════════════
+
+router = DECIDE(
+    name="route_request",
+    llm=llm,
+    choices={
+        "approve": "Accept the request and proceed",
+        "reject": "Deny the request with explanation",
+        "escalate": "Send to human reviewer for decision",
+    },
+    prompt="Review this support ticket: {ticket}\n\nDecide how to handle it.",
+    default="escalate",  # Fallback if all retries fail
+)
+
+memory.set_var("ticket", "Customer requesting refund for damaged item")
+memory = router(memory)
+result = memory.get_var("route_request_result")  # "approve", "reject", or "escalate"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURES
+# ═══════════════════════════════════════════════════════════════════════════
+
+# DECIDE defaults to max_retries=5 (vs THOUGHT's 1)
+# because classification often needs more attempts
+
+# Smart parsing handles LLM verbosity:
+# "I would choose: approve" → "approve"
+# "APPROVE" → "approve" (case-insensitive by default)
+
+# Choice-specific repair prompts:
+# "(Respond with exactly one of: approve, reject, escalate. No other text.)"
+```
+
+**Key features:**
+- **Constrained output** — Forces LLM to pick from valid choices
+- **Flexible input** — List for simple choices, dict for choices with descriptions
+- **Smart parsing** — Handles exact matches, embedded choices, and case variations
+- **Higher retry default** — 5 retries vs THOUGHT's 1, since classification often needs correction
+- **Default fallback** — Optional default choice when all retries fail
+- **Inherits from THOUGHT** — Full serialization, hooks, and history support
+
+---
+
+### 5. `PLAN` — Structured Multi-Step Planning
+
+PLAN generates structured execution plans where an LLM creates a sequence of steps with parallel task support. Each task includes a reason explaining why it was chosen:
+
+```python
+from thoughtflow import LLM, MEMORY, PLAN
+
+llm = LLM("openai:gpt-4o", key="...")
+memory = MEMORY()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SIMPLE ACTIONS (descriptions only)
+# ═══════════════════════════════════════════════════════════════════════════
+
+planner = PLAN(
+    name="research_plan",
+    llm=llm,
+    actions={
+        "search": "Search the web for information",
+        "analyze": "Analyze content for key insights",
+        "summarize": "Create a concise summary",
+        "notify": "Send notification to user",
+    },
+    prompt="Create a plan to achieve: {goal}",
+)
+
+memory.set_var("goal", "Research ThoughtFlow and summarize findings")
+memory = planner(memory)
+plan = memory.get_var("research_plan_result")
+# [
+#     [{"action": "search", "params": {"query": "ThoughtFlow"},
+#       "reason": "Start by gathering information about the library."}],
+#     [{"action": "analyze", "params": {"content": "{step_0_result}"},
+#       "reason": "Extract key insights from search results."}],
+#     [{"action": "summarize", "params": {"text": "{step_1_result}"},
+#       "reason": "Condense findings into actionable summary."},
+#      {"action": "notify", "params": {"message": "Research complete"},
+#       "reason": "Alert user that the task is finished."}]
+# ]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ACTIONS WITH PARAMETER SCHEMAS
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Use "?" suffix for optional parameters (e.g., "int?" means optional int)
+planner = PLAN(
+    name="workflow",
+    llm=llm,
+    actions={
+        "search": {
+            "description": "Search for information",
+            "params": {"query": "str", "max_results": "int?"}
+        },
+        "fetch": {
+            "description": "Fetch a resource by URL",
+            "params": {"url": "str"}
+        },
+        "notify": {
+            "description": "Send notification",
+            "params": {"message": "str", "channel": "str?"}
+        }
+    },
+    prompt="Plan to achieve: {goal}\nContext: {context}",
+    max_steps=10,      # Maximum sequential steps
+    max_parallel=5,    # Maximum parallel tasks per step
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OUTPUT STRUCTURE
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Plan = List of Steps (executed sequentially)
+# Step = List of Tasks (can execute in parallel)
+# Task = {"action": "...", "params": {...}, "reason": "..."}
+
+# Tasks can reference previous step results:
+# {"action": "analyze", "params": {"content": "{step_0_result}"}, "reason": "..."}
+```
+
+**Key features:**
+- **Structured output** — `List[List[Dict]]` for steps with parallel tasks
+- **Explainable** — Each task requires a `reason` field (1-3 sentences)
+- **Flexible actions** — Simple descriptions or full parameter schemas
+- **Parameter validation** — Required vs optional params with `?` suffix
+- **Step references** — Tasks can reference `{step_N_result}` from previous steps
+- **Configurable limits** — `max_steps` and `max_parallel` constraints
+- **Inherits from THOUGHT** — Full retry, serialization, and hook support
+
+---
+
+### 6. `ACTION` — External Operations
 
 ACTION wraps external operations (API calls, file I/O, database queries) with consistent logging and error handling:
 
@@ -1391,7 +1556,7 @@ See [developer/](developer/) for comprehensive development documentation.
 
 | Aspect | Status | Notes |
 |--------|--------|-------|
-| **Core Primitives** | ✅ Stable | LLM, MEMORY, THOUGHT, ACTION |
+| **Core Primitives** | ✅ Stable | LLM, MEMORY, THOUGHT, DECIDE, PLAN, ACTION |
 | **API Stability** | 🟡 Alpha | May evolve based on feedback |
 | **Documentation** | 🟡 In Progress | Core docs complete, expanding |
 | **Test Coverage** | ✅ Comprehensive | Unit + integration tests |

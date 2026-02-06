@@ -3,6 +3,24 @@ MEMORY class for ThoughtFlow.
 
 The MEMORY class serves as an event-sourced state container for managing events, 
 logs, messages, reflections, and variables within the Thoughtflow framework.
+
+Example:
+    >>> from thoughtflow import MEMORY
+    >>>
+    >>> memory = MEMORY()
+    >>> memory.add_msg('user', 'Hello!', channel='webapp')
+    >>> memory.add_msg('assistant', 'Hi there!', channel='webapp')
+    >>> memory.set_var('session_id', 'abc123', desc='Current session')
+    >>>
+    >>> # Get messages
+    >>> memory.get_msgs(include=['user'])
+    >>>
+    >>> # Prepare context for LLM
+    >>> context = memory.prepare_context(format='openai')
+    >>>
+    >>> # Save/load state
+    >>> memory.save('memory.pkl')
+    >>> memory.to_json('memory.json')
 """
 
 from __future__ import annotations
@@ -1721,3 +1739,8 @@ True
 For more details, see the MEMORY class docstring and method documentation.
 ------------------------------------------------------------
 """
+
+
+__all__ = [
+    "MEMORY",
+]

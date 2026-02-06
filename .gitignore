@@ -1,6 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
+**/*.py[cod]
 *$py.class
 
 # C extensions
@@ -25,6 +27,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Other
+.PLANS/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -168,3 +173,34 @@ cython_debug/
 # This folder contains reference materials, notes, and files used to provide
 # context during AI-assisted development sessions. Not part of the codebase.
 .context/
+
+# ============================================================================
+# AI Assistant Configuration (Cursor, Claude, etc.)
+# ============================================================================
+# These are local IDE/assistant settings and rules that should not be committed.
+# Patterns cover files and folders at any depth in the repo.
+
+# Cursor
+.cursor
+.cursor/
+**/.cursor
+**/.cursor/
+.cursorrules
+.cursorrules/
+**/.cursorrules
+**/.cursorrules/
+*.mdc
+
+# Claude
+.claude
+.claude/
+**/.claude
+**/.claude/
+.clauderules
+.clauderules/
+**/.clauderules
+**/.clauderules/
+claude.json
+**/claude.json
+.claude_*
+**/.claude_*

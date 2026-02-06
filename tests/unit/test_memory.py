@@ -224,45 +224,83 @@ class TestMessageOperations:
         # Should return the last 3 (most recent)
         assert msgs[-1]['content'] == 'Message 9'
 
-    def test_last_user_msg_returns_content(self, memory):
+    def test_last_user_msg_returns_full_event(self, memory):
         """
-        last_user_msg must return the content of the last user message.
+        last_user_msg must return the full event dict by default.
         
-        This is a convenience method for common prompt patterns.
+        This follows the event-sourced pattern where events are dicts.
         
-        Remove this test if: We remove convenience methods.
+        Remove this test if: We change return type.
         """
         import time
         memory.add_msg('user', 'First', channel='webapp')
         time.sleep(0.001)  # Ensure distinct timestamps for ordering
         memory.add_msg('user', 'Last', channel='webapp')
         
-        assert memory.last_user_msg() == 'Last'
+        result = memory.last_user_msg()
+        assert isinstance(result, dict)
+        assert result['content'] == 'Last'
+        assert result['role'] == 'user'
 
-    def test_last_asst_msg_returns_content(self, memory):
+    def test_last_user_msg_content_only(self, memory):
         """
-        last_asst_msg must return the content of the last assistant message.
+        last_user_msg(content_only=True) must return just the content string.
         
-        This is a convenience method for common prompt patterns.
+        This is a convenience for prompt templates.
         
-        Remove this test if: We remove convenience methods.
+        Remove this test if: We remove content_only option.
+        """
+        memory.add_msg('user', 'Test message', channel='webapp')
+        
+        assert memory.last_user_msg(content_only=True) == 'Test message'
+
+    def test_last_asst_msg_returns_full_event(self, memory):
+        """
+        last_asst_msg must return the full event dict by default.
+        
+        This follows the event-sourced pattern where events are dicts.
+        
+        Remove this test if: We change return type.
         """
         import time
         memory.add_msg('assistant', 'First response', channel='webapp')
         time.sleep(0.001)  # Ensure distinct timestamps for ordering
         memory.add_msg('assistant', 'Last response', channel='webapp')
         
-        assert memory.last_asst_msg() == 'Last response'
+        result = memory.last_asst_msg()
+        assert isinstance(result, dict)
+        assert result['content'] == 'Last response'
+        assert result['role'] == 'assistant'
 
-    def test_last_user_msg_returns_empty_if_none(self, memory):
+    def test_last_asst_msg_content_only(self, memory):
         """
-        last_user_msg must return empty string if no user messages exist.
+        last_asst_msg(content_only=True) must return just the content string.
+        
+        This is a convenience for prompt templates.
+        
+        Remove this test if: We remove content_only option.
+        """
+        memory.add_msg('assistant', 'Test response', channel='webapp')
+        
+        assert memory.last_asst_msg(content_only=True) == 'Test response'
+
+    def test_last_user_msg_returns_none_if_none(self, memory):
+        """
+        last_user_msg must return None if no user messages exist.
+        
+        Remove this test if: We change empty behavior.
+        """
+        assert memory.last_user_msg() is None
+
+    def test_last_user_msg_content_only_returns_empty_if_none(self, memory):
+        """
+        last_user_msg(content_only=True) must return empty string if no messages.
         
         This prevents None-related errors in prompt templates.
         
         Remove this test if: We change empty behavior.
         """
-        assert memory.last_user_msg() == ''
+        assert memory.last_user_msg(content_only=True) == ''
 
 
 # ============================================================================
@@ -324,18 +362,32 @@ class TestLogOperations:
         
         assert len(logs) == 3
 
-    def test_last_log_msg_returns_content(self, memory):
+    def test_last_log_msg_returns_full_event(self, memory):
         """
-        last_log_msg must return the content of the last log entry.
+        last_log_msg must return the full event dict by default.
         
-        This is a convenience method for debugging.
+        This follows the event-sourced pattern where events are dicts.
         
-        Remove this test if: We remove convenience methods.
+        Remove this test if: We change return type.
         """
         memory.add_log('First log')
         memory.add_log('Last log')
         
-        assert memory.last_log_msg() == 'Last log'
+        result = memory.last_log_msg()
+        assert isinstance(result, dict)
+        assert result['content'] == 'Last log'
+
+    def test_last_log_msg_content_only(self, memory):
+        """
+        last_log_msg(content_only=True) must return just the content string.
+        
+        This is a convenience method for debugging.
+        
+        Remove this test if: We remove content_only option.
+        """
+        memory.add_log('Test log')
+        
+        assert memory.last_log_msg(content_only=True) == 'Test log'
 
 
 # ============================================================================
@@ -743,7 +795,7 @@ class TestSerialization:
         restored = MEMORY.from_events(events)
         
         assert len(restored.get_msgs()) == 2
-        assert restored.last_user_msg() == 'Hello'
+        assert restored.last_user_msg(content_only=True) == 'Hello'
 
     def test_from_events_rehydrates_variables(self, memory):
         """
@@ -808,7 +860,7 @@ class TestSerialization:
         json_str = memory.to_json()
         restored = MEMORY.from_json(json_str)
         
-        assert restored.last_user_msg() == 'Test message'
+        assert restored.last_user_msg(content_only=True) == 'Test message'
         assert restored.get_var('name') == 'Alice'
 
     def test_save_load_roundtrip(self, memory, temp_file):
@@ -827,7 +879,7 @@ class TestSerialization:
         restored = MEMORY()
         restored.load(str(temp_file))
         
-        assert restored.last_user_msg() == 'Hello'
+        assert restored.last_user_msg(content_only=True) == 'Hello'
         assert restored.get_var('counter') == 42
 
     @pytest.mark.skip(reason="MEMORY.copy() fails due to internal module reference (_bisect)")
@@ -968,38 +1020,38 @@ class TestRender:
 
     def test_render_plain_format(self, populated_memory):
         """
-        render with output_format='plain' must return plain text.
+        render with format='plain' must return plain text.
         
         This is suitable for logging and debugging.
         
         Remove this test if: We remove plain format.
         """
-        result = populated_memory.render(output_format='plain')
+        result = populated_memory.render(format='plain')
         
         assert isinstance(result, str)
         assert 'Hello' in result or 'USER' in result
 
     def test_render_conversation_format(self, populated_memory):
         """
-        render with output_format='conversation' must return LLM-ready text.
+        render with format='conversation' must return LLM-ready text.
         
         This format is optimized for including in prompts.
         
         Remove this test if: We remove conversation format.
         """
-        result = populated_memory.render(output_format='conversation')
+        result = populated_memory.render(format='conversation')
         
         assert isinstance(result, str)
 
     def test_render_json_format(self, populated_memory):
         """
-        render with output_format='json' must return valid JSON.
+        render with format='json' must return valid JSON.
         
         This enables programmatic access to memory contents.
         
         Remove this test if: We remove JSON format.
         """
-        result = populated_memory.render(output_format='json')
+        result = populated_memory.render(format='json')
         
         # Should be valid JSON
         data = json.loads(result)
@@ -1017,7 +1069,7 @@ class TestRender:
         memory.add_msg('assistant', 'Assistant responds', channel='webapp')
         
         result = memory.render(
-            output_format='plain',
+            format='plain',
             role_filter=['user'],
         )
         
