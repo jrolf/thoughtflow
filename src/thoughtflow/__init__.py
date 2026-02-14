@@ -46,6 +46,7 @@ from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
 from thoughtflow.thoughts import DECIDE, PLAN
 from thoughtflow.action import ACTION
+from thoughtflow.chat import CHAT
 
 # Action primitives
 from thoughtflow.actions import (
@@ -105,6 +106,7 @@ __all__ = [
     "DECIDE",
     "PLAN",
     "ACTION",
+    "CHAT",
     # Action Primitives - Communication
     "SAY",
     "ASK",
