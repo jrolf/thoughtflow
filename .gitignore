@@ -204,3 +204,11 @@ claude.json
 **/claude.json
 .claude_*
 **/.claude_*
+
+# Sand Box
+.sandbox/
+.explore/
+.projects/
+.research/
+.experiments/
+
