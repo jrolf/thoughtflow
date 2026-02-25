@@ -77,7 +77,7 @@ def example_read_write():
     write_action = WRITE(
         name="save_config",
         path=temp_path,
-        content={"name": "ThoughtFlow", "version": "0.0.6"},
+        content={"name": "ThoughtFlow", "version": "0.0.7"},
         mode="json"
     )
     memory = write_action(memory)

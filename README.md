@@ -64,7 +64,7 @@ pip install thoughtflow
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.0.6
+pip install thoughtflow==0.0.7
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
