@@ -551,6 +551,157 @@ class TestSEARCH:
         assert restored.query == "test query"
         assert restored.provider == "brave"
 
+    def test_accepts_google_provider(self):
+        """SEARCH accepts the google provider."""
+        search = SEARCH(query="test", provider="google")
+        assert search.provider == "google"
+
+    def test_google_requires_api_key(self, memory):
+        """SEARCH with Google requires API key (error captured by ACTION)."""
+        search = SEARCH(query="test", provider="google")
+        search(memory)
+        assert search.last_error is not None
+        assert "requires API key" in str(search.last_error)
+
+    @mock.patch.dict(os.environ, {"GOOGLE_SEARCH_API_KEY": "fake-key"})
+    def test_google_requires_cx(self, memory):
+        """SEARCH with Google requires a search engine ID (CX)."""
+        search = SEARCH(query="test", provider="google")
+        search(memory)
+        assert search.last_error is not None
+        assert "search engine ID" in str(search.last_error)
+
+    def test_google_cx_from_init(self):
+        """SEARCH stores google_cx from init parameter."""
+        search = SEARCH(
+            query="test", provider="google",
+            api_key="key", google_cx="my-cx"
+        )
+        assert search.google_cx == "my-cx"
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_google_search(self, mock_urlopen, memory):
+        """SEARCH dispatches to Google and normalizes results."""
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "searchInformation": {"totalResults": "42"},
+            "items": [
+                {
+                    "title": "Test Page",
+                    "link": "https://example.com/page",
+                    "snippet": "A test snippet",
+                    "displayLink": "example.com",
+                    "pagemap": {
+                        "metatags": [
+                            {"article:published_time": "2026-01-15"}
+                        ]
+                    },
+                }
+            ],
+        }).encode()
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "application/json"}
+        mock_response.url = "https://www.googleapis.com/customsearch/v1"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        search = SEARCH(
+            query="test", provider="google",
+            api_key="key", google_cx="cx-id"
+        )
+        memory = search(memory)
+        result = memory.get_var("search_results")
+
+        assert result["provider"] == "google"
+        assert result["query"] == "test"
+        assert result["total_found"] == 42
+        assert len(result["results"]) == 1
+
+        item = result["results"][0]
+        assert item["title"] == "Test Page"
+        assert item["url"] == "https://example.com/page"
+        assert item["snippet"] == "A test snippet"
+        assert item["rank"] == 1
+        assert item["source"] == "example.com"
+        assert item["date_published"] == "2026-01-15"
+        assert isinstance(item["extra"], dict)
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_brave_enriched_fields(self, mock_urlopen, memory):
+        """Brave results include source, date_published, and extra."""
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "web": {
+                "results": [
+                    {
+                        "title": "Brave Result",
+                        "url": "https://docs.python.org/page",
+                        "description": "A brave snippet",
+                        "page_age": "2026-02-01",
+                        "language": "en",
+                        "favicon": "https://docs.python.org/favicon.ico",
+                    }
+                ],
+                "total": 100,
+            }
+        }).encode()
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "application/json"}
+        mock_response.url = "https://api.search.brave.com/res/v1/web/search"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        search = SEARCH(query="test", provider="brave", api_key="key")
+        memory = search(memory)
+        result = memory.get_var("search_results")
+
+        item = result["results"][0]
+        assert item["source"] == "docs.python.org"
+        assert item["date_published"] == "2026-02-01"
+        assert item["extra"]["language"] == "en"
+        assert item["extra"]["favicon"] == "https://docs.python.org/favicon.ico"
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_duckduckgo_enriched_fields(self, mock_urlopen, memory):
+        """DuckDuckGo results include source field (domain extracted from URL)."""
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "Abstract": "Python is a programming language",
+            "AbstractURL": "https://en.wikipedia.org/wiki/Python",
+            "AbstractSource": "Wikipedia",
+            "Heading": "Python",
+            "RelatedTopics": [],
+        }).encode()
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "application/json"}
+        mock_response.url = "https://api.duckduckgo.com/"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        search = SEARCH(query="python", provider="duckduckgo")
+        memory = search(memory)
+        result = memory.get_var("search_results")
+
+        item = result["results"][0]
+        assert item["source"] == "en.wikipedia.org"
+        assert item["date_published"] is None
+        assert item["extra"]["abstract_source"] == "Wikipedia"
+
+    def test_from_dict_with_google_cx(self):
+        """SEARCH.from_dict can accept google_cx via kwargs."""
+        data = {
+            "name": "gsearch",
+            "provider": "google",
+            "query": "test",
+            "max_results": 3,
+        }
+        search = SEARCH.from_dict(data, api_key="k", google_cx="cx-123")
+        assert search.google_cx == "cx-123"
+        assert search.provider == "google"
+
 
 # ============================================================================
 # SCRAPE Tests
@@ -619,6 +770,223 @@ class TestSCRAPE:
         assert restored.url == "https://example.com"
         assert restored.extract == "tables"
         assert restored.clean == False
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_extracts_markdown_headings(self, mock_urlopen, memory):
+        """SCRAPE markdown mode converts headings to markdown syntax."""
+        html = (
+            b'<html><body>'
+            b'<h1>Main Title</h1>'
+            b'<h2>Section</h2>'
+            b'<p>Some paragraph text.</p>'
+            b'</body></html>'
+        )
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="markdown")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert "# Main Title" in result
+        assert "## Section" in result
+        assert "Some paragraph text." in result
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_extracts_markdown_links_and_bold(self, mock_urlopen, memory):
+        """SCRAPE markdown mode converts links and bold text."""
+        html = (
+            b'<html><body>'
+            b'<p>Visit <a href="https://test.com">this site</a> '
+            b'for <strong>important</strong> info.</p>'
+            b'</body></html>'
+        )
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="markdown")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert "[this site](https://test.com)" in result
+        assert "**important**" in result
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_extracts_markdown_lists(self, mock_urlopen, memory):
+        """SCRAPE markdown mode converts HTML lists to markdown."""
+        html = (
+            b'<html><body>'
+            b'<ul><li>Alpha</li><li>Beta</li></ul>'
+            b'<ol><li>First</li><li>Second</li></ol>'
+            b'</body></html>'
+        )
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="markdown")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert "- Alpha" in result
+        assert "- Beta" in result
+        assert "1. First" in result
+        assert "1. Second" in result
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_extracts_markdown_code_block(self, mock_urlopen, memory):
+        """SCRAPE markdown mode converts pre/code to fenced code blocks."""
+        html = (
+            b'<html><body>'
+            b'<pre><code>x = 42</code></pre>'
+            b'<p>Inline <code>y = 1</code> here</p>'
+            b'</body></html>'
+        )
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="markdown")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert "```" in result
+        assert "x = 42" in result
+        assert "`y = 1`" in result
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_extracts_markdown_table(self, mock_urlopen, memory):
+        """SCRAPE markdown mode converts tables to pipe-delimited format."""
+        html = (
+            b'<html><body>'
+            b'<table>'
+            b'<tr><th>Name</th><th>Value</th></tr>'
+            b'<tr><td>A</td><td>1</td></tr>'
+            b'</table>'
+            b'</body></html>'
+        )
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="markdown")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert "| Name | Value |" in result
+        assert "| --- | --- |" in result
+        assert "| A | 1 |" in result
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_structured_returns_all_keys(self, mock_urlopen, memory):
+        """SCRAPE structured mode returns a dict with all expected keys."""
+        html = (
+            b'<html><head>'
+            b'<title>Test Page</title>'
+            b'<meta name="description" content="A test page">'
+            b'<meta name="author" content="Jane Doe">'
+            b'<meta name="article:published_time" content="2026-03-01">'
+            b'</head><body>'
+            b'<h1>Test Page</h1>'
+            b'<p>Hello world.</p>'
+            b'<a href="https://test.com">Link</a>'
+            b'<img src="photo.jpg" alt="A photo">'
+            b'</body></html>'
+        )
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="structured")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert isinstance(result, dict)
+        assert result["url"] == "https://example.com"
+        assert result["title"] == "Test Page"
+        assert result["description"] == "A test page"
+        assert result["author"] == "Jane Doe"
+        assert result["date_published"] == "2026-03-01"
+        assert "Hello world" in result["content_text"]
+        assert "# Test Page" in result["content_markdown"]
+        assert isinstance(result["headings"], list)
+        assert "Test Page" in result["headings"]
+        assert isinstance(result["links"], list)
+        assert isinstance(result["images"], list)
+        assert result["images"][0]["alt"] == "A photo"
+        assert result["images"][0]["src"] == "photo.jpg"
+        assert isinstance(result["word_count"], int)
+        assert result["word_count"] > 0
+        assert "timestamp" in result
+
+    @mock.patch('thoughtflow.actions._http.urllib.request.urlopen')
+    def test_structured_missing_metadata(self, mock_urlopen, memory):
+        """SCRAPE structured mode handles pages with no metadata gracefully."""
+        html = b'<html><body><p>Just text.</p></body></html>'
+        mock_response = mock.MagicMock()
+        mock_response.read.return_value = html
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "text/html"}
+        mock_response.url = "https://example.com"
+        mock_response.__enter__ = mock.MagicMock(return_value=mock_response)
+        mock_response.__exit__ = mock.MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        scrape = SCRAPE(url="https://example.com", extract="structured")
+        memory = scrape(memory)
+        result = memory.get_var("scrape_content")
+
+        assert result["title"] == ""
+        assert result["description"] == ""
+        assert result["author"] == ""
+        assert result["date_published"] is None
+        assert "Just text" in result["content_text"]
+
+    def test_markdown_mode_in_serialization(self):
+        """SCRAPE with extract='markdown' survives serialization roundtrip."""
+        scrape = SCRAPE(url="https://example.com", extract="markdown")
+        data = scrape.to_dict()
+        restored = SCRAPE.from_dict(data)
+        assert restored.extract == "markdown"
+
+    def test_structured_mode_in_serialization(self):
+        """SCRAPE with extract='structured' survives serialization roundtrip."""
+        scrape = SCRAPE(url="https://example.com", extract="structured")
+        data = scrape.to_dict()
+        restored = SCRAPE.from_dict(data)
+        assert restored.extract == "structured"
 
 
 # ============================================================================

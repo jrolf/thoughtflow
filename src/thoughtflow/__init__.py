@@ -20,6 +20,7 @@ Action Primitives (elemental agent verbs):
     - Information Retrieval: SEARCH, FETCH, SCRAPE, READ
     - Persistence: WRITE, POST
     - Temporal Control: SLEEP, WAIT, NOOP
+    - Scheduling: CHRON
     - Execution: RUN, CALL
 
 Basic Usage:
@@ -42,10 +43,18 @@ from __future__ import annotations
 
 # Core primitives
 from thoughtflow.llm import LLM
+from thoughtflow.embed import EMBED
 from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
 from thoughtflow.thoughts import DECIDE, PLAN
 from thoughtflow.action import ACTION
+from thoughtflow.tool import TOOL
+from thoughtflow.mcp import MCP
+from thoughtflow.agent import AGENT
+from thoughtflow.agents import ReactAgent, ReflectAgent, PlanActAgent
+from thoughtflow.delegate import DELEGATE
+from thoughtflow.workflow import WORKFLOW
+from thoughtflow.chron import CHRON
 from thoughtflow.chat import CHAT
 
 # Action primitives
@@ -101,11 +110,21 @@ except Exception:
 __all__ = [
     # Core Primitives
     "LLM",
+    "EMBED",
     "MEMORY",
     "THOUGHT",
     "DECIDE",
     "PLAN",
     "ACTION",
+    "TOOL",
+    "MCP",
+    "AGENT",
+    "ReactAgent",
+    "ReflectAgent",
+    "PlanActAgent",
+    "DELEGATE",
+    "WORKFLOW",
+    "CHRON",
     "CHAT",
     # Action Primitives - Communication
     "SAY",
