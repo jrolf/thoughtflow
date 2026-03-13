@@ -42,9 +42,9 @@
 <p align="center">
   <a href="#-installation">Install</a> •
   <a href="#-quick-start">Quick Start</a> •
-  <a href="#-the-four-primitives">Primitives</a> •
-  <a href="#-primary-primitives-in-depth">Primary</a> •
-  <a href="#-secondary-primitives-in-depth">Secondary</a> •
+  <a href="#-the-primitives">Primitives</a> •
+  <a href="#-foundational-primitives-in-depth">Foundational</a> •
+  <a href="#-higher-level-primitives">Higher-Level</a> •
   <a href="#-real-world-patterns">Patterns</a> •
   <a href="#-philosophy-the-zen-of-thoughtflow">Philosophy</a>
 </p>
@@ -130,7 +130,7 @@ The modern LLM ecosystem has become an abstraction swamp. Frameworks compete to 
 **ThoughtFlow takes a different path.**
 
 We believe:
-- 🎯 **Your agent logic should fit in your head** — Four primitives, not forty classes
+- 🎯 **Your agent logic should fit in your head** — A few powerful primitives, not forty classes
 - 🔍 **Every state change should be visible and traceable** — Event-sourced memory with full history
 - 🧪 **Testing AI systems should be as easy as testing regular code** — Deterministic replay built-in
 - 📦 **Zero dependencies means zero supply chain nightmares** — Core runs on stdlib only
@@ -145,7 +145,7 @@ This isn't just a library. It's a stance.
 ThoughtFlow is the right choice when:
 
 - **You need serverless deployment** — Lambda, Cloud Functions, Edge. Zero dependencies means instant cold starts.
-- **You want to understand your entire codebase** in an afternoon — Four concepts, not forty.
+- **You want to understand your entire codebase** in an afternoon — A handful of concepts, not forty.
 - **You value explicit state over magic** — Every change is visible, traceable, and replayable.
 - **You need deterministic testing** of AI workflows — Record sessions, replay them, assert on results.
 - **You're building production agents**, not prototypes — Serious error handling, retry logic, validation.
@@ -158,7 +158,7 @@ Be honest with yourself — ThoughtFlow isn't for everyone:
 
 - **You need pre-built RAG pipelines out of the box** → Consider [LlamaIndex](https://github.com/run-llama/llama_index)
 - **You want visual workflow builders** → Consider [Flowise](https://github.com/FlowiseAI/Flowise), [Langflow](https://github.com/langflow-ai/langflow)
-- **You need complex multi-agent orchestration frameworks** → Consider [AutoGen](https://github.com/microsoft/autogen), [CrewAI](https://github.com/joaomdmoura/crewai)
+- **You need very large-scale multi-agent swarms** → Consider [AutoGen](https://github.com/microsoft/autogen), [CrewAI](https://github.com/joaomdmoura/crewai) (ThoughtFlow supports multi-agent via AGENT + DELEGATE, but optimizes for clarity over massive swarms)
 - **You prefer batteries-included over minimal** → Consider [LangChain](https://github.com/langchain-ai/langchain)
 - **You need built-in vector stores and retrievers** → ThoughtFlow doesn't include these (but see [ThoughtBase](#-sister-library-thoughtbase))
 
@@ -197,7 +197,7 @@ Switching to ThoughtFlow? Here's what you can remove from your project:
 |---------|-------------|-----------|------------|---------|
 | **Core Dependencies** | **0** | 50+ | 30+ | 20+ |
 | **Time to Understand** | **5 minutes** | 2+ hours | 1+ hour | 1+ hour |
-| **Concepts to Learn** | **4** | 50+ | 30+ | 15+ |
+| **Concepts to Learn** | **~12 core** | 50+ | 30+ | 15+ |
 | **Serverless Ready** | **Trivial** | Challenging | Challenging | Challenging |
 | **Cold Start (Lambda)** | **<100ms** | 2-5 seconds | 1-3 seconds | 1-2 seconds |
 | **Full State Visibility** | **Everything** | Partial | Partial | Partial |
@@ -222,23 +222,29 @@ Switching to ThoughtFlow? Here's what you can remove from your project:
 
 ---
 
-## 🧩 The Four Primitives
+## 🧩 The Primitives
 
-ThoughtFlow is built on **four foundational primitives**. Master these, and you've mastered the framework.
+ThoughtFlow is built in layers. Four **foundational** primitives form the base; everything else composes on top through inheritance and delegation.
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                         PRIMARY PRIMITIVES                            │
-│                                                                       │
-│   ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐     │
-│   │   LLM   │ ──▶  │ THOUGHT │ ──▶  │ MEMORY  │ ◀──  │ ACTION  │     │
-│   └─────────┘      └─────────┘      └─────────┘      └─────────┘     │
-│        │                │                │                │          │
-│   Any model        Cognition         State            External       │
-│   Any provider     unit              container        operations     │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ORCHESTRATION        WORKFLOW ·  CHRON                                 │
+│  COORDINATION         DELEGATE ·  CHAT                                  │
+│  AUTONOMY             AGENT  (→ ReactAgent · ReflectAgent · PlanActAgent) │
+│  CAPABILITY           TOOL · MCP                                        │
+│  ─────────────────────────────────────────────────────────────────────── │
+│  COGNITION            THOUGHT  (→ DECIDE · PLAN)                        │
+│  OPERATION            ACTION   (→ 16 elemental subclasses)              │
+│  STATE                MEMORY                                            │
+│  INTELLIGENCE         LLM · EMBED                                       │
+│  ─────────────────────────────────────────────────────────────────────── │
+│  ↑ Foundational layer            ↑ Higher-level layer                   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Foundational Primitives
+
+Master these four and you understand the core of the framework.
 
 | Primitive | What It Does | The Pattern |
 |-----------|--------------|-------------|
@@ -247,32 +253,39 @@ ThoughtFlow is built on **four foundational primitives**. Master these, and you'
 | **THOUGHT** | Atomic unit of cognition with retry/parsing | `memory = thought(memory)` |
 | **ACTION** | External operations with consistent logging | `memory = action(memory, **kwargs)` |
 
-That's it. **Four primary primitives.** Everything else builds on these through inheritance.
+### Higher-Level Primitives
 
-### Secondary Primitives
+Built on the foundational layer for richer capabilities.
 
-Secondary primitives are **specialized subclasses** of THOUGHT and ACTION for common patterns:
+| Primitive | Layer | Purpose |
+|-----------|-------|---------|
+| **EMBED** | Intelligence | Vector embeddings from any provider |
+| **DECIDE** | Cognition | Constrained decisions from finite choices (extends THOUGHT) |
+| **PLAN** | Cognition | Structured multi-step execution plans (extends THOUGHT) |
+| **TOOL** | Capability | Wrap any callable as an LLM-invocable tool |
+| **MCP** | Capability | Model Context Protocol client for external tool servers |
+| **AGENT** | Autonomy | Autonomous reasoning loop (think → act → observe) |
+| **ReactAgent** | Autonomy | ReAct-style agent (extends AGENT) |
+| **ReflectAgent** | Autonomy | Self-reflective agent (extends AGENT) |
+| **PlanActAgent** | Autonomy | Plan-then-execute agent (extends AGENT) |
+| **DELEGATE** | Coordination | Route tasks across a team of named agents |
+| **CHAT** | Coordination | Multi-turn conversational interface |
+| **WORKFLOW** | Orchestration | Directed graph of steps with branching and merging |
+| **CHRON** | Orchestration | Schedule manager for recurring cron and interval jobs |
 
-| Primitive | Extends | Purpose |
-|-----------|---------|---------|
-| **DECIDE** | THOUGHT | Constrained decisions from finite choices |
-| **PLAN** | THOUGHT | Structured multi-step execution plans |
-| **SAY** | ACTION | Output messages to users |
-| **ASK** | ACTION | Prompt user for input |
-| **NOTIFY** | ACTION | Send notifications |
-| **SEARCH** | ACTION | Web search operations |
-| **FETCH** | ACTION | HTTP requests |
-| **SCRAPE** | ACTION | Extract data from web pages |
-| **READ** | ACTION | Read files from filesystem |
-| **WRITE** | ACTION | Write files to filesystem |
-| **POST** | ACTION | Send data to APIs |
-| **RUN** | ACTION | Execute shell commands |
-| **CALL** | ACTION | Invoke functions |
-| **SLEEP** | ACTION | Pause execution |
-| **WAIT** | ACTION | Wait for conditions |
-| **NOOP** | ACTION | Explicit no-operation |
+### Action Subclasses (Elemental Operations)
 
-> 💡 Secondary primitives inherit all features from their parent — retry logic, serialization, hooks, and execution history.
+These are the "verbs" that agents use to interact with the world. All extend **ACTION**.
+
+| Category | Primitives | Purpose |
+|----------|------------|---------|
+| **Communication** | `SAY`, `ASK`, `NOTIFY` | Output to users, get input, send notifications |
+| **Information Retrieval** | `SEARCH`, `FETCH`, `SCRAPE`, `READ` | Multi-provider web search, HTTP requests, content scraping, file reading |
+| **Persistence** | `WRITE`, `POST` | Write files, send data to APIs |
+| **Temporal Control** | `SLEEP`, `WAIT`, `NOOP` | Pause execution, wait for conditions, no-op |
+| **Execution** | `RUN`, `CALL` | Shell commands, function invocation |
+
+> 💡 Every primitive — foundational and higher-level alike — inherits serialization, execution history, and introspection from its parent class.
 
 ---
 
@@ -306,7 +319,7 @@ llm = LLM("ollama:llama3.2")
 
 ---
 
-## 🔮 Primary Primitives In Depth
+## 🔮 Foundational Primitives In Depth
 
 ### `LLM` — The Universal Model Interface
 
@@ -893,9 +906,9 @@ action_copy = ACTION.from_dict(action_data, fn_registry)
 
 ---
 
-## 🔧 Secondary Primitives In Depth
+## 🔧 Higher-Level Primitives
 
-Secondary primitives extend the primary primitives for common, specialized use cases. They inherit all features from their parent class (retry logic, serialization, hooks, execution history) while adding domain-specific functionality.
+Higher-level primitives build on the foundational layer for specialized use cases. They inherit all features from their parent class (retry logic, serialization, hooks, execution history) while adding domain-specific functionality.
 
 ### `DECIDE` — Constrained Decision Steps
 
@@ -1112,6 +1125,266 @@ memory = sleep(memory)
 - **Variable substitution** — Use `{variable}` placeholders from memory
 - **Automatic logging** — All executions logged to memory
 - **Inherits from ACTION** — Full execution history and serialization
+
+---
+
+### `SEARCH` — Multi-Provider Web Search
+
+> **Extends:** ACTION
+
+SEARCH abstracts multiple search engines behind a unified interface with normalized results. Supports **DuckDuckGo** (free, no key), **Brave Search**, **EXA** (semantic search), and **Google Custom Search**.
+
+```python
+from thoughtflow import MEMORY, SEARCH
+
+memory = MEMORY()
+
+# DuckDuckGo (default — no API key required)
+search = SEARCH(query="ThoughtFlow Python library", max_results=5)
+memory = search(memory)
+
+# Brave Search
+search = SEARCH(query="latest AI news", provider="brave", api_key="BSA...")
+memory = search(memory)
+
+# All providers return the same normalized structure:
+result = memory.get_var("search_result")
+# {
+#   "query": "...",
+#   "provider": "duckduckgo",
+#   "results": [
+#       {"title": "...", "url": "...", "snippet": "...", "rank": 1,
+#        "source": "example.com", "date_published": "...", "extra": {}},
+#       ...
+#   ],
+#   "total_found": 5,
+#   "timestamp": "..."
+# }
+```
+
+---
+
+### `SCRAPE` — Structured Content Extraction
+
+> **Extends:** ACTION
+
+SCRAPE visits a URL and extracts content in three modes: raw HTML (default), **Markdown**, or a **structured** JSON object with metadata, headings, links, and images.
+
+```python
+from thoughtflow import MEMORY, SCRAPE
+
+memory = MEMORY()
+
+# Get clean Markdown
+scrape = SCRAPE(url="https://example.com", extract="markdown")
+memory = scrape(memory)
+markdown_text = memory.get_var("scrape_result")
+
+# Get structured JSON with full metadata
+scrape = SCRAPE(url="https://example.com", extract="structured")
+memory = scrape(memory)
+data = memory.get_var("scrape_result")
+# {"url": "...", "title": "...", "author": "...", "content_markdown": "...",
+#  "content_text": "...", "headings": [...], "links": [...], "images": [...],
+#  "word_count": 42, "timestamp": "..."}
+```
+
+---
+
+### `TOOL` — LLM-Selectable Capabilities
+
+TOOL wraps any callable with a JSON Schema so that an LLM can discover, reason about, and invoke it during an agentic loop. This is the bridge between your code and the LLM's function-calling protocol.
+
+```python
+from thoughtflow import TOOL
+
+def get_weather(city, units="celsius"):
+    """Fetch current weather for a city."""
+    return {"city": city, "temp": 22, "units": units}
+
+weather_tool = TOOL(
+    name="get_weather",
+    description="Get the current weather for a city.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "description": "City name"},
+            "units": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+        },
+        "required": ["city"],
+    },
+    fn=get_weather,
+)
+
+# Pass to an AGENT — the LLM decides when to call it
+```
+
+---
+
+### `MCP` — Model Context Protocol Client
+
+MCP connects to external tool servers using the open [Model Context Protocol](https://modelcontextprotocol.io). It discovers remote tools and returns them as native TOOL instances. Supports **stdio** (local subprocess) and **HTTP+SSE** (remote server) transports.
+
+```python
+from thoughtflow import MCP
+
+# Local MCP server via stdio
+with MCP("npx -y @modelcontextprotocol/server-filesystem /tmp") as mcp:
+    tools = mcp.list_tools()    # Returns list of TOOL instances
+    result = mcp.call_tool("read_file", {"path": "/tmp/notes.txt"})
+
+# Remote MCP server via HTTP
+with MCP("https://my-mcp-server.example.com/mcp") as mcp:
+    tools = mcp.list_tools()
+```
+
+---
+
+### `AGENT` — Autonomous Tool-Use Loop
+
+AGENT is the primitive that turns an LLM into an autonomous agent. It runs the cycle: **call LLM → parse tool requests → execute tools → feed results back → repeat** until the LLM produces a final text response or the iteration limit is reached.
+
+```python
+from thoughtflow import LLM, MEMORY, TOOL, AGENT
+
+llm = LLM("openai:gpt-4o", key="...")
+tools = [weather_tool]  # TOOL instances
+
+agent = AGENT(
+    llm=llm,
+    tools=tools,
+    system_prompt="You are a helpful weather assistant.",
+    max_iterations=10,
+)
+
+memory = MEMORY()
+memory.add_msg("user", "What's the weather in Paris?")
+memory = agent(memory)  # Autonomous loop runs here
+
+print(memory.last_asst_msg(content_only=True))
+```
+
+Subclasses provide different agentic strategies:
+
+| Subclass | Strategy |
+|----------|----------|
+| **ReactAgent** | ReAct: interleaved reasoning and acting |
+| **ReflectAgent** | Self-reflective: critiques its own output before finalizing |
+| **PlanActAgent** | Plan-then-execute: generates a plan, then executes it step by step |
+
+---
+
+### `DELEGATE` — Multi-Agent Coordination
+
+DELEGATE routes tasks between a team of named agents using three coordination patterns:
+
+```python
+from thoughtflow import AGENT, DELEGATE, MEMORY
+
+researcher = AGENT(llm=llm, tools=[search_tool], name="researcher")
+writer = AGENT(llm=llm, name="writer")
+
+delegate = DELEGATE(agents=[researcher, writer])
+
+memory = MEMORY()
+
+# Dispatch: send to researcher, wait for result
+memory = delegate.dispatch(memory, "researcher", "Find info on quantum computing")
+
+# Handoff: pass to writer, fire-and-forget
+delegate.handoff(memory, "writer", "Write a summary of the findings")
+
+# Broadcast: ask all agents the same question
+results = delegate.broadcast(memory, "Summarize your findings")
+```
+
+---
+
+### `WORKFLOW` — Step-Based Orchestration
+
+WORKFLOW chains steps (THOUGHTs, ACTIONs, AGENTs, or plain functions) into a directed sequence with conditional branching and error handling. It is "Python control flow with guardrails."
+
+```python
+from thoughtflow import MEMORY, THOUGHT, WORKFLOW
+
+workflow = WORKFLOW(name="research_flow", on_error="skip")
+
+workflow.step(classify_thought, name="classify")
+workflow.step(search_action, condition=lambda m: m.get_var("needs_search"))
+workflow.step(summarize_thought, name="summarize")
+
+memory = MEMORY()
+memory.add_msg("user", "Tell me about quantum computing")
+memory = workflow(memory)
+
+# Inspect execution
+for entry in workflow.execution_log:
+    print(f"{entry['step']}: {entry['duration_ms']:.0f}ms — {'ok' if entry['success'] else 'error'}")
+```
+
+---
+
+### `CHRON` — Schedule Manager
+
+CHRON manages recurring jobs with cron expressions or fixed intervals. It supports two execution modes: **tick mode** for serverless environments (Lambda, Cloud Functions) and **loop mode** for long-running daemons. Job state optionally persists to a JSON file.
+
+```python
+from thoughtflow import CHRON
+
+chron = CHRON(name="ops", state_file="jobs.json")
+
+# Cron expression: run at 2am daily
+chron.add("nightly_cleanup", schedule="0 2 * * *", action=run_cleanup)
+
+# Fixed interval: every 60 seconds
+chron.add("heartbeat", every=60, action=lambda m: print("alive"))
+
+# Serverless: external cron calls your handler
+results = chron.tick()  # Executes any jobs that are due right now
+
+# Daemon: blocking loop (or start() for a background thread)
+chron.start(tick_interval=60)
+# ... later ...
+chron.stop()
+```
+
+---
+
+### `CHAT` — Interactive Conversation Loop
+
+CHAT wraps any callable that follows the ThoughtFlow contract and provides a text-based input/output loop for testing agents in a terminal or Jupyter notebook.
+
+```python
+from thoughtflow import LLM, THOUGHT, CHAT
+
+llm = LLM("openai:gpt-4o", key="...")
+responder = THOUGHT(name="respond", llm=llm, prompt="Answer: {last_user_msg}")
+
+chat = CHAT(responder, greeting="Hello! Ask me anything.")
+chat.run()  # Interactive loop — type 'q' to exit
+
+# Or programmatic turn-by-turn:
+response = chat.turn("What is the capital of France?")
+```
+
+---
+
+### `EMBED` — Vector Embeddings
+
+EMBED is the embedding counterpart to LLM. It sends text to an embedding endpoint and returns a vector. Same multi-provider pattern — one class, any provider.
+
+```python
+from thoughtflow import EMBED
+
+embed = EMBED("openai:text-embedding-3-small", key="sk-...")
+
+# Single text → single vector
+vector = embed.call("Hello world")
+print(len(vector))  # e.g., 1536
+
+# Batch → list of vectors
+vectors = embed.call(["Hello", "World"])
+```
 
 ---
 
@@ -1460,6 +1733,88 @@ memory = synthesize(memory)  # Think: synthesize answer
 answer = memory.get_var("synthesize_result")
 ```
 
+### Agentic Research with AGENT + TOOL
+
+Let the LLM decide which tools to call autonomously:
+
+```python
+from thoughtflow import LLM, MEMORY, TOOL, AGENT
+
+llm = LLM("openai:gpt-4o", key="...")
+
+# Define tools with schemas the LLM can reason about
+search_tool = TOOL(
+    name="web_search",
+    description="Search the web for current information.",
+    parameters={
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "Search query"}},
+        "required": ["query"],
+    },
+    fn=lambda query: my_search_fn(query),
+)
+
+agent = AGENT(
+    llm=llm,
+    tools=[search_tool],
+    system_prompt="You are a research assistant. Use tools to answer questions.",
+    max_iterations=5,
+)
+
+memory = MEMORY()
+memory.add_msg("user", "What are the latest developments in quantum computing?")
+memory = agent(memory)
+
+print(memory.last_asst_msg(content_only=True))
+```
+
+### Orchestrated Workflow with Branching
+
+Use WORKFLOW for conditional step execution:
+
+```python
+from thoughtflow import MEMORY, THOUGHT, WORKFLOW, SEARCH
+
+workflow = WORKFLOW(name="smart_answer", on_error="skip")
+
+# Step 1: Classify the question
+workflow.step(classify_thought, name="classify")
+
+# Step 2: Search only if classification says we need external info
+workflow.step(
+    SEARCH(query="{last_user_msg}", max_results=3),
+    name="search",
+    condition=lambda m: m.get_var("classify_result") == "needs_research",
+)
+
+# Step 3: Always summarize
+workflow.step(summarize_thought, name="summarize")
+
+memory = MEMORY()
+memory.add_msg("user", "What happened in tech news today?")
+memory = workflow(memory)
+```
+
+### Scheduled Jobs with CHRON
+
+Run recurring tasks on a cron schedule:
+
+```python
+from thoughtflow import CHRON, MEMORY
+
+def daily_report(memory):
+    """Generate and send a daily report."""
+    # ... your logic here ...
+    print(f"Report generated at {memory.get_var('chron_fired_at')}")
+
+chron = CHRON(name="scheduler", state_file="schedule_state.json")
+chron.add("daily_report", schedule="0 9 * * 1-5", action=daily_report)
+chron.add("health_check", every=300, action=lambda m: print("OK"))
+
+# In serverless (Lambda handler): chron.tick()
+# In a daemon process: chron.start(tick_interval=60)
+```
+
 ---
 
 ## 🎯 Philosophy: The Zen of ThoughtFlow
@@ -1581,24 +1936,27 @@ for result in results:
 thoughtflow/
 ├── src/thoughtflow/
 │   ├── __init__.py      # Public API exports
-│   ├── llm.py           # LLM class - multi-provider interface
-│   ├── memory/
-│   │   ├── __init__.py
-│   │   └── base.py      # MEMORY class - event-sourced state
-│   ├── thought.py       # THOUGHT class - cognitive unit
-│   ├── action.py        # ACTION class - external operations
-│   ├── thoughts/        # THOUGHT subclasses (DECIDE, PLAN)
-│   ├── actions/         # ACTION subclasses (14 elemental operations)
+│   ├── llm.py           # LLM — multi-provider model interface
+│   ├── embed.py         # EMBED — multi-provider embeddings
+│   ├── memory.py        # MEMORY — event-sourced state container
+│   ├── thought.py       # THOUGHT — atomic cognitive unit
+│   ├── action.py        # ACTION — external operations base class
+│   ├── tool.py          # TOOL — LLM-selectable capabilities
+│   ├── mcp.py           # MCP — Model Context Protocol client
+│   ├── agent.py         # AGENT — autonomous tool-use loop
+│   ├── delegate.py      # DELEGATE — multi-agent coordination
+│   ├── workflow.py      # WORKFLOW — step-based orchestration
+│   ├── chron.py         # CHRON — schedule manager (cron/interval)
+│   ├── chat.py          # CHAT — interactive conversation loop
+│   ├── _cron_expr.py    # Internal cron expression parser
 │   ├── _util.py         # Utilities (event_stamp, valid_extract, etc.)
-│   ├── tools/           # Tool registry for function calling
+│   ├── thoughts/        # THOUGHT subclasses (DECIDE, PLAN)
+│   ├── actions/         # ACTION subclasses (16 elemental operations)
+│   ├── agents/          # AGENT subclasses (ReactAgent, ReflectAgent, PlanActAgent)
 │   ├── trace/           # Session tracing and events
 │   └── eval/            # Evaluation harness and replay
+├── primitives/          # Per-primitive documentation (Markdown)
 ├── examples/            # Working, runnable examples
-│   ├── 01_hello_world.py
-│   ├── 02_action.py
-│   ├── 03_memory.py
-│   ├── 04_valid_extract.py
-│   └── ...
 ├── tests/               # Comprehensive test suite
 │   ├── unit/
 │   └── integration/
@@ -1644,12 +2002,16 @@ See [developer/](developer/) for comprehensive development documentation.
 
 | Aspect | Status | Notes |
 |--------|--------|-------|
-| **Primary Primitives** | ✅ Stable | LLM, MEMORY, THOUGHT, ACTION |
-| **Secondary Primitives** | ✅ Stable | DECIDE, PLAN, and ACTION subclasses |
+| **Foundational Primitives** | ✅ Stable | LLM, EMBED, MEMORY, THOUGHT, ACTION |
+| **Cognitive / Planning** | ✅ Stable | DECIDE, PLAN |
+| **Capability** | ✅ Stable | TOOL, MCP |
+| **Autonomy** | ✅ Stable | AGENT, ReactAgent, ReflectAgent, PlanActAgent |
+| **Coordination** | ✅ Stable | DELEGATE, CHAT |
+| **Orchestration** | ✅ Stable | WORKFLOW, CHRON |
+| **Action Subclasses** | ✅ Stable | 16 elemental operations (SEARCH, SCRAPE, FETCH, etc.) |
 | **API Stability** | 🟡 Alpha | May evolve based on feedback |
-| **Documentation** | 🟡 In Progress | Core docs complete, expanding |
+| **Documentation** | ✅ Per-primitive docs | `primitives/` folder with Markdown per class |
 | **Test Coverage** | ✅ Comprehensive | Unit + integration tests |
-| **Type Hints** | ✅ Full | Strict mypy compliance |
 | **Serverless Ready** | ✅ Yes | Zero deps, fast cold starts |
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
@@ -1696,6 +2058,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 |----------|-------------|
 | 📚 [Documentation](https://thoughtflow.dev) | Full documentation site |
 | 🧘 [ZEN.md](ZEN.md) | Philosophy and design principles |
+| 🧩 [primitives/](primitives/) | Per-primitive documentation (one Markdown file per class) |
 | 💡 [examples/](examples/) | Working, runnable examples |
 | 🛠️ [developer/](developer/) | Developer guides and docs |
 | 📝 [CHANGELOG.md](CHANGELOG.md) | Version history |
@@ -1726,8 +2089,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
   <sub>
     <a href="#-installation">Install</a> •
     <a href="#-quick-start">Quick Start</a> •
-    <a href="#-primary-primitives-in-depth">Primary Primitives</a> •
-    <a href="#-secondary-primitives-in-depth">Secondary Primitives</a> •
+    <a href="#-foundational-primitives-in-depth">Foundational</a> •
+    <a href="#-higher-level-primitives">Higher-Level</a> •
     <a href="#-contributing">Contribute</a>
   </sub>
 </p>
