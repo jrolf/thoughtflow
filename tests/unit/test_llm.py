@@ -388,6 +388,29 @@ class TestLLMCall:
         
         assert result[0] == 'Hello from Claude!'
 
+    @patch('urllib.request.urlopen')
+    def test_call_handles_ollama_response_format(self, mock_urlopen):
+        """
+        LLM.call() must handle Ollama's response format.
+
+        Ollama returns {"message": {...}, ...} or {"choices": [{...}]}
+        Returns a "tool_calls" key in the message if tool calls are used.
+
+        Alter this test if: Ollama changes their response format.
+        """
+        mock_response = MockHTTPResponse({
+            'message': {'role': 'assistant', 'content': "", 'tool_calls': [{'function': {'name': 'get_weather', 'arguments': '{"city": "New York"}'}}]},
+        })
+        mock_urlopen.return_value = mock_response
+
+        llm = LLM(model_id="ollama:llama3.2", key="")
+        result = llm.call([
+            {"role": "user", "content": "What's the weather in New York?"}
+        ])
+
+        expected = json.dumps({"tool_calls": [{"name": "get_weather", "arguments": {"city": "New York"}}]})
+        assert result[0] == expected
+
 
 # ============================================================================
 # Error Handling Tests
