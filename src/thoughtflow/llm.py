@@ -42,11 +42,28 @@ class LLM:
             Helper function to send HTTP requests to the specified URL with data and headers.
     """
     def __init__(self, model_id='', key='API_KEY', secret='API_SECRET'):
+        self.config = {
+            "openai": {"role_mapping": {
+                "user": "user",
+                "assistant": "assistant",
+                "system": "system",
+                "action": "tool",
+                "result": "tool",
+            }},
+            "groq": {"role_mapping": {"user": "user", "assistant": "assistant", "system": "system", "action": "tool", "result": "tool"}},
+            "anthropic": {"role_mapping": {"user": "user", "assistant": "assistant", "system": "system", "action": "assistant", "result": "assistant"}},
+            "ollama": {"role_mapping": {"user": "user", "assistant": "assistant", "system": "system", "action": "tool", "result": "tool"}},
+            "gemini": {"role_mapping": {"user": "user", "assistant": "model", "system": "user", "action": "model", "result": "model"}},
+            "openrouter": {"role_mapping": {"user": "user", "assistant": "assistant", "system": "system", "action": "tool", "result": "tool"}},
+        }
+
         # Parse model ID and initialize service and model name
         if ':' not in model_id: model_id = 'openai:gpt-4-turbo'
         
         splitted = model_id.split(':') 
         self.service = splitted[0]
+        if self.service not in self.config:
+            raise ValueError(f"Unsupported service '{self.service}'.")
         self.model = ''.join(splitted[1:]) 
         self.api_key = key
         self.api_secret = secret
@@ -56,6 +73,8 @@ class LLM:
 
     def _normalize_messages(self, msg_list):
         """
+        Maps the role to the LLM-supported role.
+
         Accepts either:
         - list[str] -> converts to [{'role':'user','content': str}, ...]
         - list[dict] with 'role' and 'content' -> passes through unchanged
@@ -66,8 +85,9 @@ class LLM:
         for m in msg_list:
             if isinstance(m, dict):
                 role = m.get("role", "user")
+                mapped_role = self.config[self.service]["role_mapping"].get(role, role)
                 content = m.get("content", "")
-                norm.append({"role": role, "content": content})
+                norm.append({"role": mapped_role, "content": content})
             else:
                 # treat as plain user text
                 norm.append({"role": "user", "content": str(m)})
@@ -231,10 +251,9 @@ class LLM:
         # Gemini wants [{"role": "user/assistant", "parts": [{"text": ...}]}]
         gemini_msgs = []
         for m in self._normalize_messages(msg_list):
-            # Google's role scheme: "user" or "model"
-            g_role = {"user": "user", "assistant": "model", "system": "user"}.get(m["role"], "user")
+            mapped_role = self.config[self.service]["role_mapping"].get(m["role"], "user")
             gemini_msgs.append({
-                "role": g_role,
+                "role": mapped_role,
                 "parts": [{"text": str(m["content"])}] if isinstance(m["content"], str) else m["content"]
             })
         payload = {
