@@ -11,6 +11,20 @@ import urllib.request
 import urllib.error
 
 
+# Maps ThoughtFlow-internal roles to each provider's accepted role strings.
+# Only non-identity mappings are listed; roles not present here pass through
+# unchanged.  This is pure configuration — behaviour lives in _map_roles().
+PROVIDER_ROLE_MAP = {
+    "openai":     {"action": "tool",      "result": "tool"},
+    "groq":       {"action": "tool",      "result": "tool"},
+    "anthropic":  {"action": "assistant", "result": "assistant"},
+    "ollama":     {"action": "tool",      "result": "tool"},
+    "gemini":     {"action": "model",     "result": "model",
+                   "assistant": "model",  "system": "user"},
+    "openrouter": {"action": "tool",      "result": "tool"},
+}
+
+
 class LLM:
     """
     The LLM class is designed to interface with various language model services.
@@ -28,6 +42,18 @@ class LLM:
         
         call(msg_list, params):
             Calls the appropriate API based on the service with the given message list and parameters.
+        
+        _normalize_messages(msg_list):
+            Structural normalization only — coerces inputs into message dicts
+            without changing roles.
+        
+        _map_roles(msg_list):
+            Translates ThoughtFlow-internal roles (e.g. 'action', 'result')
+            to provider-native role strings using PROVIDER_ROLE_MAP.
+        
+        _prepare_messages(msg_list):
+            Convenience pipeline: _normalize_messages() then _map_roles().
+            All _call_* methods use this.
         
         _call_openai(msg_list, params):
             Sends a request to the OpenAI API with the specified messages and parameters.
@@ -59,11 +85,19 @@ class LLM:
 
     def _normalize_messages(self, msg_list):
         """
-        Accepts either:
-        - list[str] -> converts to [{'role':'user','content': str}, ...]
-        - list[dict] with 'role' and 'content' -> passes through unchanged
-        - list[dict] with only 'content' -> assumes role='user'
-        Returns: list[{'role': str, 'content': str or list[...]}]
+        Structural normalization only — coerces inputs into message dicts.
+
+        Roles are passed through exactly as provided; no provider-specific
+        translation happens here.  Use _prepare_messages() to also apply
+        provider role mapping.
+
+        Accepts:
+            - list[str] -> converts to [{'role':'user','content': str}, ...]
+            - list[dict] with 'role' and 'content' -> passes through unchanged
+            - list[dict] with only 'content' -> assumes role='user'
+
+        Returns:
+            list[{'role': str, 'content': str or list[...]}]
         """
         norm = []
         for m in msg_list:
@@ -75,6 +109,48 @@ class LLM:
                 # treat as plain user text
                 norm.append({"role": "user", "content": str(m)})
         return norm
+
+    def _map_roles(self, msg_list):
+        """
+        Translate ThoughtFlow roles to provider-native role strings.
+
+        Uses the PROVIDER_ROLE_MAP lookup for the current service.  Roles
+        without an explicit mapping entry pass through unchanged — if the
+        provider rejects them, the API error is surfaced honestly rather
+        than the role being silently dropped or rewritten.
+
+        Args:
+            msg_list: List of normalised message dicts (from _normalize_messages).
+
+        Returns:
+            list[dict]: New message dicts with translated roles.
+        """
+        role_map = PROVIDER_ROLE_MAP.get(self.service, {})
+        if not role_map:
+            return msg_list
+        mapped = []
+        for m in msg_list:
+            m_copy = dict(m)
+            m_copy["role"] = role_map.get(m["role"], m["role"])
+            mapped.append(m_copy)
+        return mapped
+
+    def _prepare_messages(self, msg_list):
+        """
+        Normalise structure then translate roles for the current provider.
+
+        Convenience pipeline: _normalize_messages() (structural) followed
+        by _map_roles() (provider-aware).  All _call_* methods should use
+        this instead of calling _normalize_messages() directly.
+
+        Args:
+            msg_list: Raw messages (strings, dicts, or a mix).
+
+        Returns:
+            list[dict]: Provider-ready message dicts.
+        """
+        normalized = self._normalize_messages(msg_list)
+        return self._map_roles(normalized)
 
     def call(self, msg_list, params={}, output_schema=None, stream=False):
         """
@@ -128,7 +204,7 @@ class LLM:
         output_schema = params.pop('_output_schema', None)
         payload = {
             "model": self.model,
-            "messages": self._normalize_messages(msg_list),
+            "messages": self._prepare_messages(msg_list),
             **params
         }
         if output_schema:
@@ -156,7 +232,7 @@ class LLM:
         output_schema = params.pop('_output_schema', None)
         payload = {
             "model": self.model,
-            "messages": self._normalize_messages(msg_list),
+            "messages": self._prepare_messages(msg_list),
             **params
         }
         if output_schema:
@@ -186,7 +262,7 @@ class LLM:
         payload = {
             "model": self.model,
             "max_tokens": params.get("max_tokens", 1024),
-            "messages": self._normalize_messages(msg_list),
+            "messages": self._prepare_messages(msg_list),
         }
 
         # Anthropic uses a tool-use pattern for structured output: define a
@@ -229,15 +305,13 @@ class LLM:
         """
         params.pop('_output_schema', None)
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
-        # Gemini expects a list of "contents" alternating user/assistant
-        # We collapse the messages into a sequence of dicts as required by Gemini
-        # Gemini wants [{"role": "user/assistant", "parts": [{"text": ...}]}]
+        # Gemini expects [{"role": "user"/"model", "parts": [{"text": ...}]}].
+        # Role translation (assistant→model, system→user, etc.) is handled by
+        # _prepare_messages() via PROVIDER_ROLE_MAP — no inline mapping needed.
         gemini_msgs = []
-        for m in self._normalize_messages(msg_list):
-            # Google's role scheme: "user" or "model"
-            g_role = {"user": "user", "assistant": "model", "system": "user"}.get(m["role"], "user")
+        for m in self._prepare_messages(msg_list):
             gemini_msgs.append({
-                "role": g_role,
+                "role": m["role"],
                 "parts": [{"text": str(m["content"])}] if isinstance(m["content"], str) else m["content"]
             })
         payload = {
@@ -267,7 +341,7 @@ class LLM:
         url = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": self.model,
-            "messages": self._normalize_messages(msg_list),
+            "messages": self._prepare_messages(msg_list),
             **params
         }
         if output_schema:
@@ -300,7 +374,7 @@ class LLM:
         url = base_url.rstrip('/') + "/api/chat"
         payload = {
             "model": self.model,
-            "messages": self._normalize_messages(msg_list),
+            "messages": self._prepare_messages(msg_list),
             "stream": False,
             **{k: v for k, v in params.items() if k not in ("ollama_url", "model")}
         }
@@ -413,14 +487,14 @@ class LLM:
         if self.service == 'ollama':
             payload = {
                 "model": self.model,
-                "messages": self._normalize_messages(msg_list),
+                "messages": self._prepare_messages(msg_list),
                 "stream": True,
                 **{k: v for k, v in params.items() if k not in ("ollama_url", "model")}
             }
         else:
             payload = {
                 "model": self.model,
-                "messages": self._normalize_messages(msg_list),
+                "messages": self._prepare_messages(msg_list),
                 "stream": True,
                 **params
             }

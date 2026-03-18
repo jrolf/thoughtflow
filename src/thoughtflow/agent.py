@@ -41,6 +41,10 @@ class AGENT:
             Receives (tool_name, arguments) and can return False to block execution.
         id (str): Unique identifier for this agent instance.
         iteration_count (int): Number of iterations in the most recent run.
+        LLM_ROLES (set): Class-level set of MEMORY roles that should be forwarded
+            to the LLM.  Roles not in this set (e.g. 'reflection', 'query',
+            'logger') are filtered out by _build_messages().  Subclasses can
+            override this to include additional roles.
 
     Example:
         >>> from thoughtflow import LLM, MEMORY, TOOL, AGENT
@@ -52,6 +56,11 @@ class AGENT:
         >>> memory = agent(memory)
         >>> print(memory.last_asst_msg())
     """
+
+    # MEMORY roles that are relevant for LLM conversation context.
+    # The LLM's _prepare_messages() handles translating these into
+    # provider-native role strings (e.g. "action" → "tool" for OpenAI).
+    LLM_ROLES = {'user', 'assistant', 'system', 'action', 'result'}
 
     def __init__(
         self,
@@ -170,9 +179,15 @@ class AGENT:
         """
         Construct the message list for the LLM from memory.
 
-        Builds the conversation context: system prompt first, then all
-        messages from memory. Subclasses can override this to inject
-        methodology-specific prompts (e.g., ReAct formatting).
+        Builds the conversation context: system prompt first, then messages
+        from memory whose role is in LLM_ROLES.  Messages with roles outside
+        that set (e.g. 'reflection', 'query', 'logger') are intentionally
+        omitted — MEMORY may store many role types, but only conversation-
+        relevant ones should be forwarded to the LLM.
+
+        Subclasses can override this to inject methodology-specific prompts
+        (e.g., ReAct formatting), or override LLM_ROLES to include
+        additional roles.
 
         Args:
             memory: The MEMORY instance.
@@ -186,10 +201,12 @@ class AGENT:
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
 
-        # Conversation history from memory
+        # Conversation history from memory (filtered to LLM-relevant roles)
         if hasattr(memory, "get_msgs"):
             for msg in memory.get_msgs():
                 role = msg.get("role", "user")
+                if role not in self.LLM_ROLES:
+                    continue
                 content = msg.get("content", "")
                 messages.append({"role": role, "content": content})
 
