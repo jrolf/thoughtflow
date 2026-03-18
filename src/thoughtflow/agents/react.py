@@ -69,6 +69,8 @@ Available tools: {tool_list}
 
         Injects the ReAct instructions and available tool descriptions into
         the system prompt so the LLM knows the expected output format.
+        Only forwards messages whose role is in LLM_ROLES (inherited from
+        AGENT); other MEMORY roles are filtered out.
 
         Args:
             memory: The MEMORY instance.
@@ -92,8 +94,11 @@ Available tools: {tool_list}
 
         if hasattr(memory, "get_msgs"):
             for msg in memory.get_msgs():
+                role = msg.get("role", "user")
+                if role not in self.LLM_ROLES:
+                    continue
                 messages.append({
-                    "role": msg.get("role", "user"),
+                    "role": role,
                     "content": msg.get("content", ""),
                 })
 

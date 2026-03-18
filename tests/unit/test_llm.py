@@ -490,3 +490,215 @@ class TestModelParsing:
         
         assert hasattr(llm, 'last_params')
         assert llm.last_params == {}
+
+
+# ============================================================================
+# Role Mapping Tests
+# ============================================================================
+
+
+class TestRoleMapping:
+    """
+    Tests for provider-aware role mapping.
+
+    ThoughtFlow uses internal roles like 'action' and 'result' for tool
+    interactions in MEMORY.  The LLM class translates these to each
+    provider's native role strings before sending requests.
+
+    _normalize_messages() is structural only (strings -> dicts).
+    _map_roles() handles provider-specific role translation.
+    _prepare_messages() pipelines both steps.
+    """
+
+    def test_normalize_preserves_roles_unchanged(self):
+        """
+        _normalize_messages() must NOT translate roles.
+
+        It is structural normalization only — roles pass through exactly
+        as given.  Role translation is the job of _map_roles().
+
+        Alter this test if: _normalize_messages() gains role-mapping duties.
+        """
+        llm = LLM(model_id="openai:gpt-4o", key="test-key")
+        msgs = [
+            {"role": "action", "content": "tool request"},
+            {"role": "result", "content": "tool output"},
+            {"role": "reflection", "content": "internal thought"},
+        ]
+
+        normalized = llm._normalize_messages(msgs)
+
+        assert normalized[0]["role"] == "action"
+        assert normalized[1]["role"] == "result"
+        assert normalized[2]["role"] == "reflection"
+
+    def test_map_roles_translates_action_and_result_for_openai(self):
+        """
+        _map_roles() must translate 'action' and 'result' to 'tool' for OpenAI.
+
+        Alter this test if: OpenAI changes supported roles.
+        """
+        llm = LLM(model_id="openai:gpt-4o", key="test-key")
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "action", "content": "tool call"},
+            {"role": "result", "content": "tool output"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+        mapped = llm._map_roles(msgs)
+
+        assert mapped[0]["role"] == "user"
+        assert mapped[1]["role"] == "tool"
+        assert mapped[2]["role"] == "tool"
+        assert mapped[3]["role"] == "assistant"
+
+    def test_map_roles_translates_action_and_result_for_ollama(self):
+        """
+        _map_roles() must translate 'action' and 'result' to 'tool' for Ollama.
+
+        This is the fix for the infinite-loop bug: Ollama discards messages
+        with unrecognised roles, so 'action'/'result' must become 'tool'.
+
+        Alter this test if: Ollama changes supported roles.
+        """
+        llm = LLM(model_id="ollama:llama3.2", key="")
+        msgs = [
+            {"role": "action", "content": "tool call"},
+            {"role": "result", "content": "tool output"},
+        ]
+
+        mapped = llm._map_roles(msgs)
+
+        assert mapped[0]["role"] == "tool"
+        assert mapped[1]["role"] == "tool"
+
+    def test_map_roles_translates_for_gemini(self):
+        """
+        _map_roles() must translate 'assistant' -> 'model' and
+        'system' -> 'user' for Gemini, plus 'action'/'result' -> 'model'.
+
+        Alter this test if: Gemini changes their role scheme.
+        """
+        llm = LLM(model_id="gemini:gemini-pro", key="test-key")
+        msgs = [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "action", "content": "tool call"},
+            {"role": "result", "content": "tool output"},
+        ]
+
+        mapped = llm._map_roles(msgs)
+
+        assert mapped[0]["role"] == "user"
+        assert mapped[1]["role"] == "user"
+        assert mapped[2]["role"] == "model"
+        assert mapped[3]["role"] == "model"
+        assert mapped[4]["role"] == "model"
+
+    def test_map_roles_translates_for_anthropic(self):
+        """
+        _map_roles() must translate 'action'/'result' to 'assistant' for Anthropic.
+
+        Alter this test if: Anthropic changes supported roles.
+        """
+        llm = LLM(model_id="anthropic:claude-3-5-sonnet", key="test-key")
+        msgs = [
+            {"role": "action", "content": "tool call"},
+            {"role": "result", "content": "tool output"},
+        ]
+
+        mapped = llm._map_roles(msgs)
+
+        assert mapped[0]["role"] == "assistant"
+        assert mapped[1]["role"] == "assistant"
+
+    def test_map_roles_passes_unknown_roles_through(self):
+        """
+        _map_roles() must pass through roles that have no mapping entry.
+
+        Unknown roles are NOT silently dropped — they are sent as-is so that
+        any API rejection is honest rather than a silent data loss.
+
+        Alter this test if: we decide to drop/raise on unknown roles.
+        """
+        llm = LLM(model_id="openai:gpt-4o", key="test-key")
+        msgs = [{"role": "custom_xyz", "content": "test"}]
+
+        mapped = llm._map_roles(msgs)
+
+        assert mapped[0]["role"] == "custom_xyz"
+
+    def test_map_roles_does_not_mutate_input(self):
+        """
+        _map_roles() must return new dicts, not mutate the input list.
+
+        Alter this test if: we switch to in-place mutation for performance.
+        """
+        llm = LLM(model_id="openai:gpt-4o", key="test-key")
+        original = [{"role": "action", "content": "test"}]
+
+        mapped = llm._map_roles(original)
+
+        assert original[0]["role"] == "action"
+        assert mapped[0]["role"] == "tool"
+
+    def test_prepare_messages_pipelines_normalize_and_map(self):
+        """
+        _prepare_messages() must normalise structure then translate roles.
+
+        It combines _normalize_messages() (structural) and _map_roles()
+        (provider-aware) in a single call.
+
+        Alter this test if: the pipeline order or steps change.
+        """
+        llm = LLM(model_id="openai:gpt-4o", key="test-key")
+        raw = [
+            "plain string",
+            {"role": "action", "content": "tool call"},
+            {"content": "no role"},
+        ]
+
+        prepared = llm._prepare_messages(raw)
+
+        # String -> user dict (normalize), role unchanged (no map needed)
+        assert prepared[0] == {"role": "user", "content": "plain string"}
+        # action -> tool (map)
+        assert prepared[1] == {"role": "tool", "content": "tool call"}
+        # Missing role -> user (normalize), role unchanged (no map needed)
+        assert prepared[2] == {"role": "user", "content": "no role"}
+
+    @patch('urllib.request.urlopen')
+    def test_gemini_call_uses_mapped_roles(self, mock_urlopen):
+        """
+        _call_gemini() must use roles from _prepare_messages(), not its own
+        inline mapping.
+
+        Previously Gemini had a local role dict; this is now handled by
+        PROVIDER_ROLE_MAP via _prepare_messages().
+
+        Alter this test if: Gemini response format or role handling changes.
+        """
+        mock_response = MockHTTPResponse({
+            'candidates': [
+                {'content': {'parts': [{'text': 'Hello from Gemini!'}]}}
+            ]
+        })
+        mock_urlopen.return_value = mock_response
+
+        llm = LLM(model_id="gemini:gemini-pro", key="test-key")
+        result = llm.call([
+            {"role": "assistant", "content": "prior response"},
+            {"role": "user", "content": "follow up"},
+        ])
+
+        # Verify the payload sent to Gemini uses mapped roles
+        call_args = mock_urlopen.call_args
+        request = call_args[0][0]
+        payload = json.loads(request.data.decode('utf-8'))
+        contents = payload["contents"]
+
+        assert contents[0]["role"] == "model"
+        assert contents[1]["role"] == "user"
+        assert result[0] == "Hello from Gemini!"
