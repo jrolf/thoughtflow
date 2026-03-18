@@ -37,6 +37,9 @@ class LLM:
         
         _call_anthropic(msg_list, params):
             Sends a request to the Anthropic API with the specified messages and parameters.
+
+        _call_ollama(msg_list, params):
+            Sends a request to the Ollama API with the specified messages and parameters.
         
         _send_request(url, data, headers):
             Helper function to send HTTP requests to the specified URL with data and headers.
@@ -309,14 +312,34 @@ class LLM:
             "Content-Type": "application/json",
         }
         res = self._send_request(url, data, headers)
+
+        def _message_to_choice(message: dict) -> str:
+            """
+            Convert an Ollama message to include tool calls in the content.
+            """
+            tools = message.get("tool_calls", [])
+            if not tools:
+                return message.get("content", "")
+                
+            output = []
+            for tool in tools:
+                func = tool.get("function", {})
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                output.append({"name": func.get("name", ""), "arguments": args})
+            return json.dumps({"tool_calls": output})
+            
         # Ollama returns {"message": {...}, ...} or {"choices": [{...}]}
         # Prefer OpenAI-style extraction if available, else fallback
         if "choices" in res:
-            choices = [a["message"]["content"] for a in res.get("choices", [])]
+            choices = [_message_to_choice(a["message"]) for a in res.get("choices", [])]
         elif "message" in res:
             # single result
-            msg = res["message"]
-            choices = [msg.get("content", "")]
+            choices = [_message_to_choice(res["message"])]
         elif "response" in res:
             # streaming/fallback
             choices = [res["response"]]
