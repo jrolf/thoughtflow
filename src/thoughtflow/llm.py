@@ -74,9 +74,9 @@ class LLM:
         # Parse model ID and initialize service and model name
         if ':' not in model_id: model_id = 'openai:gpt-4-turbo'
         
-        splitted = model_id.split(':') 
-        self.service = splitted[0]
-        self.model = ''.join(splitted[1:]) 
+        service, model = model_id.split(':', 1)
+        self.service = service
+        self.model = model
         self.api_key = key
         self.api_secret = secret
         self.last_params = {} 
