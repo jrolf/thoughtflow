@@ -217,8 +217,6 @@ class PlanActAgent(AGENT):
         result = self.llm.call(messages)
         raw = result[0] if result else ""
 
-        plan = None
-
         # Parse the plan from the LLM response
         try:
             plan = json.loads(raw)
@@ -227,16 +225,15 @@ class PlanActAgent(AGENT):
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Fenced JSON if top-level parse is not a list (e.g. dict, or parse failed).
-        if not isinstance(plan, list):
-            try:
-                message = self.plan_regex.search(raw)
-                if message:
-                    plan = json.loads(message.group(1).strip())
-                    if isinstance(plan, list):
-                        return plan
-            except (json.JSONDecodeError, TypeError):
-                pass
+        # Fenced JSON if top-level parse fails.
+        try:
+            message = self.plan_regex.search(raw)
+            if message:
+                plan = json.loads(message.group(1).strip())
+                if isinstance(plan, list):
+                    return plan
+        except (json.JSONDecodeError, TypeError):
+            pass
 
         return []
 
