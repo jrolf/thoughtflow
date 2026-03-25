@@ -9,6 +9,7 @@ This implements the Plan-then-Execute pattern with adaptive replanning.
 from __future__ import annotations
 
 import json
+import re
 
 from thoughtflow.agent import AGENT
 
@@ -67,6 +68,7 @@ class PlanActAgent(AGENT):
         self.replan_on_failure = replan_on_failure
         self.current_plan = []
         self.execution_log = []
+        self.plan_regex = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
     def __call__(self, memory):
         """
@@ -100,6 +102,16 @@ class PlanActAgent(AGENT):
             # Fall back to base agent behavior if planning fails
             return super().__call__(memory)
 
+        self.execution_log.append({
+            "step": "Plan",
+            "tool": None,
+            "result": json.dumps(self.current_plan),
+            "success": True,
+        })
+
+        if hasattr(memory, "add_msg"):
+            memory.add_msg("assistant", "Plan:\n" + json.dumps(self.current_plan))
+
         # Execute the plan
         for step_idx, step in enumerate(self.current_plan):
             step_desc = step.get("step", "Step {}".format(step_idx + 1))
@@ -128,6 +140,14 @@ class PlanActAgent(AGENT):
                     remaining_task = self._summarize_remaining(task, step_idx)
                     self.current_plan = self._generate_plan(remaining_task)
                     if self.current_plan:
+                        self.execution_log.append({
+                            "step": "Replan",
+                            "tool": None,
+                            "result": json.dumps(self.current_plan),
+                            "success": True,
+                        })
+                        if hasattr(memory, "add_msg"):
+                            memory.add_msg("assistant", "Replan:\n" + json.dumps(self.current_plan))
                         # Recursively execute the new plan (with reduced depth)
                         break
             else:
@@ -197,6 +217,8 @@ class PlanActAgent(AGENT):
         result = self.llm.call(messages)
         raw = result[0] if result else ""
 
+        plan = None
+
         # Parse the plan from the LLM response
         try:
             plan = json.loads(raw)
@@ -204,6 +226,17 @@ class PlanActAgent(AGENT):
                 return plan
         except (json.JSONDecodeError, TypeError):
             pass
+
+        # Fenced JSON if top-level parse is not a list (e.g. dict, or parse failed).
+        if not isinstance(plan, list):
+            try:
+                message = self.plan_regex.search(raw)
+                if message:
+                    inner = json.loads(message.group(1).strip())
+                    if isinstance(inner, list):
+                        return inner
+            except (json.JSONDecodeError, TypeError):
+                pass
 
         return []
 
