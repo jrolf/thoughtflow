@@ -232,9 +232,9 @@ class PlanActAgent(AGENT):
             try:
                 message = self.plan_regex.search(raw)
                 if message:
-                    inner = json.loads(message.group(1).strip())
-                    if isinstance(inner, list):
-                        return inner
+                    plan = json.loads(message.group(1).strip())
+                    if isinstance(plan, list):
+                        return plan
             except (json.JSONDecodeError, TypeError):
                 pass
 
