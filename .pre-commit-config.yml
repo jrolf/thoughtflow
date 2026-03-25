@@ -1,0 +1,30 @@
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff-check
+        entry: ruff check --fix
+        language: system
+        types: [python]
+        pass_filenames: true
+      - id: ruff-format
+        name: ruff-format
+        entry: ruff format
+        language: system
+        types: [python]
+        pass_filenames: true
+
+  - repo: local
+    hooks:
+      - id: pytest-unit
+        name: pytest-unit
+        entry: pytest tests/unit/ -v
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^src/.*\.py$
