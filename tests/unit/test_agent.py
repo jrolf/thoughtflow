@@ -388,7 +388,7 @@ class TestPlanActAgent:
 
         # 1 for plan, 1 for execution
         assert len(agent.execution_log) == 2
-        assert "Echo: hello" in agent.execution_log[0]["result"]
+        assert "Echo: hello" in agent.execution_log[-1]["result"]
 
 
 # ============================================================================
