@@ -66,7 +66,7 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
 # Install pre-commit hooks
-prek install -f
+prek install
 ```
 
 ### 4. Verify Setup
