@@ -66,7 +66,7 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
 # Install pre-commit hooks
-pre-commit install
+prek install -f
 ```
 
 ### 4. Verify Setup
@@ -97,6 +97,7 @@ Use descriptive branch names:
 - `fix/message-serialization` - Bug fixes
 - `docs/update-quickstart` - Documentation
 - `refactor/simplify-trace-events` - Refactoring
+- `chore/upgrading-cicd` - Maintenance
 
 ### Commit Messages
 
