@@ -45,7 +45,7 @@ def main():
 
     # You can also see the full conversation
     print("\n--- Full Conversation ---")
-    print(memory.render(output_format='conversation'))
+    print(memory.render(format='conversation'))
 
 
 if __name__ == "__main__":
