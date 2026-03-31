@@ -79,7 +79,7 @@ def main():
 
     # --- Render Memory State ---
     print("\n--- Render as Conversation ---")
-    print(memory.render(output_format='conversation', max_total_length=500))
+    print(memory.render(format='conversation', max_total_length=500))
 
     # --- Get All Variables ---
     print("\n--- All Variables ---")
