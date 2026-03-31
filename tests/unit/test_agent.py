@@ -386,8 +386,9 @@ class TestPlanActAgent:
         memory.add_msg("user", "Echo hello")
         memory = agent(memory)
 
-        assert len(agent.execution_log) == 1
-        assert "Echo: hello" in agent.execution_log[0]["result"]
+        # 1 for plan, 1 for execution
+        assert len(agent.execution_log) == 2
+        assert "Echo: hello" in agent.execution_log[-1]["result"]
 
 
 # ============================================================================
