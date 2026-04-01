@@ -14,11 +14,11 @@
 <h1 align="center">ThoughtFlow</h1>
 
 <p align="center">
-  <strong>The Pythonic Cognitive Engine for LLM Systems That Actually Make Sense</strong>
+  <strong>Powerful AI systems from simple parts.</strong>
 </p>
 
 <p align="center">
-  <em>"We believe your code should be smarter than your framework."</em>
+  <em>A handful of composable primitives. Event-sourced memory. Autonomous agents. No framework overhead. Just Python.</em>
 </p>
 
 <!-- Primary badges: trust signals -->
@@ -35,7 +35,6 @@
   <a href="https://github.com/jrolf/thoughtflow/stargazers"><img src="https://img.shields.io/github/stars/jrolf/thoughtflow?style=flat" alt="GitHub stars"></a>
   <a href="https://github.com/jrolf/thoughtflow/commits/main"><img src="https://img.shields.io/github/last-commit/jrolf/thoughtflow" alt="Last commit"></a>
   <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
-  <a href="http://mypy-lang.org/"><img src="https://img.shields.io/badge/type%20checked-mypy-blue" alt="mypy"></a>
 </p>
 
 <!-- Navigation -->
@@ -64,7 +63,7 @@ pip install thoughtflow
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.0.7
+pip install thoughtflow==0.1.0
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -123,20 +122,17 @@ print(memory.render(format="conversation"))
 
 ## 🔥 The Manifesto
 
-> **We reject the complexity-industrial complex.**
+> **Simple parts. Powerful systems.**
 
-The modern LLM ecosystem has become an abstraction swamp. Frameworks compete to add more layers, more magic, more indirection—until you need a PhD just to debug a chatbot.
+AI systems don't need to be complicated. The complexity lives in the problems you're solving, not in the tools you use to solve them.
 
-**ThoughtFlow takes a different path.**
+**ThoughtFlow is built on that belief.**
 
-We believe:
 - 🎯 **Your agent logic should fit in your head** — A few powerful primitives, not forty classes
 - 🔍 **Every state change should be visible and traceable** — Event-sourced memory with full history
 - 🧪 **Testing AI systems should be as easy as testing regular code** — Deterministic replay built-in
 - 📦 **Zero dependencies means zero supply chain nightmares** — Core runs on stdlib only
 - ⚡ **Serverless deployment should be trivial, not heroic** — <100ms cold starts
-
-This isn't just a library. It's a stance.
 
 ---
 
@@ -1873,7 +1869,7 @@ memory = persistent_mem.load(session_id="abc123")
 
 | Version | Python | Status | Notes |
 |---------|--------|--------|-------|
-| **0.0.x** | 3.9 - 3.12 | 🟢 Active | Current development |
+| **0.1.x** | 3.9 - 3.12 | 🟢 Active | Current development |
 
 **Compatibility Policy:**
 - We test against Python 3.9, 3.10, 3.11, and 3.12
@@ -1984,14 +1980,8 @@ pytest
 # Run with coverage
 pytest --cov=src/thoughtflow
 
-# Lint the code
+# Lint the code (bug-catching only, no style enforcement)
 ruff check src/
-
-# Format the code
-ruff format src/
-
-# Type check
-mypy src/thoughtflow/
 ```
 
 See [developer/](developer/) for comprehensive development documentation.
@@ -2078,11 +2068,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 <p align="center">
   <strong>ThoughtFlow</strong><br>
-  <sub>Because your agent code should be as clear as your thinking.</sub>
+  <sub>Powerful AI systems from simple parts.</sub>
 </p>
 
 <p align="center">
-  <sub>Built with ❤️ for developers who believe AI tools should empower, not mystify.</sub>
+  <sub>Built for developers who believe AI tools should empower, not mystify.</sub>
 </p>
 
 <p align="center">

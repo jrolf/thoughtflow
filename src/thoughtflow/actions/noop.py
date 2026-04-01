@@ -10,7 +10,6 @@ The simplest possible action, useful for:
 from __future__ import annotations
 
 from thoughtflow.action import ACTION
-from thoughtflow._util import event_stamp
 
 
 class NOOP(ACTION):

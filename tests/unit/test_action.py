@@ -14,9 +14,8 @@ ACTIONs are the bridge between LLM cognition (THOUGHT) and real-world effects.
 from __future__ import annotations
 
 import time
-import pytest
 
-from thoughtflow import ACTION, MEMORY
+from thoughtflow import ACTION
 
 
 # ============================================================================

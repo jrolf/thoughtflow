@@ -65,8 +65,8 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 # Install in editable mode with all dev dependencies
 pip install -e ".[dev]"
 
-# Install pre-commit hooks
-pre-commit install
+# Install pre-commit hooks (uses prek: https://github.com/j178/prek)
+prek install
 ```
 
 ### 4. Verify Setup
@@ -77,12 +77,6 @@ pytest tests/unit/ -v
 
 # Run linter
 ruff check src/ tests/
-
-# Run formatter check
-ruff format --check src/ tests/
-
-# Run type checker
-mypy src/
 ```
 
 ---
@@ -135,9 +129,7 @@ docs(readme): add installation instructions for Windows
 ### 1. Before Submitting
 
 - [ ] All tests pass: `pytest tests/unit/ -v`
-- [ ] Code is formatted: `ruff format src/ tests/`
 - [ ] Linter passes: `ruff check src/ tests/`
-- [ ] Type checker passes: `mypy src/`
 - [ ] Documentation is updated (if applicable)
 - [ ] CHANGELOG.md is updated (for features/fixes)
 
@@ -168,44 +160,21 @@ Use the PR template and include:
 
 ### Style Guide
 
-We use [Ruff](https://docs.astral.sh/ruff/) for linting and formatting:
+We use [Ruff](https://docs.astral.sh/ruff/) strictly as a bug catcher -- not for style enforcement. Ruff is configured to catch unused imports, undefined names, unused variables, and redefined names. It does not enforce formatting, import order, or modernization preferences.
 
 ```bash
-# Format code
-ruff format src/ tests/
-
-# Check and fix lint issues
-ruff check --fix src/ tests/
+# Check for bugs and dead code
+ruff check src/ tests/
 ```
 
-### Type Hints
-
-All public APIs must have type hints:
-
-```python
-def call(
-    self,
-    msg_list: MessageList,
-    params: dict[str, Any] | None = None,
-) -> str:
-    """Call the agent with messages.
-
-    Args:
-        msg_list: List of message dicts.
-        params: Optional parameters.
-
-    Returns:
-        The agent's response.
-    """
-    ...
-```
+We do **not** use `ruff format`. This project uses intentional whitespace for visual alignment (e.g., lining up `=` across related assignments), which automated formatters destroy.
 
 ### Docstrings
 
 Use Google-style docstrings:
 
 ```python
-def example_function(arg1: str, arg2: int = 10) -> bool:
+def example_function(arg1, arg2=10):
     """Short description of function.
 
     Longer description if needed. Can span multiple lines
@@ -230,20 +199,15 @@ def example_function(arg1: str, arg2: int = 10) -> bool:
 
 ### Import Organization
 
-Imports are automatically organized by Ruff. The order is:
+Group imports in this order:
 
 1. Standard library
 2. Third-party packages
 3. Local imports
 
 ```python
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
-from typing import Any
-
-import pytest
 
 from thoughtflow.agent import Agent
 from thoughtflow.trace import Session

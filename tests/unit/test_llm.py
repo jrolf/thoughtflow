@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-import pytest
 
 from thoughtflow import LLM
 
@@ -44,6 +43,13 @@ class TestLLMInitialization:
         
         assert llm.service == "openai"
         assert llm.model == "gpt-4o-mini"
+
+        # Handle Multiple Colons in Model Name
+        llm = LLM(model_id="ollama:mistral:7b", key="")
+
+        assert llm.service == "ollama"
+        assert llm.model == "mistral:7b"
+
 
     def test_defaults_to_openai_gpt4_when_no_colon(self):
         """
@@ -463,20 +469,6 @@ class TestModelParsing:
     """
     Tests for model string parsing.
     """
-
-    def test_handles_model_with_multiple_colons(self):
-        """
-        Model string with multiple colons should only split on first.
-        
-        Some model names may contain colons (e.g., dates).
-        
-        Remove this test if: We change parsing logic.
-        """
-        llm = LLM(model_id="openai:gpt-4o:extra:part", key="test-key")
-        
-        assert llm.service == "openai"
-        # Model should be everything after first colon
-        assert llm.model == "gpt-4oextrapart"  # Current implementation joins without colons
 
     def test_stores_last_params(self):
         """

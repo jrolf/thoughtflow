@@ -21,7 +21,7 @@ This module has no dependencies beyond the standard library.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 
 # Valid ranges for each of the five cron fields
