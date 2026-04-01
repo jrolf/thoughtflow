@@ -50,7 +50,7 @@ Thoughtflow is built to be Pythonic. Python is the first-class citizen, and ever
 
 ## Design Document
 
-ThoughtFlow is designed to be a sophisticated AI agent framework for building 
+ThoughtFlow is designed around composable cognitive primitives for building 
 intelligent, memory-aware systems that can think, act, and maintain persistent 
 state. 
 
@@ -60,7 +60,7 @@ state.
 
 This document explains **exactly** how to engineer Thoughtflow in simple, idiomatic Python. It is written for a reader with **zero** prior exposure to Thoughtflow.
 
-Thoughtflow is a **Pythonic cognitive engine**. You write ordinary Python—`for`/`while`, `if/elif/else`, `try/except`, and small classes—no graphs, no hidden DSLs. A *flow* is "just a function" that accepts a `MEMORY` object and returns that same `MEMORY` object, modified. Cognition is built from four primitives:
+Thoughtflow builds powerful AI systems from simple parts. You write ordinary Python—`for`/`while`, `if/elif/else`, `try/except`, and small classes—no graphs, no hidden DSLs. A *flow* is "just a function" that accepts a `MEMORY` object and returns that same `MEMORY` object, modified. Cognition is built from four primitives:
 
 1. **LLM** — A tiny wrapper around a chat-style language model API.
 2. **MEMORY** — The single state container that keeps messages, events, logs, reflections, and variables.

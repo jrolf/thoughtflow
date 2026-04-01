@@ -1,8 +1,8 @@
 """
-ThoughtFlow: A minimal, explicit, Pythonic substrate for LLM and agent systems.
+ThoughtFlow: Powerful AI systems from simple parts.
 
 Core Philosophy:
-    - Tiny surface area: Few powerful primitives over many specialized classes
+    - Simple parts: A handful of composable primitives, not forty classes
     - Explicit state: All state is visible, serializable, and replayable
     - Portability: Works across OpenAI, Anthropic, local models, serverless
     - Deterministic testing: Record/replay workflows, stable sessions
