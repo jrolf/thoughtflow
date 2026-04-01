@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.2] - 2026-04-01
+
+### Added
+- `LLM` constructor now accepts `**kwargs` for default call parameters — `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, and `presence_penalty` (plus any provider-specific key) can be set once at construction and apply to every subsequent `.call()` invocation
+- `LLM.default_params` attribute exposes the stored defaults for inspection
+- Per-call `params` continue to override defaults on a per-key basis
+- 8 new unit tests covering default storage, merge precedence, non-mutation between calls, and all five parameters passing through to the API payload
+- Updated `primitives/LLM.md` with full parameter reference table and constructor-defaults usage examples
+- Updated `docs/quickstart.md` with "Setting Default Parameters" section
+
+### Fixed
+- Closes [#4](https://github.com/jrolf/thoughtflow/issues/4) — feature request: `temperature` argument for LLM creation
+
+---
+
 ## [0.1.1] - 2026-04-01
 
 ### Added
@@ -71,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/jrolf/thoughtflow/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jrolf/thoughtflow/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jrolf/thoughtflow/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/jrolf/thoughtflow/compare/v0.0.8...v0.0.9

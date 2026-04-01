@@ -63,6 +63,28 @@ llm = LLM("gemini:gemini-1.5-pro", key=gemini_key)
 llm = LLM("ollama:llama3.2")  # Local models, no key needed
 ```
 
+## Setting Default Parameters
+
+You can set parameters once at construction time instead of repeating them on every call. Per-call values always override the defaults.
+
+```python
+llm = LLM(
+    "openai:gpt-4o",
+    key=openai_key,
+    temperature=0.7,     # Controls randomness (0 = deterministic, 2 = creative)
+    max_tokens=1024,     # Maximum response length
+    top_p=0.95,          # Nucleus sampling threshold
+    frequency_penalty=0.1,  # Reduces token repetition
+    presence_penalty=0.0,   # Penalizes tokens that have appeared at all
+)
+
+# All calls use these defaults automatically
+response = llm.call([{"role": "user", "content": "Hello"}])[0]
+
+# Override just one; the others still apply
+response = llm.call(messages, params={"temperature": 0.1})[0]
+```
+
 ---
 
 ## Working with MEMORY
