@@ -6,7 +6,6 @@ A convenience wrapper for calling any function with memory-sourced parameters.
 
 from __future__ import annotations
 
-import time as time_module
 
 from thoughtflow.action import ACTION
 from thoughtflow.actions._substitution import substitute
@@ -153,8 +152,6 @@ class CALL(ACTION):
                 resolved_params[k] = substitute(v, memory)
         
         # Execute function
-        start_time = time_module.time()
-        
         try:
             if timeout:
                 result = self._call_with_timeout(resolved_params, timeout)

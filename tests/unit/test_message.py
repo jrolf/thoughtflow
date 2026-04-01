@@ -4,7 +4,6 @@ Unit tests for the Message module.
 
 from __future__ import annotations
 
-import pytest
 
 from thoughtflow.message import Message, normalize_messages
 

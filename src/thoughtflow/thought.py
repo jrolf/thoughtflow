@@ -8,7 +8,6 @@ workflow. It is the atomic unit of cognition in the Thoughtflow framework.
 from __future__ import annotations
 
 import json
-import copy
 
 from thoughtflow._util import (
     event_stamp,
