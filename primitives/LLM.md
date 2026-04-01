@@ -14,19 +14,39 @@ LLM parses a `service:model` identifier (e.g., `openai:gpt-4o`, `anthropic:claud
 
 Messages are normalized before sending. You can pass plain strings, dicts with `role` and `content`, or mixed formats; `_normalize_messages()` converts everything to the canonical `{role, content}` structure that providers expect. For structured output, you pass an `output_schema` dict; the LLM uses the provider's native mechanism (OpenAI's `response_format`, Anthropic's tool-use pattern, etc.) to constrain the model's output. When `stream=True`, the LLM yields token chunks as they arrive instead of buffering the full response.
 
-The last parameters used for each call are stored in `last_params` for debugging and inspection.
+The last merged parameters used for each call are stored in `last_params` for debugging and inspection. Default parameters are stored in `default_params`.
 
 ## Inputs & Configuration
 
+### Constructor
+
 | Parameter | Description |
 |-----------|-------------|
-| model_id | String in `service:model` format (e.g., `openai:gpt-4o`, `anthropic:claude-3-5-sonnet`, `ollama:llama3`) |
-| key | API key for the provider (env var name or actual key) |
-| secret | Optional API secret for providers that require it |
-| msg_list | List of messages — strings or dicts with `role` and `content` |
-| params | Provider-specific parameters (temperature, max_tokens, etc.) |
-| output_schema | Optional JSON Schema dict for structured output enforcement |
-| stream | If True, returns a generator yielding token chunks instead of full response |
+| `model_id` | String in `service:model` format (e.g., `openai:gpt-4o`, `anthropic:claude-3-5-sonnet`, `ollama:llama3`) |
+| `key` | API key for the provider (env var name or actual key) |
+| `secret` | Optional API secret for providers that require it |
+| `**kwargs` | Default call parameters — applied to every `.call()` unless overridden (see table below) |
+
+### Default Parameters (constructor kwargs)
+
+These are the five most commonly used parameters. Any provider-specific key is also accepted.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `temperature` | float 0–2 | Controls randomness. Lower = more focused; higher = more creative. |
+| `max_tokens` | int | Maximum number of tokens in the response. |
+| `top_p` | float 0–1 | Nucleus sampling threshold. Controls diversity via probability mass. |
+| `frequency_penalty` | float -2–2 | Reduces repetition of tokens that have already appeared frequently. |
+| `presence_penalty` | float -2–2 | Reduces repetition of any token that has appeared at all. |
+
+### `.call()` arguments
+
+| Parameter | Description |
+|-----------|-------------|
+| `msg_list` | List of messages — strings or dicts with `role` and `content` |
+| `params` | Per-call parameters — merged with defaults; per-call values win on conflict |
+| `output_schema` | Optional JSON Schema dict for structured output enforcement |
+| `stream` | If True, returns a generator yielding token chunks instead of full response |
 
 **Supported providers:** OpenAI, Anthropic, Groq, Ollama (local), Gemini, OpenRouter.
 
@@ -35,6 +55,7 @@ The last parameters used for each call are stored in `last_params` for debugging
 ```python
 from thoughtflow import LLM
 
+# --- Basic call with per-call params ---
 llm = LLM(model_id='openai:gpt-4o', key='OPENAI_API_KEY')
 choices = llm.call([
     {'role': 'system', 'content': 'You are a helpful assistant.'},
@@ -44,11 +65,28 @@ response = choices[0]
 ```
 
 ```python
-# Structured output
+# --- Constructor defaults: set once, applied to every call ---
+llm = LLM(
+    model_id='openai:gpt-4o',
+    key='OPENAI_API_KEY',
+    temperature=0.7,
+    max_tokens=1024,
+    top_p=0.95,
+)
+
+# Uses temperature=0.7, max_tokens=1024, top_p=0.95 automatically
+choices = llm.call([{'role': 'user', 'content': 'Tell me a joke.'}])
+
+# Override just one value; defaults still apply for the rest
+choices = llm.call([{'role': 'user', 'content': 'Be precise.'}], params={'temperature': 0.1})
+```
+
+```python
+# --- Structured output ---
 schema = {'name': 'extract', 'properties': {'summary': {'type': 'string'}}, 'required': ['summary']}
 choices = llm.call(msgs, output_schema=schema)
 
-# Streaming
+# --- Streaming ---
 for chunk in llm.call(msgs, stream=True):
     print(chunk, end='')
 ```

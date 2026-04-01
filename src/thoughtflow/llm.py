@@ -34,11 +34,15 @@ class LLM:
         model (str): The specific model to be used within the service.
         api_key (str): The API key for authenticating requests.
         api_secret (str): The API secret for additional authentication.
-        last_params (dict): Stores the parameters used in the last API call.
+        default_params (dict): Default parameters applied to every call (set via constructor kwargs).
+        last_params (dict): Stores the merged parameters used in the last API call.
 
     Methods:
-        __init__(model_id, key, secret):
-            Initializes the LLM instance with a model ID, API key, and secret.
+        __init__(model_id, key, secret, **kwargs):
+            Initializes the LLM instance. Any additional keyword arguments
+            (temperature, max_tokens, top_p, frequency_penalty, presence_penalty,
+            etc.) are stored as defaults applied to every call.  Per-call params
+            override these defaults.
         
         call(msg_list, params):
             Calls the appropriate API based on the service with the given message list and parameters.
@@ -70,7 +74,7 @@ class LLM:
         _send_request(url, data, headers):
             Helper function to send HTTP requests to the specified URL with data and headers.
     """
-    def __init__(self, model_id='', key='API_KEY', secret='API_SECRET'):
+    def __init__(self, model_id='', key='API_KEY', secret='API_SECRET', **kwargs):
         # Parse model ID and initialize service and model name
         if ':' not in model_id: model_id = 'openai:gpt-4-turbo'
         
@@ -80,6 +84,14 @@ class LLM:
         self.api_key = key
         self.api_secret = secret
         self.last_params = {} 
+        self.default_params = {}
+
+        # Recognized constructor-level defaults; anything else is passed
+        # through as a provider-specific param (e.g. ollama_url).
+        for k, v in kwargs.items():
+            if v is not None:
+                self.default_params[k] = v
+
         # Make the object directly callable
         self.__call__ = self.call
 
@@ -158,7 +170,9 @@ class LLM:
 
         Args:
             msg_list (list): Messages to send to the LLM.
-            params (dict): Provider-specific parameters (temperature, max_tokens, etc.).
+            params (dict): Provider-specific parameters (temperature, max_tokens,
+                top_p, frequency_penalty, presence_penalty, etc.).  Per-call
+                values override any defaults set in the constructor.
             output_schema (dict, optional): JSON Schema dict to enforce structured
                 output. When provided, the LLM is constrained to return JSON
                 matching this schema via the provider's native structured output
@@ -172,13 +186,13 @@ class LLM:
             list[str]: Response strings (one per choice) when stream=False.
             generator: Yields string chunks when stream=True.
         """
-        self.last_params = dict(params)
+        merged = {**self.default_params, **params}
+        self.last_params = dict(merged)
 
         if stream:
-            return self._stream(msg_list, params, output_schema)
+            return self._stream(msg_list, merged, output_schema)
 
-        # Merge output_schema into params for provider-specific handling
-        call_params = dict(params)
+        call_params = dict(merged)
         if output_schema:
             call_params['_output_schema'] = output_schema
 

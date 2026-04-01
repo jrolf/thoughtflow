@@ -98,6 +98,96 @@ class TestLLMInitialization:
         assert llm.service == "groq"
         assert llm.model == "llama-3.1-70b"
 
+    def test_stores_default_params_from_kwargs(self):
+        llm = LLM(model_id="openai:gpt-4o", key="k", temperature=0.7, max_tokens=500)
+
+        assert llm.default_params == {"temperature": 0.7, "max_tokens": 500}
+
+    def test_default_params_empty_when_no_kwargs(self):
+        llm = LLM(model_id="openai:gpt-4o", key="k")
+
+        assert llm.default_params == {}
+
+    def test_ignores_none_kwargs(self):
+        llm = LLM(model_id="openai:gpt-4o", key="k", temperature=None, top_p=0.9)
+
+        assert llm.default_params == {"top_p": 0.9}
+
+
+# ============================================================================
+# Default Params Merge Tests
+# ============================================================================
+
+
+class TestDefaultParams:
+
+    @patch('urllib.request.urlopen')
+    def test_defaults_applied_when_no_per_call_params(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:gpt-4o", key="k", temperature=0.3, max_tokens=200)
+        llm.call([{"role": "user", "content": "hi"}])
+
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode('utf-8'))
+        assert payload['temperature'] == 0.3
+        assert payload['max_tokens'] == 200
+
+    @patch('urllib.request.urlopen')
+    def test_per_call_params_override_defaults(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:gpt-4o", key="k", temperature=0.3, max_tokens=200)
+        llm.call([{"role": "user", "content": "hi"}], params={"temperature": 0.9})
+
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode('utf-8'))
+        assert payload['temperature'] == 0.9
+        assert payload['max_tokens'] == 200
+
+    @patch('urllib.request.urlopen')
+    def test_last_params_reflects_merged_values(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:gpt-4o", key="k", temperature=0.5, top_p=0.8)
+        llm.call([{"role": "user", "content": "hi"}], params={"top_p": 1.0})
+
+        assert llm.last_params["temperature"] == 0.5
+        assert llm.last_params["top_p"] == 1.0
+
+    @patch('urllib.request.urlopen')
+    def test_defaults_do_not_mutate_across_calls(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:gpt-4o", key="k", temperature=0.5)
+        llm.call([{"role": "user", "content": "a"}], params={"temperature": 0.9})
+        llm.call([{"role": "user", "content": "b"}])
+
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode('utf-8'))
+        assert payload['temperature'] == 0.5
+        assert llm.default_params == {"temperature": 0.5}
+
+    @patch('urllib.request.urlopen')
+    def test_top_five_params_all_pass_through(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(
+            model_id="openai:gpt-4o", key="k",
+            temperature=0.7, max_tokens=1024, top_p=0.95,
+            frequency_penalty=0.5, presence_penalty=0.3,
+        )
+        llm.call([{"role": "user", "content": "hi"}])
+
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode('utf-8'))
+        assert payload['temperature'] == 0.7
+        assert payload['max_tokens'] == 1024
+        assert payload['top_p'] == 0.95
+        assert payload['frequency_penalty'] == 0.5
+        assert payload['presence_penalty'] == 0.3
+
 
 # ============================================================================
 # Message Normalization Tests
