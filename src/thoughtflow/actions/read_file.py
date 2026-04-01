@@ -150,7 +150,7 @@ class READ(ACTION):
             else:
                 with open(path, 'r', encoding=encoding) as f:
                     content = f.read()
-        except Exception as e:
+        except Exception:
             if on_missing in ("empty", "default"):
                 return self._handle_missing(path, on_missing, default, parse)
             raise
