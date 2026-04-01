@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "thoughtflow"
-version = "0.0.9"
-description = "Powerful AI systems from simple parts. Composable cognitive primitives, event-sourced memory, and autonomous agents in pure Python with zero dependencies."
+version = "0.1.0"
+description = "Powerful AI systems from simple parts. Composable cognitive primitives, event-sourced memory, and autonomous agents in pure Python with zero dependencies." origin/develop
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
