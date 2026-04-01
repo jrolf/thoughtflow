@@ -18,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.0] - 2026-04-01
+
+### Added
+- `PlanActAgent` fenced-JSON fallback parsing -- silently recovers when the LLM wraps its plan output in markdown code fences (contributed by @cmgoffena13 via PR #5)
+- `PlanActAgent` execution logging -- plan generation and replanning events are now recorded in `execution_log` and written to conversation memory for full traceability (contributed by @cmgoffena13 via PR #5)
+- Pre-commit hooks via `prek` -- `ruff check` on commit, `pytest tests/unit/` on pre-push
+- `ruff.toml` -- project-wide linter configuration (Pyflakes F-rules only; no style enforcement)
+- `chore/` branch naming convention added to CONTRIBUTING.md
+
+### Changed
+- Ruff configured as bug-catcher only (unused imports, undefined names, unused variables). No formatter, no style or modernization rules.
+- `CONTRIBUTING.md` updated to reflect actual dev setup -- removed `ruff format`, type hints requirements, and `mypy` from the checklist
+- Dev dependency swapped from `pre-commit` to `prek`
+
+### Fixed
+- `LLM.__init__` now correctly parses model names containing colons (e.g. `ollama:mistral:7b`) by splitting on the first colon only (contributed by @cmgoffena13 via PR #3)
+- `memory.render()` calls in example scripts corrected from stale `output_format=` argument to `format=` (contributed by @orliesaurus via PR #7)
+- Dead code removed across `src/` and `tests/` -- unused imports, unused variables, and redefined names cleared
+
+---
+
 ## [0.0.9] - 2026-03-18
 
 ### Added
@@ -38,19 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.0] - Unreleased
-
-### Added
-- First alpha release
-- Core primitives: Agent, Message, Adapter
-- OpenAI adapter implementation
-- Basic tracing infrastructure
-- Unit test suite
-- Documentation site
-
----
-
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jrolf/thoughtflow/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/jrolf/thoughtflow/compare/v0.0.8...v0.0.9
-[0.1.0]: https://github.com/jrolf/thoughtflow/releases/tag/v0.1.0
