@@ -109,7 +109,7 @@ class MCP:
         self._jsonrpc_call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "thoughtflow", "version": "0.1.0"},
+            "clientInfo": {"name": "thoughtflow", "version": "0.1.1"},
         })
 
         # Send initialized notification (no response expected)

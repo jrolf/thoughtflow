@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2026-04-01
+
+### Added
+- `hooks/block-ai-contributors.sh` — portable pre-commit/commit-msg hook that blocks commits attributed to non-human identities (checks author name/email and Co-authored-by trailers against a configurable blocklist)
+- `.pre-commit-config.yaml` now includes `block-ai-author` (pre-commit stage) and `block-ai-trailer` (commit-msg stage) hooks
+
+### Fixed
+- Removed erroneous `Co-authored-by: Cursor` and `Made-with: Cursor` trailers from five historical commits; git history rewritten to ensure only human contributors are attributed
+
+---
+
 ## [0.1.0] - 2026-04-01
 
 ### Added
@@ -60,6 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jrolf/thoughtflow/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jrolf/thoughtflow/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/jrolf/thoughtflow/compare/v0.0.8...v0.0.9
