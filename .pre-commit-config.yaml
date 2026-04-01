@@ -1,10 +1,27 @@
 default_install_hook_types:
   - pre-commit
+  - commit-msg
   - pre-push
 
 repos:
   - repo: local
     hooks:
+      - id: block-ai-author
+        name: block-ai-author
+        entry: hooks/block-ai-contributors.sh identity
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: block-ai-trailer
+        name: block-ai-trailer
+        entry: hooks/block-ai-contributors.sh message
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [commit-msg]
+
       - id: ruff-check
         name: ruff-check
         entry: ruff check
