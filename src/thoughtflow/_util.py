@@ -11,19 +11,14 @@ from __future__ import annotations
 
 ### IMPORTS AND SETTINGS
 
-import os, sys, time, pickle, json, uuid
-import http, urllib, socket, ssl, gzip, copy
-import urllib.request
-import pprint 
-import random
+import time, pickle, json
 import re, ast
 from typing import Mapping, Any, Iterable, Optional, Tuple, Union
 
-import time,hashlib,pickle
+import hashlib
 from random import randint
 from functools import reduce
 
-import datetime as dtt
 from zoneinfo import ZoneInfo
 
 tz_bog = ZoneInfo("America/Bogota")
@@ -316,7 +311,6 @@ def _candidate_segments(raw_text: str, schema: Any, prefer_fences_first: bool = 
     # 1) From code fences
     if prefer_fences_first:
         for m in _FENCE_RE.finditer(raw_text):
-            lang = (m.group("lang") or "").strip().lower()
             body = m.group("body")
             # If the fence declares "python" or "json", prioritize; otherwise still try.
             yield body

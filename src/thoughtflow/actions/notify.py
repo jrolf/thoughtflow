@@ -6,7 +6,6 @@ Supports console, webhook, and email (via smtplib) using only standard library.
 
 from __future__ import annotations
 
-import json
 import os
 
 from thoughtflow.action import ACTION

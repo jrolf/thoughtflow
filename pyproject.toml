@@ -61,7 +61,7 @@ dev = [
     "pytest-asyncio>=0.21",
     "ruff>=0.1",
     "mypy>=1.0",
-    "pre-commit>=3.0",
+    "prek>=0.3.8",
 ]
 
 # Documentation

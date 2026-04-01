@@ -7,7 +7,6 @@ branching, error handling, and execution tracking.
 
 from __future__ import annotations
 
-import pytest
 
 from thoughtflow.workflow import WORKFLOW
 from thoughtflow import MEMORY
