@@ -1,58 +1,54 @@
 # ThoughtFlow
 
-**A minimal, explicit, Pythonic substrate for building reproducible, portable, testable LLM and agent systems.**
+**Powerful AI systems from simple parts.**
+
+A handful of composable primitives. Event-sourced memory. Autonomous agents. No framework overhead. Just Python.
 
 ---
 
 ## Why ThoughtFlow?
 
-The modern LLM/agent ecosystem often evolves into abstraction swamps—hidden state, magical callbacks, and frameworks that are hard to understand, test, and deploy.
+AI systems don't need to be complicated. The complexity lives in the problems you're solving, not in the tools you use to solve them.
 
-**ThoughtFlow takes a different path:**
-
-- ✅ No hidden agent runtime you can't reason about
-- ✅ No graph DSL you must adopt to do anything serious
-- ✅ No implicit global memory or callback chains
-- ✅ No abstraction layers whose main job is wrapping other abstractions
-
-Instead, ThoughtFlow makes orchestration logic **plain Python**.
+- A few powerful primitives, not forty classes
+- Every state change is visible and traceable
+- Testing AI systems is as easy as testing regular code
+- Zero dependencies -- core runs on stdlib only
+- Serverless deployment is trivial, not heroic
 
 ---
 
-## Core Principles
+## Core Primitives
 
-### 1. Tiny Surface Area
-Few powerful primitives over many specialized classes. Add new API only when it's truly a missing primitive.
-
-### 2. Explicit State
-All state is visible, serializable, and replayable. A run produces a structured trace of inputs, outputs, tool calls, timing, and costs.
-
-### 3. Portability
-Works across OpenAI, Anthropic, local models (Ollama), and serverless environments. Clean adapter boundaries.
-
-### 4. Deterministic Testing
-Record/replay workflows, stable sessions, predictable tool behaviors, no hidden non-determinism.
+| Primitive | What It Does | The Pattern |
+|-----------|--------------|-------------|
+| **LLM** | Unified interface to call any language model | `response = llm.call(messages)` |
+| **MEMORY** | Event-sourced state container for everything | `memory.add_msg("user", "Hello!")` |
+| **THOUGHT** | Atomic unit of cognition with retry/parsing | `memory = thought(memory)` |
+| **ACTION** | External operations with consistent logging | `memory = action(memory, **kwargs)` |
 
 ---
 
 ## Quick Start
 
 ```python
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
+from thoughtflow import LLM, MEMORY, THOUGHT
 
-# Create an adapter
-adapter = OpenAIAdapter(api_key="your-api-key")
+llm = LLM("openai:gpt-4o", key="your-api-key")
+memory = MEMORY()
+memory.add_msg("user", "What is the meaning of life?")
 
-# Create an agent
-agent = Agent(adapter)
+thought = THOUGHT(
+    name="respond",
+    llm=llm,
+    prompt="You are a wise philosopher. Answer: {last_user_msg}",
+)
 
-# Call with messages
-response = agent.call([
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-])
+memory = thought(memory)
+print(memory.get_var("respond_result"))
 ```
+
+The universal pattern is `memory = thought(memory)`. Everything flows through MEMORY.
 
 See the [Quick Start Guide](quickstart.md) for more details.
 
@@ -74,7 +70,7 @@ pip install thoughtflow[all-providers]
 
 ## Project Status
 
-🚧 **Alpha** - ThoughtFlow is under active development. APIs may change.
+🚧 **Alpha** -- ThoughtFlow is under active development. APIs may evolve based on feedback.
 
 ---
 
