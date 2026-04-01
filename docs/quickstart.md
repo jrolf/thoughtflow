@@ -7,124 +7,217 @@ Get up and running with ThoughtFlow in 5 minutes.
 ## Installation
 
 ```bash
-# Core library (zero dependencies)
 pip install thoughtflow
-
-# With OpenAI support
-pip install thoughtflow[openai]
-
-# With Anthropic support
-pip install thoughtflow[anthropic]
-
-# With all providers
-pip install thoughtflow[all-providers]
 ```
+
+The core library has **zero dependencies** -- it uses only Python's standard library.
 
 ---
 
-## Your First Agent
+## Your First THOUGHT
+
+ThoughtFlow has one universal pattern: `memory = thought(memory)`. Here's a complete working example:
 
 ```python
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
+import os
+from thoughtflow import LLM, MEMORY, THOUGHT
 
-# 1. Create an adapter for your provider
-adapter = OpenAIAdapter(api_key="your-api-key")
-# Or use environment variable: export OPENAI_API_KEY=sk-...
-# adapter = OpenAIAdapter()
+api_key = os.environ.get("OPENAI_API_KEY")
 
-# 2. Create an agent
-agent = Agent(adapter)
+llm = LLM("openai:gpt-4o", key=api_key)
+memory = MEMORY()
 
-# 3. Call with a message list
-response = agent.call([
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What is ThoughtFlow?"}
-])
+memory.add_msg("user", "What is the meaning of life?")
 
-print(response)
-```
-
----
-
-## Using Message Objects
-
-You can use plain dicts or Message objects:
-
-```python
-from thoughtflow import Agent, Message
-from thoughtflow.adapters import OpenAIAdapter
-
-adapter = OpenAIAdapter()
-agent = Agent(adapter)
-
-# Using Message objects
-response = agent.call([
-    Message.system("You are helpful."),
-    Message.user("Hello!"),
-])
-```
-
----
-
-## Adding Tracing
-
-Capture complete execution traces for debugging and evaluation:
-
-```python
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
-from thoughtflow.trace import Session
-
-adapter = OpenAIAdapter()
-agent = Agent(adapter)
-
-# Create a session to capture the trace
-session = Session()
-
-response = agent.call(
-    [{"role": "user", "content": "Hello!"}],
-    session=session
+thought = THOUGHT(
+    name="respond",
+    llm=llm,
+    prompt="You are a wise philosopher. Answer: {last_user_msg}",
 )
 
-# Inspect the trace
-print(session.events)
-print(f"Total tokens: {session.total_tokens}")
+memory = thought(memory)
 
-# Save for later analysis
-session.save("trace.json")
+result = memory.get_var("respond_result")
+print(result)
 ```
+
+That's it. `THOUGHT` combines prompt + context + LLM call + parsing + validation into a single callable. `MEMORY` tracks everything that happens.
 
 ---
 
 ## Switching Providers
 
-ThoughtFlow makes it easy to switch between providers:
+Changing providers is a one-line change. Your THOUGHT and MEMORY code stays the same:
 
 ```python
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter, AnthropicAdapter, LocalAdapter
+from thoughtflow import LLM
 
-# OpenAI
-openai_agent = Agent(OpenAIAdapter())
+llm = LLM("openai:gpt-4o", key=openai_key)
 
-# Anthropic
-anthropic_agent = Agent(AnthropicAdapter())
+llm = LLM("anthropic:claude-3-5-sonnet-20241022", key=anthropic_key)
 
-# Local (Ollama)
-local_agent = Agent(LocalAdapter(base_url="http://localhost:11434/v1"))
+llm = LLM("groq:llama-3.1-70b-versatile", key=groq_key)
 
-# Same interface for all!
-messages = [{"role": "user", "content": "Hello!"}]
-response = openai_agent.call(messages)
-# response = anthropic_agent.call(messages)
-# response = local_agent.call(messages)
+llm = LLM("gemini:gemini-1.5-pro", key=gemini_key)
+
+llm = LLM("ollama:llama3.2")  # Local models, no key needed
+```
+
+---
+
+## Working with MEMORY
+
+MEMORY is an event-sourced container. Every change is an event with a sortable ID:
+
+```python
+from thoughtflow import MEMORY
+
+memory = MEMORY()
+
+memory.add_msg("user", "Hello!")
+memory.add_msg("assistant", "Hi there!")
+
+memory.set_var("session_id", "abc123")
+memory.set_var("request_count", 0)
+memory.set_var("request_count", 1)
+memory.set_var("request_count", 2)
+
+memory.get_var("request_count")              # Returns: 2
+memory.get_var_history("request_count")      # Returns every change with timestamps
+
+memory.last_user_msg(content_only=True)      # "Hello!"
+
+print(memory.render(format="conversation"))
+```
+
+---
+
+## Chaining THOUGHTs
+
+Build multi-step workflows by chaining thoughts together -- it's just a for loop:
+
+```python
+from thoughtflow import LLM, MEMORY, THOUGHT
+
+llm = LLM("openai:gpt-4o", key="...")
+memory = MEMORY()
+
+analyze = THOUGHT(
+    name="analyze",
+    llm=llm,
+    prompt="Identify the key themes in: {text}",
+)
+
+summarize = THOUGHT(
+    name="summarize",
+    llm=llm,
+    prompt="Summarize these themes: {analyze_result}",
+)
+
+memory.set_var("text", "Your document here...")
+
+for thought in [analyze, summarize]:
+    memory = thought(memory)
+
+print(memory.get_var("summarize_result"))
+```
+
+Each thought stores its result in `{name}_result`, so the next thought can reference it.
+
+---
+
+## Structured Output with Parsing
+
+Extract structured data from messy LLM output:
+
+```python
+thought = THOUGHT(
+    name="extract_info",
+    llm=llm,
+    prompt="Extract user information from: {text}",
+    parsing_rules={
+        "kind": "python",
+        "format": {
+            "name": "",
+            "age": 0,
+            "skills": [],
+        }
+    },
+    max_retries=3,
+)
+
+memory.set_var("text", "My name is Alice, I'm 28, and I know Python and ML.")
+memory = thought(memory)
+
+info = memory.get_var("extract_info_result")
+# {"name": "Alice", "age": 28, "skills": ["Python", "ML"]}
+```
+
+If parsing or validation fails, THOUGHT automatically retries with a repair prompt that explains what went wrong.
+
+---
+
+## Using Tools and Agents
+
+Let the LLM decide which tools to call autonomously:
+
+```python
+from thoughtflow import LLM, MEMORY, TOOL, AGENT
+
+llm = LLM("openai:gpt-4o", key="...")
+
+weather_tool = TOOL(
+    name="get_weather",
+    description="Get the current weather for a city.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "description": "City name"},
+        },
+        "required": ["city"],
+    },
+    fn=lambda city: {"city": city, "temp": 22, "units": "celsius"},
+)
+
+agent = AGENT(
+    llm=llm,
+    tools=[weather_tool],
+    system_prompt="You are a helpful weather assistant.",
+    max_iterations=5,
+)
+
+memory = MEMORY()
+memory.add_msg("user", "What's the weather in Paris?")
+memory = agent(memory)
+
+print(memory.last_asst_msg(content_only=True))
+```
+
+AGENT runs the cycle: call LLM, parse tool requests, execute tools, feed results back, repeat -- until the LLM produces a final response.
+
+---
+
+## Saving and Loading State
+
+MEMORY supports multiple serialization formats:
+
+```python
+memory.save("state.pkl")
+memory.to_json("state.json")
+
+restored = MEMORY()
+restored.load("state.pkl")
+
+restored = MEMORY.from_json("state.json")
 ```
 
 ---
 
 ## Next Steps
 
-- [Agent Concepts](concepts/agent.md) - Deep dive into the Agent contract
-- [Adapters](concepts/adapters.md) - Learn about provider adapters
-- [Tracing](concepts/tracing.md) - Debug and evaluate your agents
+- [primitives/LLM.md](../primitives/LLM.md) -- Multi-provider model interface
+- [primitives/MEMORY.md](../primitives/MEMORY.md) -- Event-sourced state container
+- [primitives/THOUGHT.md](../primitives/THOUGHT.md) -- Atomic unit of cognition
+- [primitives/ACTION.md](../primitives/ACTION.md) -- External operations
+- [primitives/AGENT.md](../primitives/AGENT.md) -- Autonomous tool-use loop
+- [README](../README.md) -- Full documentation with all primitives and patterns
