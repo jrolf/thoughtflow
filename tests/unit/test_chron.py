@@ -8,7 +8,6 @@ execution, and optional state persistence.
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from datetime import datetime, timedelta

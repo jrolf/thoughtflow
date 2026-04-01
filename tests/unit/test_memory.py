@@ -703,7 +703,7 @@ class TestObjectStorage:
         Remove this test if: We remove named object support.
         """
         data = "Large binary data here"
-        stamp = memory.set_obj(data, name='document', desc='A large document')
+        memory.set_obj(data, name='document', desc='A large document')
         
         # Should be accessible via variable
         assert memory.get_var('document') == data

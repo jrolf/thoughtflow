@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from datetime import datetime
 
-import pytest
 
 from thoughtflow.trace import Event, EventType, Session, TraceSchema
 from thoughtflow.trace.events import call_start, call_end, tool_call, tool_result
