@@ -542,6 +542,23 @@ class MEMORY:
             return '' if content_only else None
         return logs[-1]['content'] if content_only else logs[-1]
 
+    def last_result_msg(self, content_only=False):
+        """
+        Get the last result message.
+        
+        Args:
+            content_only: If True, return just the content string. 
+                          If False (default), return the full event dict.
+
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no logs.
+        """
+        msgs = self.get_msgs(include=['result'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
     def last_ref(self, content_only=False):
         """
         Get the last reflection.
