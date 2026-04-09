@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 
 from thoughtflow import LLM
+from thoughtflow.llm import OpenAICompatibleLLM
 
 
 # ============================================================================
@@ -784,3 +785,162 @@ class TestRoleMapping:
         assert contents[0]["role"] == "model"
         assert contents[1]["role"] == "user"
         assert result[0] == "Hello from Gemini!"
+
+
+# ============================================================================
+# Local / OpenAI-Compatible Server Tests
+# ============================================================================
+
+
+class TestOpenAIBaseURL:
+    """Tests for custom base_url support in the openai adapter."""
+
+    @patch('urllib.request.urlopen')
+    def test_base_url_routes_to_custom_server(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'local reply'}}]}
+        )
+        llm = LLM(model_id="openai:my-model", key="dummy",
+                   base_url="http://127.0.0.1:8765/v1")
+        result = llm.call([{"role": "user", "content": "hi"}])
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "http://127.0.0.1:8765/v1/chat/completions"
+        assert result == ["local reply"]
+
+    @patch('urllib.request.urlopen')
+    def test_base_url_trailing_slash_normalized(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:m", key="k",
+                   base_url="http://localhost:8080/v1/")
+        llm.call([{"role": "user", "content": "hi"}])
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "http://localhost:8080/v1/chat/completions"
+
+    @patch('urllib.request.urlopen')
+    def test_no_base_url_uses_openai_cloud(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:gpt-4o", key="sk-real")
+        llm.call([{"role": "user", "content": "hi"}])
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "https://api.openai.com/v1/chat/completions"
+
+    @patch('urllib.request.urlopen')
+    def test_transport_keys_not_in_payload(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:m", key="k",
+                   base_url="http://localhost:8080/v1",
+                   extra_headers={"X-Custom": "val"})
+        llm.call([{"role": "user", "content": "hi"}])
+
+        payload = json.loads(
+            mock_urlopen.call_args[0][0].data.decode('utf-8')
+        )
+        assert "base_url" not in payload
+        assert "extra_headers" not in payload
+
+    @patch('urllib.request.urlopen')
+    def test_extra_headers_merged(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'ok'}}]}
+        )
+        llm = LLM(model_id="openai:m", key="k",
+                   base_url="http://localhost/v1",
+                   extra_headers={"X-Custom": "val"})
+        llm.call([{"role": "user", "content": "hi"}])
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.headers.get("X-custom") == "val"
+        assert "Bearer k" in request.headers.get("Authorization", "")
+
+    @patch('urllib.request.urlopen')
+    def test_schema_prompt_injection_when_base_url_set(self, mock_urlopen):
+        """With base_url, output_schema must be injected as a prompt, not response_format."""
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': '{"summary":"ok"}'}}]}
+        )
+        schema = {"name": "extract", "properties": {"summary": {"type": "string"}},
+                  "required": ["summary"]}
+        llm = LLM(model_id="openai:local-model", key="dummy",
+                   base_url="http://localhost:8080/v1")
+        llm.call([{"role": "user", "content": "summarize"}],
+                 output_schema=schema)
+
+        payload = json.loads(
+            mock_urlopen.call_args[0][0].data.decode('utf-8')
+        )
+        assert "response_format" not in payload
+        last_msg = payload["messages"][-1]
+        assert last_msg["role"] == "system"
+        assert '"summary"' in last_msg["content"]
+
+    @patch('urllib.request.urlopen')
+    def test_native_schema_when_no_base_url(self, mock_urlopen):
+        """Without base_url, output_schema must use native response_format."""
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': '{"summary":"ok"}'}}]}
+        )
+        schema = {"name": "extract", "properties": {"summary": {"type": "string"}},
+                  "required": ["summary"]}
+        llm = LLM(model_id="openai:gpt-4o", key="sk-real")
+        llm.call([{"role": "user", "content": "summarize"}],
+                 output_schema=schema)
+
+        payload = json.loads(
+            mock_urlopen.call_args[0][0].data.decode('utf-8')
+        )
+        assert "response_format" in payload
+        assert payload["response_format"]["type"] == "json_schema"
+
+
+class TestOpenAICompatibleLLM:
+    """Tests for the OpenAICompatibleLLM convenience class."""
+
+    def test_sets_service_and_model(self):
+        llm = OpenAICompatibleLLM(
+            model="mlx-community/Llama-3-8B",
+            base_url="http://127.0.0.1:8765/v1",
+        )
+        assert llm.service == "openai"
+        assert llm.model == "mlx-community/Llama-3-8B"
+
+    def test_default_key_is_dummy(self):
+        llm = OpenAICompatibleLLM(
+            model="my-model", base_url="http://localhost/v1"
+        )
+        assert llm.api_key == "dummy"
+
+    def test_base_url_stored_in_default_params(self):
+        llm = OpenAICompatibleLLM(
+            model="m", base_url="http://localhost:9000/v1"
+        )
+        assert llm.default_params["base_url"] == "http://localhost:9000/v1"
+
+    def test_extra_kwargs_forwarded(self):
+        llm = OpenAICompatibleLLM(
+            model="m", base_url="http://localhost/v1",
+            temperature=0.5, extra_headers={"X-App": "test"},
+        )
+        assert llm.default_params["temperature"] == 0.5
+        assert llm.default_params["extra_headers"] == {"X-App": "test"}
+
+    @patch('urllib.request.urlopen')
+    def test_call_routes_to_custom_url(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse(
+            {'choices': [{'message': {'content': 'hi'}}]}
+        )
+        llm = OpenAICompatibleLLM(
+            model="local-7b", base_url="http://127.0.0.1:8765/v1"
+        )
+        llm.call([{"role": "user", "content": "hello"}])
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "http://127.0.0.1:8765/v1/chat/completions"

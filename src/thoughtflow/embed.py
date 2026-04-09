@@ -46,7 +46,7 @@ class EMBED:
         >>> vector = embed.call("Local embedding")
     """
 
-    def __init__(self, model_id='', key='API_KEY', secret='API_SECRET'):
+    def __init__(self, model_id='', key='API_KEY', secret='API_SECRET', **kwargs):
         """
         Initialize an EMBED instance with a model ID and credentials.
 
@@ -60,6 +60,8 @@ class EMBED:
                 Defaults to 'openai:text-embedding-3-small' if no colon is present.
             key (str): API key for the provider.
             secret (str): Optional API secret for additional authentication.
+            **kwargs: Default parameters applied to every call (e.g. base_url,
+                extra_headers, dimensions).  Per-call params override these.
         """
         if ':' not in model_id:
             model_id = 'openai:text-embedding-3-small'
@@ -71,6 +73,11 @@ class EMBED:
         self.api_secret = secret
         self.last_params = {}
         self.last_meta = {}
+        self.default_params = {}
+
+        for k, v in kwargs.items():
+            if v is not None:
+                self.default_params[k] = v
 
         self.__call__ = self.call
 
@@ -100,7 +107,7 @@ class EMBED:
             >>> len(vs)
             2
         """
-        params = params or {}
+        params = {**self.default_params, **(params or {})}
         self.last_params = dict(params)
         self.last_meta = {}
 
@@ -131,10 +138,11 @@ class EMBED:
 
     def _call_openai(self, texts, params):
         """
-        Call the OpenAI embeddings endpoint.
+        Call the OpenAI (or OpenAI-compatible) embeddings endpoint.
 
         Uses the /v1/embeddings endpoint. Supports the 'dimensions' parameter
         for models that allow truncated embeddings (e.g., text-embedding-3-*).
+        When base_url is provided, targets that server instead of cloud OpenAI.
 
         Args:
             texts (list[str]): Texts to embed.
@@ -143,12 +151,18 @@ class EMBED:
         Returns:
             list[list[float]]: Embedding vectors ordered by input index.
         """
-        url = "https://api.openai.com/v1/embeddings"
+        base_url = params.pop('base_url', None)
+        extra_headers = params.pop('extra_headers', None)
+
+        if base_url:
+            url = base_url.rstrip('/') + '/embeddings'
+        else:
+            url = "https://api.openai.com/v1/embeddings"
+
         payload = {
             "model": self.model,
             "input": texts,
         }
-        # Pass through known optional params
         for key in ("dimensions", "encoding_format"):
             if key in params:
                 payload[key] = params[key]
@@ -158,6 +172,9 @@ class EMBED:
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
         }
+        if extra_headers:
+            headers.update(extra_headers)
+
         res = self._send_request(url, data, headers)
         return self._parse_openai_response(res)
 

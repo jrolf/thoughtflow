@@ -164,6 +164,46 @@ class LLM:
         normalized = self._normalize_messages(msg_list)
         return self._map_roles(normalized)
 
+    def _resolve_openai_transport(self, params):
+        """Pop transport-only keys from params and return (url, headers, is_local).
+
+        When base_url is provided the request targets that server instead of
+        the OpenAI cloud API.  extra_headers (if any) are merged into the
+        default Authorization + Content-Type headers.
+        """
+        base_url = params.pop('base_url', None)
+        extra_headers = params.pop('extra_headers', None)
+
+        if base_url:
+            url = base_url.rstrip('/') + '/chat/completions'
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
+
+        headers = {
+            "Authorization": "Bearer " + self.api_key,
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        return url, headers, bool(base_url)
+
+    @staticmethod
+    def _schema_prompt_instruction(output_schema):
+        """Build a system message instructing the model to return schema-conforming JSON.
+
+        Used as a fallback for OpenAI-compatible servers that do not support
+        the native response_format json_schema mechanism.
+        """
+        return {
+            "role": "system",
+            "content": (
+                "You must respond with ONLY valid JSON (no markdown, no explanation) "
+                "conforming to this JSON Schema:\n"
+                + json.dumps(output_schema, separators=(',', ':'))
+            ),
+        }
+
     def call(self, msg_list, params={}, output_schema=None, stream=False):
         """
         Call the appropriate LLM API with the given messages and parameters.
@@ -212,16 +252,19 @@ class LLM:
             raise ValueError("Unsupported service '{}'.".format(self.service))
 
     def _call_openai(self, msg_list, params):
-        url = "https://api.openai.com/v1/chat/completions"
-
-        # Extract and apply structured output schema if present
+        url, headers, is_local = self._resolve_openai_transport(params)
         output_schema = params.pop('_output_schema', None)
+
+        messages = self._prepare_messages(msg_list)
+        if output_schema and is_local:
+            messages = messages + [self._schema_prompt_instruction(output_schema)]
+
         payload = {
             "model": self.model,
-            "messages": self._prepare_messages(msg_list),
+            "messages": messages,
             **params
         }
-        if output_schema:
+        if output_schema and not is_local:
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -232,10 +275,6 @@ class LLM:
             }
 
         data = json.dumps(payload).encode("utf-8")
-        headers = {
-            "Authorization": "Bearer " + self.api_key,
-            "Content-Type": "application/json",
-        }
         res = self._send_request(url, data, headers)
         choices = [a["message"]["content"] for a in res.get("choices", [])]
         return choices
@@ -468,13 +507,11 @@ class LLM:
                 yield text
             return
 
+        is_local = False
+
         # Build the URL and headers per provider
         if self.service == 'openai':
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": "Bearer " + self.api_key,
-                "Content-Type": "application/json",
-            }
+            url, headers, is_local = self._resolve_openai_transport(params)
         elif self.service == 'groq':
             url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {
@@ -506,13 +543,20 @@ class LLM:
                 **{k: v for k, v in params.items() if k not in ("ollama_url", "model")}
             }
         else:
+            params.pop('base_url', None)
+            params.pop('extra_headers', None)
+
+            messages = self._prepare_messages(msg_list)
+            if output_schema and is_local:
+                messages = messages + [self._schema_prompt_instruction(output_schema)]
+
             payload = {
                 "model": self.model,
-                "messages": self._prepare_messages(msg_list),
+                "messages": messages,
                 "stream": True,
                 **params
             }
-            if output_schema:
+            if output_schema and not is_local:
                 payload["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {
@@ -611,3 +655,30 @@ class LLM:
             return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}
         except Exception as e:
             return {"error": str(e)}  
+
+
+class OpenAICompatibleLLM(LLM):
+    """Convenience subclass for connecting to any OpenAI-compatible server.
+
+    Wraps LLM with the ``openai`` service and a custom ``base_url`` so you
+    can talk to local inference servers (MLX, vLLM, llama.cpp, LM Studio,
+    etc.) without remembering the ``service:model`` format or dummy key.
+
+    Example::
+
+        from thoughtflow import OpenAICompatibleLLM
+
+        llm = OpenAICompatibleLLM(
+            model="mlx-community/Llama-3-8B-Instruct",
+            base_url="http://127.0.0.1:8765/v1",
+        )
+        choices = llm.call([{"role": "user", "content": "Hello!"}])
+    """
+
+    def __init__(self, model, base_url, key="dummy", **kwargs):
+        super().__init__(
+            model_id="openai:{}".format(model),
+            key=key,
+            base_url=base_url,
+            **kwargs,
+        )

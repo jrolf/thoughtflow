@@ -457,3 +457,121 @@ class TestEmbedRepr:
         embed = EMBED(model_id="openai:text-embedding-3-small", key="test-key")
         assert "openai" in repr(embed)
         assert "text-embedding-3-small" in repr(embed)
+
+
+# ============================================================================
+# Default Params and Base URL Tests
+# ============================================================================
+
+
+class TestEmbedDefaultParams:
+    """Tests for EMBED constructor kwargs and default_params merging."""
+
+    def test_stores_default_params_from_kwargs(self):
+        embed = EMBED(model_id="openai:text-embedding-3-small", key="k",
+                      dimensions=256, base_url="http://localhost/v1")
+        assert embed.default_params == {
+            "dimensions": 256,
+            "base_url": "http://localhost/v1",
+        }
+
+    def test_default_params_empty_when_no_kwargs(self):
+        embed = EMBED(model_id="openai:text-embedding-3-small", key="k")
+        assert embed.default_params == {}
+
+    def test_ignores_none_kwargs(self):
+        embed = EMBED(model_id="openai:text-embedding-3-small", key="k",
+                      base_url=None, dimensions=512)
+        assert embed.default_params == {"dimensions": 512}
+
+    @patch('urllib.request.urlopen')
+    def test_defaults_applied_to_every_call(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "data": [{"embedding": [0.1], "index": 0}],
+            "usage": {},
+        })
+        embed = EMBED(model_id="openai:text-embedding-3-small", key="k",
+                      dimensions=256)
+        embed.call("hello")
+
+        payload = json.loads(
+            mock_urlopen.call_args[0][0].data.decode('utf-8')
+        )
+        assert payload["dimensions"] == 256
+
+    @patch('urllib.request.urlopen')
+    def test_per_call_params_override_defaults(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "data": [{"embedding": [0.1], "index": 0}],
+            "usage": {},
+        })
+        embed = EMBED(model_id="openai:text-embedding-3-small", key="k",
+                      dimensions=256)
+        embed.call("hello", params={"dimensions": 1024})
+
+        payload = json.loads(
+            mock_urlopen.call_args[0][0].data.decode('utf-8')
+        )
+        assert payload["dimensions"] == 1024
+
+
+class TestEmbedBaseURL:
+    """Tests for custom base_url support in the EMBED openai adapter."""
+
+    @patch('urllib.request.urlopen')
+    def test_base_url_routes_to_custom_server(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "data": [{"embedding": [0.1, 0.2], "index": 0}],
+            "usage": {},
+        })
+        embed = EMBED(model_id="openai:local-embed", key="dummy",
+                      base_url="http://127.0.0.1:8765/v1")
+        result = embed.call("hello")
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "http://127.0.0.1:8765/v1/embeddings"
+        assert result == [0.1, 0.2]
+
+    @patch('urllib.request.urlopen')
+    def test_no_base_url_uses_openai_cloud(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "data": [{"embedding": [0.1], "index": 0}],
+            "usage": {},
+        })
+        embed = EMBED(model_id="openai:text-embedding-3-small", key="sk-real")
+        embed.call("hello")
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "https://api.openai.com/v1/embeddings"
+
+    @patch('urllib.request.urlopen')
+    def test_transport_keys_not_in_payload(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "data": [{"embedding": [0.1], "index": 0}],
+            "usage": {},
+        })
+        embed = EMBED(model_id="openai:m", key="k",
+                      base_url="http://localhost/v1",
+                      extra_headers={"X-Custom": "val"})
+        embed.call("hello")
+
+        payload = json.loads(
+            mock_urlopen.call_args[0][0].data.decode('utf-8')
+        )
+        assert "base_url" not in payload
+        assert "extra_headers" not in payload
+
+    @patch('urllib.request.urlopen')
+    def test_extra_headers_merged(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "data": [{"embedding": [0.1], "index": 0}],
+            "usage": {},
+        })
+        embed = EMBED(model_id="openai:m", key="k",
+                      base_url="http://localhost/v1",
+                      extra_headers={"X-Custom": "val"})
+        embed.call("hello")
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.headers.get("X-custom") == "val"
+        assert "Bearer k" in request.headers.get("Authorization", "")
