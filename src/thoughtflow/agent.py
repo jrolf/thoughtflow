@@ -227,6 +227,12 @@ class AGENT:
             params["tools"] = [t.to_schema() for t in self.tools]
         return params
 
+    def _strip_markdown_backticks(self, response):
+        """
+        Strip markdown backticks from the response.
+        """
+        return response.replace("```", "").replace("`", "")
+
     def _parse_tool_calls(self, response):
         """
         Extract tool-call requests from an LLM response.
@@ -247,6 +253,9 @@ class AGENT:
         """
         if not response:
             return []
+
+        # Strip markdown backticks for better JSON parsing.
+        response = self._strip_markdown_backticks(response)
 
         # Try to parse as JSON
         try:
