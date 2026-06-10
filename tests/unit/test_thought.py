@@ -1304,6 +1304,19 @@ class TestPlanActionFormatting:
         assert "3" in instructions  # max_parallel
 
 
+class TestThoughtParseAlias:
+    """Tests for the parse= constructor alias to parser=."""
+
+    def test_parse_kwarg_aliases_parser_json(self, mock_llm):
+        """parse='json' must behave like parser='json' for fenced JSON responses."""
+        thought = THOUGHT(name="json_test", llm=mock_llm(), prompt="x", parse="json")
+        response = 'Here is JSON:\n\n```json\n{"name": "Alice", "age": 30}\n```'
+
+        parsed = thought.parse_response(response)
+
+        assert parsed == {"name": "Alice", "age": 30}
+
+
 class TestPlanResponseParsing:
     """
     Tests for PLAN response parsing logic.

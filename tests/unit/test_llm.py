@@ -486,6 +486,24 @@ class TestLLMCall:
         assert result[0] == 'Hello from Claude!'
 
     @patch('urllib.request.urlopen')
+    def test_call_moves_system_prompt_to_top_level_for_anthropic(self, mock_urlopen):
+        """Anthropic must receive system prompts via the top-level system field."""
+        mock_urlopen.return_value = MockHTTPResponse({
+            'content': [{'type': 'text', 'text': 'Hello'}]
+        })
+
+        llm = LLM(model_id="anthropic:claude-3-5-sonnet", key="test-key")
+        llm.call([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hello"},
+        ])
+
+        request = mock_urlopen.call_args[0][0]
+        payload = json.loads(request.data.decode('utf-8'))
+        assert payload["system"] == "Be brief."
+        assert payload["messages"] == [{"role": "user", "content": "Hello"}]
+
+    @patch('urllib.request.urlopen')
     def test_call_handles_ollama_response_format(self, mock_urlopen):
         """
         LLM.call() must handle Ollama's response format.
@@ -785,6 +803,22 @@ class TestRoleMapping:
         assert contents[0]["role"] == "model"
         assert contents[1]["role"] == "user"
         assert result[0] == "Hello from Gemini!"
+
+    @patch('urllib.request.urlopen')
+    def test_gemini_call_maps_max_tokens_to_generation_config(self, mock_urlopen):
+        """Gemini must map max_tokens to generationConfig.maxOutputTokens."""
+        mock_urlopen.return_value = MockHTTPResponse({
+            'candidates': [
+                {'content': {'parts': [{'text': '4'}]}}
+            ]
+        })
+
+        llm = LLM(model_id="gemini:gemini-2.5-flash", key="test-key")
+        llm.call("What is 2+2?", {"max_tokens": 12, "temperature": 0})
+
+        payload = json.loads(mock_urlopen.call_args[0][0].data.decode('utf-8'))
+        assert payload["generationConfig"]["maxOutputTokens"] == 12
+        assert payload["generationConfig"]["temperature"] == 0
 
 
 # ============================================================================

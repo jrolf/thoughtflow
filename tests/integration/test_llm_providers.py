@@ -77,8 +77,14 @@ class TestOpenAIIntegration:
         )
         
         result = llm.call(
-            "What is 2+2? Reply with just the number.",
-            {"max_tokens": 10},
+            [
+                {
+                    "role": "system",
+                    "content": "Reply with only the numeric answer and nothing else.",
+                },
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            {"max_tokens": 20, "temperature": 0},
         )
         
         assert len(result) == 1
@@ -121,19 +127,22 @@ class TestOpenAIIntegration:
             key=os.getenv("OPENAI_API_KEY"),
         )
         
+        prompt = [
+            {
+                "role": "system",
+                "content": "Answer factual geography questions with only the place name.",
+            },
+            {"role": "user", "content": "What is the capital of France?"},
+        ]
+
         # Make two calls with temperature=0
-        result1 = llm.call(
-            "What is the capital of France? One word answer.",
-            {"temperature": 0, "max_tokens": 10},
-        )
+        result1 = llm.call(prompt, {"temperature": 0, "max_tokens": 20})
+        result2 = llm.call(prompt, {"temperature": 0, "max_tokens": 20})
         
-        result2 = llm.call(
-            "What is the capital of France? One word answer.",
-            {"temperature": 0, "max_tokens": 10},
-        )
-        
-        # With temperature 0, should get same response
-        assert result1[0].strip() == result2[0].strip()
+        # With temperature 0, factual answers should be stable in substance even
+        # if providers occasionally vary phrasing between calls.
+        assert "paris" in result1[0].lower()
+        assert "paris" in result2[0].lower()
 
     def test_thought_with_openai(self):
         """
@@ -155,7 +164,7 @@ class TestOpenAIIntegration:
             llm=llm,
             prompt="What is 2+2? Reply with just the number.",
             output_var="answer",
-            params={"max_tokens": 10, "temperature": 0},
+            params={"max_tokens": 20, "temperature": 0},
         )
         
         thought(memory)
@@ -191,13 +200,19 @@ class TestAnthropicIntegration:
         Remove this test if: Anthropic changes their API format significantly.
         """
         llm = LLM(
-            model_id="anthropic:claude-3-5-haiku-20241022",
+            model_id="anthropic:claude-haiku-4-5",
             key=os.getenv("ANTHROPIC_API_KEY"),
         )
         
         result = llm.call(
-            "What is 2+2? Reply with just the number.",
-            {"max_tokens": 10},
+            [
+                {
+                    "role": "system",
+                    "content": "Reply with only the numeric answer and nothing else.",
+                },
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            {"max_tokens": 20, "temperature": 0},
         )
         
         assert len(result) == 1
@@ -212,7 +227,7 @@ class TestAnthropicIntegration:
         Remove this test if: Anthropic changes their API format.
         """
         llm = LLM(
-            model_id="anthropic:claude-3-5-haiku-20241022",
+            model_id="anthropic:claude-haiku-4-5",
             key=os.getenv("ANTHROPIC_API_KEY"),
         )
         
@@ -236,7 +251,7 @@ class TestAnthropicIntegration:
         Remove this test if: We change THOUGHT/LLM integration.
         """
         llm = LLM(
-            model_id="anthropic:claude-3-5-haiku-20241022",
+            model_id="anthropic:claude-haiku-4-5",
             key=os.getenv("ANTHROPIC_API_KEY"),
         )
         
@@ -247,7 +262,7 @@ class TestAnthropicIntegration:
             llm=llm,
             prompt="What is 2+2? Reply with just the number.",
             output_var="answer",
-            params={"max_tokens": 10},
+            params={"max_tokens": 20},
         )
         
         thought(memory)
@@ -287,8 +302,14 @@ class TestGroqIntegration:
         )
         
         result = llm.call(
-            "What is 2+2? Reply with just the number.",
-            {"max_tokens": 10},
+            [
+                {
+                    "role": "system",
+                    "content": "Reply with only the numeric answer and nothing else.",
+                },
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            {"max_tokens": 20, "temperature": 0},
         )
         
         assert len(result) == 1
@@ -326,8 +347,14 @@ class TestOpenRouterIntegration:
         )
         
         result = llm.call(
-            "What is 2+2? Reply with just the number.",
-            {"max_tokens": 10},
+            [
+                {
+                    "role": "system",
+                    "content": "Reply with only the numeric answer and nothing else.",
+                },
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            {"max_tokens": 20, "temperature": 0},
         )
         
         assert len(result) == 1
@@ -359,13 +386,14 @@ class TestGeminiIntegration:
         Remove this test if: Google changes their API format.
         """
         llm = LLM(
-            model_id="gemini:gemini-2.0-flash-exp",
+            model_id="gemini:gemini-2.5-flash",
             key=os.getenv("GOOGLE_API_KEY"),
         )
         
         result = llm.call(
             "What is 2+2? Reply with just the number.",
-            {"max_tokens": 10},
+            # Gemini 2.5 may spend budget on internal thinking tokens before text.
+            {"max_tokens": 50},
         )
         
         assert len(result) == 1

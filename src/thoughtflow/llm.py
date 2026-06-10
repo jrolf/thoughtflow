@@ -419,15 +419,37 @@ class LLM:
         choices = [a["message"]["content"] for a in res.get("choices", [])]
         return choices
 
+    def _split_system_messages(self, msg_list):
+        """Extract system prompts for Anthropic's top-level ``system`` field."""
+        system_parts = []
+        conversation = []
+        for msg in self._normalize_messages(msg_list):
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if content:
+                    system_parts.append(str(content))
+            else:
+                conversation.append(msg)
+        return system_parts, self._map_roles(conversation)
+
     def _call_anthropic(self, msg_list, params):
         url = "https://api.anthropic.com/v1/messages"
 
         output_schema = params.pop('_output_schema', None)
+        system_parts, messages = self._split_system_messages(msg_list)
         payload = {
             "model": self.model,
             "max_tokens": params.get("max_tokens", 1024),
-            "messages": self._prepare_messages(msg_list),
+            "messages": messages,
         }
+        if system_parts:
+            payload["system"] = (
+                "\n\n".join(system_parts)
+                if len(system_parts) > 1
+                else system_parts[0]
+            )
+        if "temperature" in params:
+            payload["temperature"] = params["temperature"]
 
         # Anthropic uses a tool-use pattern for structured output: define a
         # tool whose input_schema is the desired output shape, then force the
@@ -462,12 +484,24 @@ class LLM:
         choices = [c.get("text", "") for c in res.get("content", [])]
         return choices
 
+    def _build_gemini_generation_config(self, params):
+        """Map OpenAI-style params to Gemini ``generationConfig`` fields."""
+        generation_config = {}
+        if "max_tokens" in params:
+            generation_config["maxOutputTokens"] = params.pop("max_tokens")
+        if "temperature" in params:
+            generation_config["temperature"] = params.pop("temperature")
+        if "top_p" in params:
+            generation_config["topP"] = params.pop("top_p")
+        return generation_config
+
     def _call_gemini(self, msg_list, params):
         """
         Calls Google Gemini/SVertexAI chat-supported models via REST API.
         Requires self.api_key to be set.
         """
-        params.pop('_output_schema', None)
+        call_params = dict(params)
+        call_params.pop('_output_schema', None)
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
         # Gemini expects [{"role": "user"/"model", "parts": [{"text": ...}]}].
         # Role translation (assistant→model, system→user, etc.) is handled by
@@ -478,10 +512,10 @@ class LLM:
                 "role": m["role"],
                 "parts": [{"text": str(m["content"])}] if isinstance(m["content"], str) else m["content"]
             })
-        payload = {
-            "contents": gemini_msgs,
-            **{k: v for k, v in params.items() if k != "model"}
-        }
+        generation_config = self._build_gemini_generation_config(call_params)
+        payload = {"contents": gemini_msgs}
+        if generation_config:
+            payload["generationConfig"] = generation_config
         data = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",

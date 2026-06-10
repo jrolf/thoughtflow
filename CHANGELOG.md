@@ -8,15 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `MEMORY.add_augment()` — store context tagged for optional LLM-view merging
-  (e.g. RAG chunks) without mutating user messages in the event log
-- `MEMORY.get_llm_msgs(merge_augments=False)` — build LLM-ready message dicts;
-  when `merge_augments=True`, fold `metadata['augments'] == 'last_user'`
-  events into the preceding user turn for the model payload only
-- `AGENT(merge_augments=False)` — opt-in flag to use the merged LLM view in
-  `_build_messages()`; default behavior unchanged
-- Addresses [#15](https://github.com/jrolf/thoughtflow/issues/15) — optional
-  support for prompt-injection-style RAG while preserving event-sourced storage
+- Nothing yet
 
 ### Changed
 - Nothing yet
@@ -55,6 +47,15 @@ grown from MEMORY itself, with zero new concepts.
 - Unit tests for record/replay (round-trips, hash stability, miss behavior,
   end-to-end THOUGHT replay), the eval harness, on_token streaming, and
   validation-spelling equivalence
+- `MEMORY.add_augment()` — store context tagged for optional LLM-view merging
+  (e.g. RAG chunks) without mutating user messages in the event log
+- `MEMORY.get_llm_msgs(merge_augments=False)` — build LLM-ready message dicts;
+  when `merge_augments=True`, fold `metadata['augments'] == 'last_user'`
+  events into the preceding user turn for the model payload only
+- `AGENT(merge_augments=False)` — opt-in flag to use the merged LLM view in
+  `_build_messages()`; default behavior unchanged
+- Addresses [#15](https://github.com/jrolf/thoughtflow/issues/15) — optional
+  support for prompt-injection-style RAG while preserving event-sourced storage
 
 ### Changed
 - `THOUGHT` validation: `validation=` is the canonical spelling and now accepts
@@ -68,6 +69,9 @@ grown from MEMORY itself, with zero new concepts.
 - `MEMORY.copy()` — no longer stores a module reference on the instance
   (`bisect` is now a module-level import), so deep copy works; the previously
   skipped test is restored and expanded
+- Anthropic: system prompts now use the top-level `system` field (not `messages`)
+- Gemini: map `max_tokens` / `temperature` / `top_p` to `generationConfig`
+- `THOUGHT`: `parse='json'` now aliases `parser='json'`; fenced JSON parsing improved
 
 ### Removed
 - `thoughtflow.trace` (Session/Event/TraceSchema) — superseded by MEMORY-native

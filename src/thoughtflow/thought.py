@@ -173,6 +173,8 @@ class THOUGHT:
 
         # Store any additional configuration parameters
         self.config = kwargs.copy()
+        if self.config.get("parse") and not self.config.get("parser"):
+            self.config["parser"] = self.config["parse"]
 
         # Optionally, store a description or docstring if provided
         self.description = kwargs.get("description", None)
@@ -732,9 +734,15 @@ class THOUGHT:
             return response
         elif parser == "json":
             import re
-            # Remove code fences if present
+            # Remove wrapping markdown code fences if present
             text = response.strip()
-            text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+            fence_match = re.match(
+                r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
+                text,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if fence_match:
+                text = fence_match.group(1).strip()
             # Find first JSON object or array
             match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
             if match:
