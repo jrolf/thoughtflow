@@ -303,6 +303,178 @@ class TestMessageOperations:
         assert memory.last_user_msg(content_only=True) == ''
 
 
+class TestResultMessageOperations:
+    """Tests for result-role message accessors."""
+
+    def test_last_result_msg_returns_full_event(self, memory):
+        """last_result_msg must return the full event dict by default."""
+        import time
+        memory.add_msg('result', 'First result')
+        time.sleep(0.001)  # Ensure distinct timestamps for ordering
+        memory.add_msg('result', 'Last result')
+
+        result = memory.last_result_msg()
+        assert isinstance(result, dict)
+        assert result['content'] == 'Last result'
+        assert result['role'] == 'result'
+
+    def test_last_result_msg_content_only(self, memory):
+        """last_result_msg(content_only=True) must return just the content string."""
+        memory.add_msg('result', 'Tool output')
+
+        assert memory.last_result_msg(content_only=True) == 'Tool output'
+
+    def test_last_result_msg_returns_none_if_none(self, memory):
+        """last_result_msg must return None if no result messages exist."""
+        assert memory.last_result_msg() is None
+
+    def test_last_result_msg_content_only_returns_empty_if_none(self, memory):
+        """last_result_msg(content_only=True) must return empty string if no messages."""
+        assert memory.last_result_msg(content_only=True) == ''
+
+
+class TestMessageMetadata:
+    """Tests for per-message metadata on MEMORY events."""
+
+    def test_add_msg_stores_metadata(self, memory):
+        """add_msg must persist optional metadata on the stored event."""
+        memory.add_msg(
+            'system',
+            'RAG context',
+            channel='webapp',
+            metadata={'internal': True, 'source': 'rag'},
+        )
+
+        msgs = memory.get_msgs()
+        assert msgs[0]['metadata'] == {'internal': True, 'source': 'rag'}
+
+    def test_add_msg_omits_empty_metadata(self, memory):
+        """add_msg must not add a metadata key when metadata is omitted."""
+        memory.add_msg('user', 'Hello', channel='webapp')
+
+        assert 'metadata' not in memory.get_msgs()[0]
+
+    def test_add_msg_rejects_non_dict_metadata(self, memory):
+        """add_msg must reject non-dict metadata values."""
+        with pytest.raises(ValueError, match='metadata must be a dict'):
+            memory.add_msg('user', 'Hello', channel='webapp', metadata='bad')
+
+    def test_get_msgs_exclude_metadata(self, memory):
+        """get_msgs(exclude_metadata=...) must hide tagged internal messages."""
+        memory.add_msg('user', 'Visible question', channel='webapp')
+        memory.add_msg(
+            'system',
+            'Hidden RAG context',
+            channel='webapp',
+            metadata={'internal': True},
+        )
+        memory.add_msg('assistant', 'Visible answer', channel='webapp')
+
+        visible = memory.get_msgs(exclude_metadata={'internal': True})
+        contents = [msg['content'] for msg in visible]
+
+        assert contents == ['Visible question', 'Visible answer']
+
+    def test_get_msgs_metadata_filter(self, memory):
+        """get_msgs(metadata_filter=...) must keep only matching messages."""
+        memory.add_msg('system', 'Public system prompt', channel='webapp')
+        memory.add_msg(
+            'system',
+            'Hidden RAG context',
+            channel='webapp',
+            metadata={'internal': True},
+        )
+
+        internal = memory.get_msgs(metadata_filter={'internal': True})
+        assert len(internal) == 1
+        assert internal[0]['content'] == 'Hidden RAG context'
+
+
+class TestLlmViewAugments:
+    """Tests for optional LLM-view augmentation (issue #15)."""
+
+    def test_add_augment_stores_metadata(self, memory):
+        """add_augment must tag events for optional LLM-view merging."""
+        memory.add_augment(
+            'Retrieved context',
+            metadata={'internal': True, 'source': 'rag'},
+        )
+
+        msgs = memory.get_msgs()
+        assert msgs[0]['metadata'] == {
+            'internal': True,
+            'source': 'rag',
+            'augments': 'last_user',
+        }
+
+    def test_get_llm_msgs_default_matches_separate_messages(self, memory):
+        """get_llm_msgs() must forward stored messages without merging."""
+        memory.add_msg('user', 'Question?', channel='webapp')
+        memory.add_augment('RAG context', metadata={'internal': True})
+
+        llm_msgs = memory.get_llm_msgs()
+        stored = memory.get_msgs()
+
+        assert len(llm_msgs) == len(stored)
+        assert llm_msgs[0]['content'] == 'Question?'
+        assert llm_msgs[1]['content'] == 'RAG context'
+
+    def test_get_llm_msgs_merge_augments_into_user_turn(self, memory):
+        """merge_augments must fold augment events into the preceding user turn."""
+        memory.add_msg('user', 'Question?', channel='webapp')
+        memory.add_augment('RAG context', metadata={'internal': True})
+
+        merged = memory.get_llm_msgs(merge_augments=True)
+
+        assert len(merged) == 1
+        assert merged[0]['role'] == 'user'
+        assert merged[0]['content'] == 'RAG context\n\nQuestion?'
+
+    def test_get_llm_msgs_merge_is_per_turn(self, memory):
+        """Augments must attach to the user message on the same turn only."""
+        import time
+
+        memory.add_msg('user', 'Turn one', channel='webapp')
+        time.sleep(0.001)
+        memory.add_augment('Context one')
+        time.sleep(0.001)
+        memory.add_msg('assistant', 'Answer one', channel='webapp')
+        time.sleep(0.001)
+        memory.add_msg('user', 'Turn two', channel='webapp')
+        time.sleep(0.001)
+        memory.add_augment('Context two')
+
+        merged = memory.get_llm_msgs(merge_augments=True)
+        user_contents = [msg['content'] for msg in merged if msg['role'] == 'user']
+
+        assert user_contents == [
+            'Context one\n\nTurn one',
+            'Context two\n\nTurn two',
+        ]
+        assert any(msg['content'] == 'Answer one' for msg in merged if msg['role'] == 'assistant')
+
+    def test_get_msgs_unchanged_when_merge_enabled_elsewhere(self, memory):
+        """get_msgs must still return separate stored events."""
+        memory.add_msg('user', 'Question?', channel='webapp')
+        memory.add_augment('RAG context', metadata={'internal': True})
+
+        memory.get_llm_msgs(merge_augments=True)
+        stored = memory.get_msgs()
+
+        assert len(stored) == 2
+        assert stored[1]['content'] == 'RAG context'
+
+    def test_exclude_metadata_still_hides_augment_events(self, memory):
+        """UI filtering must still hide augment events from visible history."""
+        memory.add_msg('user', 'Visible question', channel='webapp')
+        memory.add_augment('Hidden RAG context', metadata={'internal': True})
+
+        visible = memory.get_msgs(exclude_metadata={'internal': True})
+        contents = [msg['content'] for msg in visible]
+
+        assert contents == ['Visible question']
+
+
 # ============================================================================
 # Log Operation Tests
 # ============================================================================
@@ -882,15 +1054,11 @@ class TestSerialization:
         assert restored.last_user_msg(content_only=True) == 'Hello'
         assert restored.get_var('counter') == 42
 
-    @pytest.mark.skip(reason="MEMORY.copy() fails due to internal module reference (_bisect)")
     def test_copy_creates_independent_instance(self, memory):
         """
         copy must create a deep copy that is independent.
         
         Changes to the copy must not affect the original.
-        
-        Note: This test is currently skipped because MEMORY stores an internal
-        reference to the bisect module which cannot be deep copied.
         
         Remove this test if: We remove copy method.
         """
@@ -901,6 +1069,21 @@ class TestSerialization:
         
         assert memory.get_var('x') == 1
         assert copy.get_var('x') == 2
+
+    def test_copy_preserves_messages_and_indexes(self, memory):
+        """
+        copy must preserve message history and keep indexes independent.
+        
+        Remove this test if: We remove copy method.
+        """
+        memory.add_msg('user', 'Original message', channel='webapp')
+        
+        duplicate = memory.copy()
+        duplicate.add_msg('assistant', 'Only in the copy', channel='webapp')
+        
+        assert duplicate.last_user_msg(content_only=True) == 'Original message'
+        assert len(memory.get_msgs()) == 1
+        assert len(duplicate.get_msgs()) == 2
 
 
 # ============================================================================

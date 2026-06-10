@@ -12,6 +12,8 @@ import json
 import urllib.request
 import urllib.error
 
+from thoughtflow._util import exchange_key, TRANSPORT_PARAM_KEYS
+
 
 class EMBED:
     """
@@ -46,7 +48,7 @@ class EMBED:
         >>> vector = embed.call("Local embedding")
     """
 
-    def __init__(self, model_id='', key='API_KEY', secret='API_SECRET'):
+    def __init__(self, model_id='', key='API_KEY', secret='API_SECRET', **kwargs):
         """
         Initialize an EMBED instance with a model ID and credentials.
 
@@ -60,6 +62,8 @@ class EMBED:
                 Defaults to 'openai:text-embedding-3-small' if no colon is present.
             key (str): API key for the provider.
             secret (str): Optional API secret for additional authentication.
+            **kwargs: Default parameters applied to every call (e.g. base_url,
+                extra_headers, dimensions).  Per-call params override these.
         """
         if ':' not in model_id:
             model_id = 'openai:text-embedding-3-small'
@@ -71,8 +75,58 @@ class EMBED:
         self.api_secret = secret
         self.last_params = {}
         self.last_meta = {}
+        self.default_params = {}
+
+        # Optional MEMORY that receives a record of every exchange
+        self._record_memory = kwargs.pop('record', None)
+
+        for k, v in kwargs.items():
+            if v is not None:
+                self.default_params[k] = v
 
         self.__call__ = self.call
+
+    def record(self, memory):
+        """
+        Start recording every embedding exchange into the given MEMORY.
+
+        Mirrors LLM.record(): each call() appends an exchange event keyed by
+        content hash, enabling deterministic replay via EMBED.replay().
+
+        Args:
+            memory: A MEMORY instance, or None to stop recording.
+
+        Returns:
+            self (for chaining).
+        """
+        self._record_memory = memory
+        return self
+
+    def _request_signature(self, texts, params):
+        """Build the canonical (key, request) pair for an embedding exchange."""
+        clean_params = {
+            k: v for k, v in params.items() if k not in TRANSPORT_PARAM_KEYS
+        }
+        request = {'texts': list(texts), 'params': clean_params}
+        key = exchange_key(self.service, self.model, request)
+        return key, request
+
+    @classmethod
+    def replay(cls, memory, on_miss='raise', model_id=None):
+        """
+        Build a ReplayEMBED that serves vectors recorded in the given MEMORY.
+
+        Args:
+            memory: A MEMORY containing recorded embed exchanges.
+            on_miss: 'raise' (default) to fail loudly on an unrecorded
+                request, or a live EMBED instance to fall back to.
+            model_id: 'service:model' to replay as. Only needed when the
+                memory contains recordings from more than one embedding model.
+
+        Returns:
+            ReplayEMBED
+        """
+        return ReplayEMBED(memory, on_miss=on_miss, model_id=model_id)
 
     def call(self, text, params=None):
         """
@@ -100,13 +154,19 @@ class EMBED:
             >>> len(vs)
             2
         """
-        params = params or {}
+        params = {**self.default_params, **(params or {})}
         self.last_params = dict(params)
         self.last_meta = {}
 
         # Track whether the caller passed a single string so we can unwrap
         single_input = isinstance(text, str)
         texts = [text] if single_input else list(text)
+
+        # Compute the exchange signature up front (params are mutated by the
+        # provider methods) so recording sees the canonical request.
+        recording = self._record_memory is not None
+        if recording:
+            key, request = self._request_signature(texts, params)
 
         if self.service == 'openai':
             vectors = self._call_openai(texts, params)
@@ -121,6 +181,16 @@ class EMBED:
         else:
             raise ValueError("Unsupported embedding service '{}'.".format(self.service))
 
+        if recording:
+            self._record_memory.add_exchange(
+                kind='embed',
+                key=key,
+                service=self.service,
+                model=self.model,
+                request=request,
+                response=vectors,
+            )
+
         if single_input and vectors:
             return vectors[0]
         return vectors
@@ -131,10 +201,11 @@ class EMBED:
 
     def _call_openai(self, texts, params):
         """
-        Call the OpenAI embeddings endpoint.
+        Call the OpenAI (or OpenAI-compatible) embeddings endpoint.
 
         Uses the /v1/embeddings endpoint. Supports the 'dimensions' parameter
         for models that allow truncated embeddings (e.g., text-embedding-3-*).
+        When base_url is provided, targets that server instead of cloud OpenAI.
 
         Args:
             texts (list[str]): Texts to embed.
@@ -143,12 +214,18 @@ class EMBED:
         Returns:
             list[list[float]]: Embedding vectors ordered by input index.
         """
-        url = "https://api.openai.com/v1/embeddings"
+        base_url = params.pop('base_url', None)
+        extra_headers = params.pop('extra_headers', None)
+
+        if base_url:
+            url = base_url.rstrip('/') + '/embeddings'
+        else:
+            url = "https://api.openai.com/v1/embeddings"
+
         payload = {
             "model": self.model,
             "input": texts,
         }
-        # Pass through known optional params
         for key in ("dimensions", "encoding_format"):
             if key in params:
                 payload[key] = params[key]
@@ -158,6 +235,9 @@ class EMBED:
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
         }
+        if extra_headers:
+            headers.update(extra_headers)
+
         res = self._send_request(url, data, headers)
         return self._parse_openai_response(res)
 
@@ -214,7 +294,7 @@ class EMBED:
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
             "HTTP-Referer": params.get("referer", "https://your-app.com"),
-            "X-Title": params.get("title", "Thoughtflow"),
+            "X-Title": params.get("title", "ThoughtFlow"),
         }
         res = self._send_request(url, data, headers)
         return self._parse_openai_response(res)
@@ -367,3 +447,78 @@ class EMBED:
     def __repr__(self):
         """Return a detailed string representation."""
         return "EMBED(service='{}', model='{}')".format(self.service, self.model)
+
+
+class ReplayEMBED(EMBED):
+    """
+    An EMBED that serves recorded vectors instead of calling the network.
+
+    Mirror of ReplayLLM for the embedding boundary. Construct via
+    EMBED.replay(memory) or directly.
+    """
+
+    def __init__(self, memory, on_miss='raise', model_id=None):
+        """
+        Args:
+            memory: MEMORY containing recorded 'embed' exchanges.
+            on_miss: 'raise' to raise ReplayMissError on unrecorded requests,
+                or a live EMBED instance to fall back to.
+            model_id: 'service:model' to replay as. Optional when the memory
+                contains recordings from exactly one embedding model.
+        """
+        from thoughtflow.llm import ReplayMissError  # shared exception
+        self._miss_error = ReplayMissError
+
+        exchanges = memory.get_exchanges(kind='embed')
+
+        identities = {(e.get('service'), e.get('model')) for e in exchanges}
+        if model_id is not None:
+            parts = model_id.split(':')
+            service, model = parts[0], ':'.join(parts[1:])
+        elif len(identities) == 1:
+            service, model = next(iter(identities))
+        elif len(identities) == 0:
+            service, model = 'replay', 'empty'
+        else:
+            raise ValueError(
+                "Memory contains embed recordings from multiple models ({}). "
+                "Pass model_id='service:model' to choose one.".format(
+                    ", ".join(sorted("{}:{}".format(s, m) for s, m in identities))
+                )
+            )
+
+        super().__init__(model_id="{}:{}".format(service, model), key='replay')
+        self.on_miss = on_miss
+
+        self._responses = {}
+        for e in exchanges:
+            if (e.get('service'), e.get('model')) != (service, model):
+                continue
+            # Last recording wins for identical embed requests (embeddings
+            # for the same input are expected to be stable).
+            self._responses[e['key']] = e.get('response', [])
+
+    def call(self, text, params=None):
+        """Serve recorded vectors for the given text(s)."""
+        params = {**self.default_params, **(params or {})}
+        self.last_params = dict(params)
+        self.last_meta = {}
+
+        single_input = isinstance(text, str)
+        texts = [text] if single_input else list(text)
+
+        key, _request = self._request_signature(texts, params)
+        vectors = self._responses.get(key)
+
+        if vectors is None:
+            if self.on_miss == 'raise' or self.on_miss is None:
+                raise self._miss_error(
+                    "No recorded embedding for this request (key={}). "
+                    "Re-record the session, or construct ReplayEMBED with "
+                    "on_miss=<live EMBED> to fall back.".format(key)
+                )
+            return self.on_miss.call(text, params=params)
+
+        if single_input and vectors:
+            return vectors[0]
+        return list(vectors)

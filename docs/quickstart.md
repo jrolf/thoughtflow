@@ -235,11 +235,29 @@ restored = MEMORY.from_json("state.json")
 
 ---
 
+## Deterministic Testing
+
+Because MEMORY is event-sourced, any LLM can record its exchanges into it and replay them later — offline, instant, byte-identical:
+
+```python
+llm = LLM("openai:gpt-4o", key="...").record(memory)
+# ... run your flow once against the live API ...
+memory.to_json("session.json")
+
+# In tests: no network, no key, same outputs
+replay_llm = LLM.replay(MEMORY.from_json("session.json"))
+```
+
+See [Deterministic Replay](concepts/replay.md) for the full record/save/replay/assert lifecycle.
+
+---
+
 ## Next Steps
 
-- [primitives/LLM.md](../primitives/LLM.md) -- Multi-provider model interface
-- [primitives/MEMORY.md](../primitives/MEMORY.md) -- Event-sourced state container
-- [primitives/THOUGHT.md](../primitives/THOUGHT.md) -- Atomic unit of cognition
-- [primitives/ACTION.md](../primitives/ACTION.md) -- External operations
-- [primitives/AGENT.md](../primitives/AGENT.md) -- Autonomous tool-use loop
-- [README](../README.md) -- Full documentation with all primitives and patterns
+- [LLM](concepts/llm.md) -- Multi-provider model interface
+- [Memory](concepts/memory.md) -- Event-sourced state container
+- [Agent](concepts/agent.md) -- Autonomous tool-use loop
+- [Tools](concepts/tools.md) -- LLM-selectable capabilities
+- [Deterministic Replay](concepts/replay.md) -- Record/replay testing
+- [Full API reference](https://github.com/jrolf/thoughtflow/tree/main/primitives) -- Canonical docs for every primitive
+- [README](https://github.com/jrolf/thoughtflow/blob/main/README.md) -- Full documentation with all primitives and patterns

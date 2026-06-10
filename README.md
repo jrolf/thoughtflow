@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <em>A handful of composable primitives. Event-sourced memory. Autonomous agents. No framework overhead. Just Python.</em>
+  <em>A handful of composable primitives. Event-sourced memory. Deterministic replay. Zero dependencies. Just Python.</em>
 </p>
 
 <!-- Primary badges: trust signals -->
@@ -26,7 +26,7 @@
   <a href="https://pypi.org/project/thoughtflow/"><img src="https://img.shields.io/pypi/v/thoughtflow?color=blue" alt="PyPI version"></a>
   <a href="https://pypi.org/project/thoughtflow/"><img src="https://img.shields.io/pypi/pyversions/thoughtflow" alt="Python versions"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/jrolf/thoughtflow"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build"></a>
+  <a href="https://github.com/jrolf/thoughtflow/actions/workflows/test.yml"><img src="https://github.com/jrolf/thoughtflow/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
   <a href="https://pepy.tech/project/thoughtflow"><img src="https://static.pepy.tech/badge/thoughtflow/month" alt="Downloads/month"></a>
 </p>
 
@@ -41,6 +41,7 @@
 <p align="center">
   <a href="#-installation">Install</a> •
   <a href="#-quick-start">Quick Start</a> •
+  <a href="#-deterministic-by-design-record--replay">Replay</a> •
   <a href="#-the-primitives">Primitives</a> •
   <a href="#-foundational-primitives-in-depth">Foundational</a> •
   <a href="#-higher-level-primitives">Higher-Level</a> •
@@ -50,20 +51,49 @@
 
 ---
 
+## 🧠 One Idea, Carried All the Way Through
+
+Every ThoughtFlow program — from a single prompt to an autonomous multi-agent
+system — is built from one pattern:
+
+```python
+memory = primitive(memory)
+```
+
+A **MEMORY** flows through your system. Every primitive — a thought, a tool
+call, an agent, an entire workflow — takes the memory, does its work, records
+what happened, and hands the memory back. That single contract gives you
+things other frameworks bolt on afterward:
+
+- **Composition is just Python.** Chain primitives with a `for` loop. Branch
+  with an `if`. No graph DSL, no YAML, no callback registry.
+- **State is never hidden.** The memory is an event-sourced log of every
+  message, decision, variable change, and tool result — inspectable,
+  serializable, and diffable at any point.
+- **Any step is swappable.** A THOUGHT, an AGENT, and a plain Python function
+  are interchangeable, because they all share the same signature.
+
+And because the entire library is **pure Python with zero dependencies**, the
+whole engine fits in your head — and in a Lambda function.
+
+---
+
 ## 🚀 Installation
 
 ```bash
 pip install thoughtflow
 ```
 
-**That's it.** The core library has **zero dependencies** — it uses only Python's standard library.
+**That's it.** No transitive dependency tree, no version conflicts, no
+supply-chain anxiety. The core library uses only Python's standard library —
+`pip install thoughtflow` is the entire setup story.
 
 ```bash
 # Upgrade to the latest version
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.1.2
+pip install thoughtflow==0.2.0
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -118,6 +148,61 @@ print(memory.render(format="conversation"))
 
 **The universal pattern is `memory = thought(memory)`.** That's not a simplification — that's the actual API. Everything flows through MEMORY.
 
+Want it more autonomous? Swap the THOUGHT for an AGENT with tools — the
+contract doesn't change:
+
+```python
+from thoughtflow import TOOL, AGENT
+
+agent = AGENT(llm=llm, tools=[weather_tool, search_tool],
+              system_prompt="You are a research assistant.")
+
+memory = agent(memory)   # same pattern, now with autonomous tool use
+```
+
+---
+
+## 🧪 Deterministic by Design: Record & Replay
+
+The hardest part of building AI systems is testing them. Model outputs are
+nondeterministic, API calls cost money, and CI can't depend on a network.
+ThoughtFlow solves this with a capability that falls naturally out of its
+architecture: **because MEMORY is event-sourced, the LLM boundary can be
+recorded as events — and any flow can be replayed deterministically.**
+
+```python
+from thoughtflow import LLM, MEMORY
+
+# 1. RECORD — run your flow live once; every exchange is captured
+llm = LLM("openai:gpt-4o", key="sk-...")
+recording = MEMORY()
+llm.record(recording)
+
+memory = my_flow(MEMORY(), llm)        # hits the API, records everything
+recording.to_json("session.json")      # the memory IS the recording
+
+# 2. REPLAY — same flow, no network, no keys, byte-identical
+replay_llm = LLM.replay(MEMORY.from_json("session.json"))
+memory2 = my_flow(MEMORY(), replay_llm)
+
+assert memory2.last_asst_msg() == memory.last_asst_msg()   # passes, forever
+```
+
+- **Offline & instant** — replay runs need no API keys and cost nothing.
+  Commit `session.json` to your repo and your agent tests run in CI forever.
+- **Fails loudly on drift** — if your flow sends a request that was never
+  recorded, you get a `ReplayMissError` (or fall back to a live LLM with
+  `on_miss=`), so silent staleness can't creep in.
+- **Zero new concepts** — there is no session object, no tracer, no plugin.
+  Recording is just more MEMORY events; replay is just an LLM that reads them.
+- **Debug production sessions on your laptop** — record in production,
+  download one JSON file, and step through the exact conversation locally.
+
+The same seam exists for embeddings (`EMBED.record()` / `EMBED.replay()`),
+and a thin [eval harness](#-testing--evaluation) turns recorded flows into
+structured test suites. See the runnable demo:
+[`examples/scripts/13_record_replay.py`](examples/scripts/13_record_replay.py).
+
 ---
 
 ## 🔥 The Manifesto
@@ -130,9 +215,9 @@ AI systems don't need to be complicated. The complexity lives in the problems yo
 
 - 🎯 **Your agent logic should fit in your head** — A few powerful primitives, not forty classes
 - 🔍 **Every state change should be visible and traceable** — Event-sourced memory with full history
-- 🧪 **Testing AI systems should be as easy as testing regular code** — Deterministic replay built-in
+- 🧪 **Testing AI systems should be as easy as testing regular code** — Record/replay is built into the LLM and MEMORY primitives
 - 📦 **Zero dependencies means zero supply chain nightmares** — Core runs on stdlib only
-- ⚡ **Serverless deployment should be trivial, not heroic** — <100ms cold starts
+- ⚡ **Serverless deployment should be trivial, not heroic** — Sub-second cold starts, full state in one JSON string
 
 ---
 
@@ -195,7 +280,7 @@ Switching to ThoughtFlow? Here's what you can remove from your project:
 | **Time to Understand** | **5 minutes** | 2+ hours | 1+ hour | 1+ hour |
 | **Concepts to Learn** | **~12 core** | 50+ | 30+ | 15+ |
 | **Serverless Ready** | **Trivial** | Challenging | Challenging | Challenging |
-| **Cold Start (Lambda)** | **<100ms** | 2-5 seconds | 1-3 seconds | 1-2 seconds |
+| **Cold Start (Lambda)** | **Sub-second** | Multiple seconds | Multiple seconds | Multiple seconds |
 | **Full State Visibility** | **Everything** | Partial | Partial | Partial |
 | **Deterministic Replay** | **Built-in** | DIY | DIY | DIY |
 | **Multi-Provider LLM** | **Built-in** | Via adapters | Via adapters | Via adapters |
@@ -211,7 +296,7 @@ Switching to ThoughtFlow? Here's what you can remove from your project:
 | **Import Time** | ~15ms | Zero dependencies = instant module load |
 | **Memory Overhead** | ~2MB | Minimal runtime footprint |
 | **Call Overhead** | <1ms | Direct HTTP calls, no middleware stack |
-| **Cold Start (Lambda)** | <100ms | Critical for serverless economics |
+| **Cold Start (Lambda)** | Sub-second | Critical for serverless economics |
 | **Event Throughput** | 100k+ events/sec | Event-sourced architecture scales |
 
 *These are architectural characteristics, not formal benchmarks. Your mileage may vary based on workload.*
@@ -377,6 +462,58 @@ llm.call([{"content": "Hello"}])
 
 # Plain strings (becomes user messages)
 llm.call(["Hello", "How are you?"])
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STRUCTURED OUTPUT — enforce a JSON Schema
+# ═══════════════════════════════════════════════════════════════════════════
+
+schema = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+    "required": ["name", "age"],
+}
+response = llm.call(
+    [{"role": "user", "content": "Alice is 28 years old."}],
+    output_schema=schema,
+)
+# The provider's native mechanism is used (response_format for OpenAI/Groq/
+# OpenRouter, tool-use for Anthropic, format for Ollama) — with prompt
+# injection as the fallback for local servers.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STREAMING — get chunks as they arrive
+# ═══════════════════════════════════════════════════════════════════════════
+
+for chunk in llm.call([{"role": "user", "content": "Tell me a story"}], stream=True):
+    print(chunk, end="", flush=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LOCAL & SELF-HOSTED MODELS — vLLM, LM Studio, llama.cpp, MLX, Ollama
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Any OpenAI-compatible server via base_url
+llm = LLM("openai:my-local-model", key="dummy",
+          base_url="http://localhost:8000/v1")
+
+# Or the convenience class
+from thoughtflow import OpenAICompatibleLLM
+llm = OpenAICompatibleLLM(model="mlx-community/Llama-3-8B-Instruct",
+                          base_url="http://127.0.0.1:8765/v1")
+
+# Ollama is a first-class service
+llm = LLM("ollama:llama3.2")   # no key needed
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RECORD & REPLAY — deterministic testing at the LLM boundary
+# ═══════════════════════════════════════════════════════════════════════════
+
+recording = MEMORY()
+llm.record(recording)                  # every exchange captured as events
+# ... run your flow ...
+recording.to_json("session.json")
+
+replay_llm = LLM.replay(MEMORY.from_json("session.json"))
+# replay_llm is a drop-in LLM: same flows, no network, identical outputs
 ```
 
 **Key features:**
@@ -384,6 +521,9 @@ llm.call(["Hello", "How are you?"])
 - **Consistent response format** — Always returns a list of response strings
 - **Zero provider-specific code** — Switch providers by changing one string
 - **Direct HTTP calls** — No middleware, no overhead, no surprises
+- **Structured output** — JSON Schema enforcement via each provider's native mechanism
+- **Streaming** — SSE/NDJSON streaming with a plain generator interface
+- **Record/replay** — Capture exchanges into MEMORY; replay them deterministically
 
 ---
 
@@ -420,6 +560,20 @@ memory.last_sys_msg()                     # Returns: {'stamp': '...', 'content':
 # Or get just the content string
 memory.last_user_msg(content_only=True)   # Returns: "Also checking on mobile"
 memory.last_asst_msg(content_only=True)   # Returns: "Hi there! How can I help?"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MESSAGE METADATA — tag events, filter views
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Tag messages with metadata (e.g. RAG context the user shouldn't see)
+memory.add_msg("system", "Retrieved context: ...", channel="webapp",
+               metadata={"internal": True, "source": "rag"})
+
+# UI-visible history: hide internal events
+visible = memory.get_msgs(exclude_metadata={"internal": True})
+
+# Or select only the tagged ones
+rag_events = memory.get_msgs(metadata_filter={"source": "rag"})
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LOGS & REFLECTIONS — internal agent reasoning
@@ -575,9 +729,11 @@ memory.get_var("attachment")  # Returns decompressed data
 - **Event-sourced** — Every change is an event with a sortable ID
 - **Full variable history** — See every change with timestamps
 - **Channel tracking** — Build omni-channel agents (web, mobile, Telegram, etc.)
+- **Message metadata** — Tag events and filter views (UI-visible vs internal)
 - **Tombstone deletion** — History is never lost
 - **Auto-compression** — Large values handled automatically
 - **Multiple export formats** — JSON, Pickle, snapshots for cloud sync
+- **Record/replay substrate** — LLM exchanges store as events; recordings survive JSON round-trips
 
 ---
 
@@ -640,16 +796,17 @@ thought = THOUGHT(
     llm=llm,
     prompt="Generate exactly 5 creative ideas for: {topic}",
     parser="json",
-    validator="list_min_len:5",  # Must have at least 5 items
+    validation="list_min_len:5", # Must have at least 5 items
     max_retries=3,               # Retry up to 3 times if validation fails
     retry_delay=0.5,             # Wait 0.5s between retries
 )
 
-# Built-in validators:
+# Built-in validators (pass a string or a callable to validation=):
 # - "any"                    — Accept anything
 # - "has_keys:key1,key2"     — Dict must have these keys
 # - "list_min_len:N"         — List must have at least N items
 # - Custom callable          — Your own validation function
+# (validator= is an equivalent config-style spelling of validation=)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # WITH CUSTOM VALIDATION
@@ -738,6 +895,20 @@ thought = THOUGHT(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
+# STREAMING — surface tokens as they arrive, keep the contract intact
+# ═══════════════════════════════════════════════════════════════════════════
+
+thought = THOUGHT(
+    name="storyteller",
+    llm=llm,
+    prompt="Tell a short story about: {topic}",
+    on_token=lambda chunk: print(chunk, end="", flush=True),
+)
+memory = thought(memory)
+# Tokens stream through your hook in real time; the complete text still
+# flows through parsing/validation and lands in memory as usual.
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SERIALIZATION — save and restore thoughts
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -771,7 +942,8 @@ thought.last_response    # Raw LLM response
 - **Callable interface** — `memory = thought(memory)` is the entire API
 - **Automatic retry** — With repair prompts that explain what went wrong
 - **Schema-based parsing** — Via `valid_extract` for bulletproof extraction
-- **Multiple validators** — Built-in or custom validation functions
+- **Multiple validators** — Built-in or custom, via the `validation=` parameter
+- **Token streaming** — `on_token=` hook streams chunks without breaking the contract
 - **Four operations** — `llm_call`, `memory_query`, `variable_set`, `conditional`
 - **Pre/post hooks** — Custom processing before and after execution
 - **Full serialization** — Save, restore, and copy thoughts
@@ -1380,6 +1552,10 @@ print(len(vector))  # e.g., 1536
 
 # Batch → list of vectors
 vectors = embed.call(["Hello", "World"])
+
+# Record/replay works here too — same seam as LLM
+embed.record(memory)
+replay_embed = EMBED.replay(memory)
 ```
 
 ---
@@ -1811,6 +1987,55 @@ chron.add("health_check", every=300, action=lambda m: print("OK"))
 # In a daemon process: chron.start(tick_interval=60)
 ```
 
+### Serverless Agent (Lambda, Cloud Functions, Edge)
+
+ThoughtFlow's signature deployment pattern. Because MEMORY serializes
+completely to JSON and the library has zero dependencies, a stateless chat
+turn is three steps:
+
+```python
+def handle_turn(session_json, user_message, llm):
+    # 1. REHYDRATE — full conversation state from a JSON string
+    memory = MEMORY.from_json(session_json) if session_json else MEMORY()
+
+    # 2. RUN — the universal contract
+    memory.add_msg("user", user_message, channel="webapp")
+    memory = agent(memory)
+    reply = memory.last_asst_msg(content_only=True)
+
+    # 3. PERSIST — write the complete event log back to storage
+    return reply, memory.to_json(indent=None)
+```
+
+Store the session string anywhere — S3, DynamoDB, Redis, a database column.
+Your deployment artifact is your handler plus one pure-Python package, well
+under a megabyte. A complete AWS Lambda handler with a locally runnable demo
+lives in [`examples/serverless/`](examples/serverless/).
+
+### RAG, the ThoughtFlow Way
+
+Retrieved context enters MEMORY as **tagged events** — the user's original
+message is never mutated, so the event log stays a truthful audit of what the
+user said versus what the system added:
+
+```python
+# Retrieve (EMBED + cosine similarity, a vector DB, or any retriever you like)
+context = retrieve_relevant_chunks(memory.last_user_msg(content_only=True))
+
+# Inject as a tagged system message — auditable, filterable
+memory.add_msg("system", f"Relevant context:\n{context}",
+               metadata={"internal": True, "source": "rag"})
+
+memory = answer_thought(memory)   # the THOUGHT sees the context
+
+# The UI shows only what the user should see
+visible_history = memory.get_msgs(exclude_metadata={"internal": True})
+```
+
+ThoughtFlow deliberately ships no vector store — compose with whatever
+retrieval you already trust. The full doctrine is in
+[`docs/concepts/rag.md`](docs/concepts/rag.md).
+
 ---
 
 ## 🎯 Philosophy: The Zen of ThoughtFlow
@@ -1869,10 +2094,10 @@ memory = persistent_mem.load(session_id="abc123")
 
 | Version | Python | Status | Notes |
 |---------|--------|--------|-------|
-| **0.1.x** | 3.9 - 3.12 | 🟢 Active | Current development |
+| **0.2.x** | 3.9 - 3.13 | 🟢 Active | Current development |
 
 **Compatibility Policy:**
-- We test against Python 3.9, 3.10, 3.11, and 3.12
+- We test against Python 3.9 through 3.13 on every push (see CI)
 - We aim to support new Python versions within 3 months of stable release
 - Breaking changes are avoided; when necessary, deprecation warnings come first
 
@@ -1880,49 +2105,65 @@ memory = persistent_mem.load(session_id="abc123")
 
 ## 🧪 Testing & Evaluation
 
-ThoughtFlow is designed for **deterministic testing**:
+ThoughtFlow treats deterministic testing as a first-class capability, built
+from the primitives you already know — no separate testing framework to learn.
 
 ```python
-from thoughtflow import MEMORY
-from thoughtflow.eval import Harness, Replay
+from thoughtflow import LLM, MEMORY
+from thoughtflow.eval import Harness, TestCase
 
 # ═══════════════════════════════════════════════════════════════════════════
-# RECORD AND REPLAY
+# RECORD AND REPLAY — deterministic flows, offline
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Record a session
-memory = MEMORY()
-# ... run your workflow ...
-memory.save("session_recording.pkl")
+# Record: every LLM exchange is captured as MEMORY events
+llm = LLM("openai:gpt-4o", key="sk-...")
+recording = MEMORY()
+llm.record(recording)
 
-# Replay for testing
-replay = MEMORY()
-replay.load("session_recording.pkl")
+memory = my_flow(MEMORY(), llm)         # runs live, records everything
+recording.to_json("session.json")       # commit this file to your repo
 
-# Assert on results
-assert replay.get_var("final_result") == expected_value
-assert len(replay.get_msgs()) == expected_message_count
+# Replay: a drop-in LLM that serves the recorded responses
+replay_llm = LLM.replay(MEMORY.from_json("session.json"))
+memory = my_flow(MEMORY(), replay_llm)  # no network, no keys, identical output
+
+# Drift fails loudly — unrecorded requests raise ReplayMissError,
+# or fall back to a live model: LLM.replay(recorded, on_miss=live_llm)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# EVALUATION HARNESS
+# EVALUATION HARNESS — structured test cases over any flow
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Define test cases
-test_cases = [
-    {"input": "What's 2+2?", "expected_contains": "4"},
-    {"input": "Capital of France?", "expected_contains": "Paris"},
-]
+# A test case is a name, a setup, and a check over the result MEMORY
+harness = Harness([
+    TestCase(
+        name="capital_question",
+        setup=lambda m: m.add_msg("user", "Capital of France?"),
+        check=lambda m: "paris" in (m.last_asst_msg(content_only=True) or "").lower(),
+    ),
+    TestCase(
+        name="arithmetic",
+        messages=[{"role": "user", "content": "What's 2+2?"}],
+        expected=lambda response: "4" in response,
+    ),
+])
 
-# Run evaluation
-harness = Harness(test_cases=test_cases)
-results = harness.run(my_workflow_function)
+# A flow is any `memory -> memory` callable: a THOUGHT, AGENT, WORKFLOW,
+# or plain function. Each case runs in a fresh, isolated MEMORY.
+results = harness.run(my_flow_with(replay_llm))
 
-# Analyze results
-for result in results:
-    print(f"Input: {result['input']}")
-    print(f"Output: {result['output']}")
-    print(f"Passed: {result['passed']}")
+print(results.summary())
+# {"total": 2, "passed": 2, "failed": 0, "pass_rate": 1.0, "failures": []}
+
+for failure in results.failures:
+    print(failure.test_case.name, failure.error, failure.memory)
 ```
+
+Pair the harness with a replay LLM and your agent test suite is fully
+deterministic: no API keys in CI, no flaky outputs, no spend. The complete
+lifecycle is demonstrated in
+[`examples/scripts/13_record_replay.py`](examples/scripts/13_record_replay.py).
 
 ---
 
@@ -1949,10 +2190,11 @@ thoughtflow/
 │   ├── thoughts/        # THOUGHT subclasses (DECIDE, PLAN)
 │   ├── actions/         # ACTION subclasses (16 elemental operations)
 │   ├── agents/          # AGENT subclasses (ReactAgent, ReflectAgent, PlanActAgent)
-│   ├── trace/           # Session tracing and events
-│   └── eval/            # Evaluation harness and replay
-├── primitives/          # Per-primitive documentation (Markdown)
+│   └── eval/            # Evaluation harness (record/replay lives in llm.py/memory.py)
+├── primitives/          # Per-primitive documentation (Markdown) — canonical API reference
 ├── examples/            # Working, runnable examples
+│   ├── scripts/         # Numbered walkthroughs (01_hello_world ... 13_record_replay)
+│   └── serverless/      # Deployable AWS Lambda chat handler
 ├── tests/               # Comprehensive test suite
 │   ├── unit/
 │   └── integration/
@@ -1971,7 +2213,7 @@ thoughtflow/
 git clone https://github.com/jrolf/thoughtflow.git
 cd thoughtflow
 
-# Install in development mode with all extras
+# Install in development mode with dev tooling (pytest, ruff, mypy)
 pip install -e ".[dev]"
 
 # Run the test suite
@@ -1999,10 +2241,11 @@ See [developer/](developer/) for comprehensive development documentation.
 | **Coordination** | ✅ Stable | DELEGATE, CHAT |
 | **Orchestration** | ✅ Stable | WORKFLOW, CHRON |
 | **Action Subclasses** | ✅ Stable | 16 elemental operations (SEARCH, SCRAPE, FETCH, etc.) |
+| **Record/Replay** | ✅ Shipped | LLM/EMBED recording, deterministic replay, eval harness |
 | **API Stability** | 🟡 Alpha | May evolve based on feedback |
 | **Documentation** | ✅ Per-primitive docs | `primitives/` folder with Markdown per class |
-| **Test Coverage** | ✅ Comprehensive | Unit + integration tests |
-| **Serverless Ready** | ✅ Yes | Zero deps, fast cold starts |
+| **Test Coverage** | ✅ ~700 unit tests | Plus integration tests gated by API keys |
+| **Serverless Ready** | ✅ Yes | Zero deps, deployable example in `examples/serverless/` |
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -2088,127 +2331,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 <p align="center">
   ⭐ Star us on GitHub — it helps!
 </p>
-
-<!-- 
-═══════════════════════════════════════════════════════════════════════════════
-HIDDEN SECTIONS: Uncomment when content is ready
-═══════════════════════════════════════════════════════════════════════════════
-
-## 💬 What People Are Saying
-
-<table>
-<tr>
-<td width="33%">
-
-> *"Finally, an LLM framework that doesn't make me feel stupid."*
->
-> — **[Name]** <br><sub>Software Engineer</sub>
-
-</td>
-<td width="33%">
-
-> *"Deployed to Lambda in 10 minutes. Try that with LangChain."*
->
-> — **[Name]** <br><sub>DevOps Engineer</sub>
-
-</td>
-<td width="33%">
-
-> *"I read the entire source in one sitting. That's unheard of."*
->
-> — **[Name]** <br><sub>AI Researcher</sub>
-
-</td>
-</tr>
-</table>
-
-───────────────────────────────────────────────────────────────────────────────
-
-## 🏗️ Built With ThoughtFlow
-
-<table>
-<tr>
-<td width="33%">
-
-### 🤖 Project Name
-**Description**
-
-A conversational AI assistant built with ThoughtFlow.
-
-[View Project →](link)
-
-</td>
-<td width="33%">
-
-### 📊 Project Name
-**Description**
-
-Data analysis agent using ThoughtFlow workflows.
-
-[View Project →](link)
-
-</td>
-<td width="33%">
-
-### 🎮 Project Name
-**Description**
-
-Interactive application powered by ThoughtFlow.
-
-[View Project →](link)
-
-</td>
-</tr>
-</table>
-
-───────────────────────────────────────────────────────────────────────────────
-
-## 👥 Contributor Spotlight
-
-<table>
-<tr>
-<td align="center">
-  <a href="https://github.com/jrolf">
-    <img src="https://github.com/jrolf.png" width="80px;" alt="James Rolfsen"/><br>
-    <sub><b>James Rolfsen</b></sub>
-  </a>
-  <br><sub>Creator & Maintainer</sub>
-</td>
-<td align="center">
-  <a href="#">
-    <img src="https://github.com/[username].png" width="80px;" alt="Contributor"/><br>
-    <sub><b>[Name]</b></sub>
-  </a>
-  <br><sub>Core Contributor</sub>
-</td>
-<td align="center">
-  <a href="CONTRIBUTING.md">
-    <sub><b>You?</b></sub>
-  </a>
-  <br><sub><a href="CONTRIBUTING.md">Join Us →</a></sub>
-</td>
-</tr>
-</table>
-
-───────────────────────────────────────────────────────────────────────────────
-
-## 🌐 Community
-
-<p align="center">
-  <a href="[discord-link]"><img src="https://img.shields.io/badge/Discord-Join%20Us-7289da?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  &nbsp;
-  <a href="[twitter-link]"><img src="https://img.shields.io/badge/Twitter-Follow-1DA1F2?style=for-the-badge&logo=twitter&logoColor=white" alt="Twitter"></a>
-</p>
-
-───────────────────────────────────────────────────────────────────────────────
-
-## 🎮 Try It Now
-
-<p align="center">
-  <a href="[replit-link]"><img src="https://img.shields.io/badge/Open%20in%20Replit-Try%20ThoughtFlow-667881?style=for-the-badge&logo=replit&logoColor=white" alt="Replit"></a>
-  &nbsp;
-  <a href="[colab-link]"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
-</p>
-
-═══════════════════════════════════════════════════════════════════════════════
--->

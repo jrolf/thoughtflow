@@ -14,11 +14,10 @@ Prerequisites:
     export OPENAI_API_KEY=sk-...  (for LLM examples)
 
 Run:
-    python examples/09_decide.py
+    python examples/scripts/09_decide.py
 """
 
-import os
-from thoughtflow import MEMORY, DECIDE, LLM
+from thoughtflow import MEMORY, DECIDE
 
 
 # Create a mock LLM for examples that don't need real API calls
@@ -61,7 +60,7 @@ def main():
     memory = sentiment(memory)
     
     result = memory.get_var("classify_sentiment_result")
-    print(f"Text: 'I absolutely love this product! Best purchase ever!'")
+    print("Text: 'I absolutely love this product! Best purchase ever!'")
     print(f"Sentiment: {result}")
     print(f"Choices were: {sentiment._choices_list}")
 
@@ -89,9 +88,9 @@ def main():
     memory = router(memory)
     
     result = memory.get_var("route_ticket_result")
-    print(f"Ticket: 'Customer claims they were charged twice...'")
+    print("Ticket: 'Customer claims they were charged twice...'")
     print(f"Decision: {result}")
-    print(f"\nFormatted choices shown to LLM:")
+    print("\nFormatted choices shown to LLM:")
     print(router._format_choices())
 
     # =========================================================================
@@ -202,7 +201,7 @@ def main():
     memory.set_var("question", "Do you want to continue?")
     memory = decide(memory)
     
-    print(f"\nAfter execution:")
+    print("\nAfter execution:")
     print(f"  execution_history entries: {len(decide.execution_history)}")
     print(f"  last_result: {decide.last_result}")
     print(f"  last_error: {decide.last_error}")
@@ -280,7 +279,7 @@ Consider the context and choose the most appropriate intent.""",
     memory = intent_classifier(memory)
     
     intent = memory.get_var("classify_intent_result")
-    print(f"User: 'Where is my package? I ordered it 3 days ago.'")
+    print("User: 'Where is my package? I ordered it 3 days ago.'")
     print(f"Classified intent: {intent}")
     
     # You could then route to different handlers based on intent

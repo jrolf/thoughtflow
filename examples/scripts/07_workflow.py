@@ -19,7 +19,7 @@ Prerequisites:
     export OPENAI_API_KEY=sk-...  (optional, uses mock LLM by default)
 
 Run:
-    python examples/07_workflow.py
+    python examples/scripts/07_workflow.py
 """
 
 import os
@@ -204,7 +204,7 @@ def create_research_agent():
 def run_research_workflow(topic):
     """Execute the research workflow for a given topic."""
     
-    print(f"=== Starting Research Workflow ===")
+    print("=== Starting Research Workflow ===")
     print(f"Topic: {topic}\n")
     
     # Initialize memory with the research topic

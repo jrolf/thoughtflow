@@ -10,11 +10,15 @@ LLM is deliberately minimal. It uses only the Python standard library (urllib, j
 
 ## How It Works
 
-LLM parses a `service:model` identifier (e.g., `openai:gpt-4o`, `anthropic:claude-3-5-sonnet`) and routes calls to the appropriate provider adapter. Each adapter constructs the HTTP request in the provider's expected format, sends it via urllib, and parses the response. The result is always a list of strings — one per completion choice — so downstream code has a predictable shape to work with.
+LLM parses a `service:model` identifier (e.g., `openai:gpt-4o`, `anthropic:claude-3-5-sonnet`) and routes calls to the matching provider method (`_call_openai`, `_call_anthropic`, etc.). Each provider method constructs the HTTP request in the provider's expected format, sends it via urllib, and parses the response. The result is always a list of strings — one per completion choice — so downstream code has a predictable shape to work with.
 
 Messages are normalized before sending. You can pass plain strings, dicts with `role` and `content`, or mixed formats; `_normalize_messages()` converts everything to the canonical `{role, content}` structure that providers expect. For structured output, you pass an `output_schema` dict; the LLM uses the provider's native mechanism (OpenAI's `response_format`, Anthropic's tool-use pattern, etc.) to constrain the model's output. When `stream=True`, the LLM yields token chunks as they arrive instead of buffering the full response.
 
 The last merged parameters used for each call are stored in `last_params` for debugging and inspection. Default parameters are stored in `default_params`.
+
+LLM is also the seam for ThoughtFlow's record/replay system. `llm.record(memory)` captures every subsequent exchange (request + response, keyed by a content hash) as events in the given MEMORY. `LLM.replay(memory)` returns a `ReplayLLM` — a drop-in LLM that serves those recorded responses deterministically, with no network and no keys. Unrecorded requests raise `ReplayMissError`, or fall back to a live LLM passed via `on_miss=`. The exchange key is computed from the normalized messages, content params (transport-only keys like `base_url` are excluded), the output schema, and the service/model identity — so recordings survive endpoint changes and JSON round-trips.
+
+For local and self-hosted models, pass `base_url` to target any OpenAI-compatible server (vLLM, LM Studio, llama.cpp, MLX), or use the `OpenAICompatibleLLM` convenience subclass. Ollama is a first-class service with its own provider method.
 
 ## Inputs & Configuration
 
@@ -91,13 +95,34 @@ for chunk in llm.call(msgs, stream=True):
     print(chunk, end='')
 ```
 
+```python
+# --- Record & replay (deterministic testing) ---
+from thoughtflow import LLM, MEMORY
+
+recording = MEMORY()
+llm.record(recording)            # capture every exchange as events
+# ... run your flow ...
+recording.to_json('session.json')
+
+replay_llm = LLM.replay(MEMORY.from_json('session.json'))
+# replay_llm is call-compatible: same flow, no network, identical outputs
+```
+
+```python
+# --- Local OpenAI-compatible servers ---
+from thoughtflow import OpenAICompatibleLLM
+
+llm = OpenAICompatibleLLM(model='my-model', base_url='http://localhost:8000/v1')
+# Equivalent to: LLM('openai:my-model', key='dummy', base_url='http://localhost:8000/v1')
+```
+
 ## Relationship to Other Primitives
 
-LLM is consumed by THOUGHT (which uses it for llm_call operations), AGENT (which uses it in the agentic loop), and CHAT (which uses it for turn-by-turn conversation). It does not depend on MEMORY or any other primitive. EMBED is its sibling — the embedding counterpart for vector operations. TOOL schemas and LLM structured output share the same JSON Schema format, so they integrate cleanly.
+LLM is consumed by THOUGHT (which uses it for llm_call operations), AGENT (which uses it in the agentic loop), and CHAT (which uses it for turn-by-turn conversation). When recording, LLM writes exchange events into a MEMORY via `add_exchange()`; `ReplayLLM` reads them back via `get_exchanges()`. EMBED is its sibling — the embedding counterpart for vector operations, with the identical record/replay seam. TOOL schemas and LLM structured output share the same JSON Schema format, so they integrate cleanly.
 
 ## Considerations for Future Development
 
 - Add streaming support for Anthropic and Gemini (currently fall back to single-yield)
 - Consider async variants for high-throughput or concurrent use cases
-- Provider-specific extensions (e.g., vision, function calling) may warrant optional adapter hooks
+- Provider-specific extensions (e.g., vision, function calling) may warrant optional hooks
 - Caching layer for repeated prompts could reduce latency and cost in development

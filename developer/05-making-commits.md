@@ -19,15 +19,15 @@ We follow the [Conventional Commits](https://www.conventionalcommits.org/) speci
 ### Examples
 
 ```
-feat(adapters): add AWS Bedrock adapter
+feat(llm): add AWS Bedrock provider
 
-fix(trace): prevent duplicate events when session is reused
+fix(memory): prevent duplicate events when rehydrating from JSON
 
 docs(readme): add Windows installation instructions
 
-test(tools): add tests for ToolRegistry.unregister()
+test(tool): add tests for TOOL.from_action()
 
-refactor(agent): simplify call() method signature
+refactor(agent): simplify tool-call parsing
 
 chore(deps): update ruff to 0.2.0
 ```
@@ -58,15 +58,14 @@ Scopes help identify what part of the codebase is affected:
 
 | Scope | Description |
 |-------|-------------|
-| `agent` | Agent module |
-| `message` | Message module |
-| `adapters` | Adapter system |
-| `openai` | OpenAI adapter specifically |
-| `anthropic` | Anthropic adapter specifically |
-| `tools` | Tool system |
-| `memory` | Memory system |
-| `trace` | Tracing system |
-| `eval` | Evaluation utilities |
+| `llm` | LLM module (providers, record/replay) |
+| `embed` | EMBED module |
+| `memory` | MEMORY module |
+| `thought` | THOUGHT module |
+| `agent` | AGENT and methodology subclasses |
+| `tool` | TOOL module |
+| `action` | ACTION and action primitives |
+| `eval` | Evaluation utilities (Harness) |
 | `deps` | Dependencies |
 | `ci` | CI/CD configuration |
 | `docs` | Documentation |
@@ -93,11 +92,11 @@ Scope is optional but recommended.
 ### Good Examples
 
 ```
-feat(adapters): add streaming support to OpenAI adapter
-fix(trace): handle None values in event serialization
+feat(llm): add streaming support to the Groq provider
+fix(memory): handle None values in event serialization
 docs(quickstart): clarify virtual environment setup
-test(agent): add tests for TracedAgent wrapper
-refactor(tools): extract common validation logic
+test(agent): add tests for ReactAgent parsing
+refactor(tool): extract common schema normalization
 ```
 
 ### Bad Examples
@@ -107,7 +106,7 @@ Fixed the bug                    # Too vague
 Add feature                      # Too vague
 Updated openai.py               # Describes file, not change
 feat: Add streaming support.    # Has period
-FEAT(adapters): Add streaming   # Wrong case
+FEAT(llm): Add streaming        # Wrong case
 ```
 
 ---
@@ -117,11 +116,11 @@ FEAT(adapters): Add streaming   # Wrong case
 For complex changes, add a body explaining **why** the change was made:
 
 ```
-fix(trace): prevent memory leak in long-running sessions
+fix(memory): prevent unbounded growth of the message index
 
-The Session object was holding references to all events without
-any cleanup mechanism. For long-running processes, this caused
-memory usage to grow unboundedly.
+The MEMORY message index was holding references to all events
+without any cleanup mechanism. For long-running processes, this
+caused memory usage to grow unboundedly.
 
 This change adds an optional max_events parameter that triggers
 automatic cleanup of old events when exceeded.
@@ -141,9 +140,9 @@ automatic cleanup of old events when exceeded.
 Reference issues in the footer, not the title:
 
 ```
-feat(adapters): add support for custom headers
+feat(llm): add support for custom headers
 
-Allow users to pass custom headers to the underlying HTTP client.
+Allow users to pass extra_headers to OpenAI-compatible endpoints.
 This is useful for corporate proxies and custom authentication.
 
 Closes #42
@@ -161,14 +160,14 @@ Keywords that close issues:
 For breaking changes, add `!` after the type and explain in the footer:
 
 ```
-feat(agent)!: change call() signature to require params
+feat(llm)!: change call() signature to require params
 
-BREAKING CHANGE: The `params` argument is now required in Agent.call().
-Previously it was optional with a default of None.
+BREAKING CHANGE: The `params` argument is now required in LLM.call().
+Previously it was optional with a default of {}.
 
 Migration:
-  Before: agent.call(messages)
-  After:  agent.call(messages, params={})
+  Before: llm.call(messages)
+  After:  llm.call(messages, params={})
 ```
 
 ---

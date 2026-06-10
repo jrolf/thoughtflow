@@ -12,7 +12,7 @@ THOUGHT exists because raw LLM calls are messy. Models add prose, code fences, a
 
 THOUGHT is callable. When you invoke it with a MEMORY (and optionally a vars dict), it dispatches to one of four operation types: llm_call, memory_query, variable_set, or conditional. For llm_call, it builds messages from the prompt template and context, calls the LLM, parses the response with a built-in or custom parser, validates with a built-in or custom validator, and retries with a repair prompt if validation fails. The result is stored in memory as `{name}_result`.
 
-Prompt templates use `{variable}` placeholders filled from memory context. Parsers include text, json, list, custom callables, and schema-based parsing via valid_extract. Validators include any, has_keys:k1,k2, list_min_len:N, and custom callables. Pre and post hooks allow custom processing before and after execution. DECIDE and PLAN are subclasses that specialize THOUGHT for constrained choice and multi-step planning.
+Prompt templates use `{variable}` placeholders filled from memory context. Parsers include text, json, list, custom callables, and schema-based parsing via valid_extract. Validation is configured via the canonical `validation=` parameter, which accepts a built-in string (any, has_keys:k1,k2, list_min_len:N) or a callable `(parsed_result) -> (bool, why)`; `validator=` is an equivalent config-style spelling. Pre and post hooks allow custom processing before and after execution. An `on_token=` hook streams the LLM response chunk-by-chunk while the complete text still flows through parsing and validation. DECIDE and PLAN are subclasses that specialize THOUGHT for constrained choice and multi-step planning.
 
 ## Inputs & Configuration
 
@@ -25,13 +25,15 @@ Prompt templates use `{variable}` placeholders filled from memory context. Parse
 | system_prompt | Optional system prompt for LLM context |
 | parser | text, json, list, or callable |
 | parsing_rules | Schema for valid_extract (e.g., {'kind': 'python', 'format': []}) |
-| validator | any, has_keys:k1,k2, list_min_len:N, or callable |
+| validation | Canonical validator spec: any, has_keys:k1,k2, list_min_len:N, or callable |
+| validator | Config-style alias for `validation`; behaves identically |
 | max_retries | Retry attempts on validation failure |
 | retry_delay | Delay between retries in seconds |
 | required_vars | Variables required from memory |
 | optional_vars | Optional variables from memory |
 | output_var | Variable name for result (default: {name}_result) |
 | pre_hook, post_hook | Callables for custom processing |
+| on_token | Callable receiving each streamed text chunk: fn(chunk) |
 | channel | Channel for message tracking |
 | add_reflection | Whether to add reflection on success |
 
@@ -79,6 +81,5 @@ THOUGHT consumes LLM (for llm_call) and MEMORY (for context and result storage).
 ## Considerations for Future Development
 
 - Native output_schema passthrough to LLM for providers with structured output
-- Streaming passthrough when THOUGHT wraps an LLM call
 - DECIDE and PLAN documented in their own primitive files
-- Execution history and tracing integration with workflow observability
+- Execution history integration with workflow observability

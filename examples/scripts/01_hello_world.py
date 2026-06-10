@@ -9,7 +9,7 @@ Prerequisites:
     export OPENAI_API_KEY=sk-...
 
 Run:
-    python examples/01_hello_world.py
+    python examples/scripts/01_hello_world.py
 """
 
 import os

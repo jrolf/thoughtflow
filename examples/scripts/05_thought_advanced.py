@@ -15,11 +15,10 @@ Prerequisites:
     export OPENAI_API_KEY=sk-...  (for LLM examples)
 
 Run:
-    python examples/05_thought_advanced.py
+    python examples/scripts/05_thought_advanced.py
 """
 
-import os
-from thoughtflow import MEMORY, THOUGHT, LLM, valid_extract
+from thoughtflow import MEMORY, THOUGHT
 
 
 # Create a mock LLM for examples that don't need real API calls
@@ -343,7 +342,7 @@ def main():
     
     # Check what context is available
     ctx = greet_thought.get_context(memory)
-    print(f"Context built from memory:")
+    print("Context built from memory:")
     print(f"  user_name: {ctx.get('user_name')}")
     print(f"  context: {ctx.get('context')}")
     print(f"  preferences: {ctx.get('preferences', 'NOT FOUND')}")

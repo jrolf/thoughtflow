@@ -130,7 +130,40 @@ class EventStamp:
 event_stamp = EventStamp.stamp
 hashify = EventStamp.hashify
 encode_num = EventStamp.encode_num
-decode_num = EventStamp.decode_num 
+decode_num = EventStamp.decode_num
+
+
+# Param keys that describe transport (where to send a request), not content
+# (what is being asked). Excluded from exchange keys so a session recorded
+# against one endpoint replays cleanly against any other.
+TRANSPORT_PARAM_KEYS = frozenset({
+    'base_url', 'extra_headers', 'ollama_url', 'referer', 'title',
+})
+
+
+def exchange_key(service, model, request):
+    """
+    Compute a deterministic content hash for an LLM/EMBED exchange.
+
+    Used by the record/replay system: the same logical request always
+    produces the same key, so a recorded response can be looked up at
+    replay time without any session or ordering machinery.
+
+    Args:
+        service: Provider name (e.g. 'openai').
+        model: Model name.
+        request: JSON-serializable dict describing the request content
+            (messages/texts, params, output_schema). Transport-only param
+            keys should already be removed by the caller.
+
+    Returns:
+        str: Deterministic hash key.
+    """
+    canonical = json.dumps(
+        {'service': service, 'model': model, 'request': request},
+        sort_keys=True, separators=(',', ':'), default=str,
+    )
+    return hashify(canonical)
 
 #############################################################################
 #############################################################################

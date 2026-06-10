@@ -16,8 +16,14 @@ parts of the loop to implement different agentic methodologies.
 from __future__ import annotations
 
 import json
+import re
 
 from thoughtflow._util import event_stamp
+
+_FENCED_JSON_RE = re.compile(
+    r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 class AGENT:
@@ -29,7 +35,7 @@ class AGENT:
     results back into the conversation, and repeat until the LLM produces a
     final response or the iteration limit is reached.
 
-    Preserves the Thoughtflow contract: memory = agent(memory).
+    Preserves the ThoughtFlow contract: memory = agent(memory).
 
     Attributes:
         name (str): Identifier for this agent.
@@ -39,6 +45,9 @@ class AGENT:
         max_iterations (int): Maximum tool-use loop iterations before stopping.
         on_tool_call (callable, optional): Hook called before each tool execution.
             Receives (tool_name, arguments) and can return False to block execution.
+        merge_augments (bool): When True, fold augmenting memory events into user
+            messages for LLM calls only (via ``MEMORY.get_llm_msgs``). Default
+            False preserves separate system/context messages in the LLM payload.
         id (str): Unique identifier for this agent instance.
         iteration_count (int): Number of iterations in the most recent run.
         LLM_ROLES (set): Class-level set of MEMORY roles that should be forwarded
@@ -70,6 +79,7 @@ class AGENT:
         max_iterations=10,
         name="agent",
         on_tool_call=None,
+        merge_augments=False,
     ):
         """
         Initialize an AGENT with an LLM, tools, and configuration.
@@ -83,6 +93,8 @@ class AGENT:
             name (str): Identifier for logging and tracing.
             on_tool_call (callable, optional): Pre-execution hook. Called as
                 on_tool_call(tool_name, arguments). Return False to block.
+            merge_augments (bool): Fold augmenting memory events into user
+                messages for LLM calls only. Default False.
         """
         self.name = name
         self.id = event_stamp()
@@ -91,6 +103,7 @@ class AGENT:
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
         self.on_tool_call = on_tool_call
+        self.merge_augments = merge_augments
         self.iteration_count = 0
         self._tool_map = {t.name: t for t in self.tools}
 
@@ -175,6 +188,28 @@ class AGENT:
 
         return memory
 
+    def _iter_memory_msgs_for_llm(self, memory):
+        """
+        Yield (role, content) pairs from memory for LLM conversation context.
+
+        When ``merge_augments`` is True and memory supports ``get_llm_msgs``,
+        augmenting events are folded into user messages for the LLM view only.
+        """
+        if self.merge_augments and hasattr(memory, "get_llm_msgs"):
+            source = memory.get_llm_msgs(merge_augments=True)
+        elif hasattr(memory, "get_msgs"):
+            source = [
+                {'role': msg.get('role', 'user'), 'content': msg.get('content', '')}
+                for msg in memory.get_msgs()
+            ]
+        else:
+            return
+
+        for msg in source:
+            role = msg.get('role', 'user')
+            if role in self.LLM_ROLES:
+                yield role, msg.get('content', '')
+
     def _build_messages(self, memory):
         """
         Construct the message list for the LLM from memory.
@@ -201,14 +236,8 @@ class AGENT:
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
 
-        # Conversation history from memory (filtered to LLM-relevant roles)
-        if hasattr(memory, "get_msgs"):
-            for msg in memory.get_msgs():
-                role = msg.get("role", "user")
-                if role not in self.LLM_ROLES:
-                    continue
-                content = msg.get("content", "")
-                messages.append({"role": role, "content": content})
+        for role, content in self._iter_memory_msgs_for_llm(memory):
+            messages.append({"role": role, "content": content})
 
         return messages
 
@@ -226,6 +255,23 @@ class AGENT:
         if self.tools:
             params["tools"] = [t.to_schema() for t in self.tools]
         return params
+
+    @staticmethod
+    def _strip_markdown_fences(response):
+        """
+        Strip wrapping markdown code fences from an LLM response.
+
+        Only removes outer ``` / ```json fences. Inline backticks inside JSON
+        string values are left untouched.
+        """
+        if not response:
+            return response
+
+        match = _FENCED_JSON_RE.match(response)
+        if match:
+            return match.group(1).strip()
+
+        return response
 
     def _parse_tool_calls(self, response):
         """
@@ -247,6 +293,8 @@ class AGENT:
         """
         if not response:
             return []
+
+        response = self._strip_markdown_fences(response)
 
         # Try to parse as JSON
         try:

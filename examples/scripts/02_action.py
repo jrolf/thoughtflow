@@ -10,7 +10,7 @@ Prerequisites:
     pip install thoughtflow
 
 Run:
-    python examples/02_action.py
+    python examples/scripts/02_action.py
 """
 
 import json
@@ -92,7 +92,7 @@ def main():
     
     # Results are automatically stored in memory
     result = memory.get_var("get_weather_result")
-    print(f"\nWeather result (stored in memory):")
+    print("\nWeather result (stored in memory):")
     print(f"  Location: {result['location']}")
     print(f"  Temperature: {result['temperature']}°{result['units']}")
     print(f"  Condition: {result['condition']}")

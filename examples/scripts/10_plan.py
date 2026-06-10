@@ -15,7 +15,7 @@ Prerequisites:
     export OPENAI_API_KEY=sk-...  (for LLM examples)
 
 Run:
-    python examples/10_plan.py
+    python examples/scripts/10_plan.py
 """
 
 import json

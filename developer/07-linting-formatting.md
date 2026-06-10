@@ -60,8 +60,8 @@ ruff format --check src/ tests/
 **Before:**
 
 ```python
-from thoughtflow.trace import Session
-from thoughtflow import Agent
+from thoughtflow.memory import MEMORY
+from thoughtflow import LLM
 import json
 from typing import Any,Dict
 
@@ -75,8 +75,8 @@ def example(  x:str,y:int=10   )->Dict[str,Any]:
 import json
 from typing import Any, Dict
 
-from thoughtflow import Agent
-from thoughtflow.trace import Session
+from thoughtflow import LLM
+from thoughtflow.memory import MEMORY
 
 
 def example(x: str, y: int = 10) -> Dict[str, Any]:
@@ -213,11 +213,11 @@ known-first-party = ["thoughtflow"]
 
 **Before:**
 ```python
-from thoughtflow import Agent
+from thoughtflow import LLM
 import os
 from typing import Any
 import pytest
-from thoughtflow.trace import Session
+from thoughtflow.memory import MEMORY
 ```
 
 **After:**
@@ -227,8 +227,8 @@ from typing import Any
 
 import pytest
 
-from thoughtflow import Agent
-from thoughtflow.trace import Session
+from thoughtflow import LLM
+from thoughtflow.memory import MEMORY
 ```
 
 ---
@@ -268,14 +268,18 @@ message = (
 **Imports:**
 ```python
 # Before
-from thoughtflow.adapters import OpenAIAdapter, AnthropicAdapter, LocalAdapter, BedrockAdapter
+from thoughtflow import LLM, MEMORY, THOUGHT, ACTION, TOOL, AGENT, WORKFLOW, CHAT
 
 # After
-from thoughtflow.adapters import (
-    AnthropicAdapter,
-    BedrockAdapter,
-    LocalAdapter,
-    OpenAIAdapter,
+from thoughtflow import (
+    ACTION,
+    AGENT,
+    CHAT,
+    LLM,
+    MEMORY,
+    THOUGHT,
+    TOOL,
+    WORKFLOW,
 )
 ```
 

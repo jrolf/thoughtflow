@@ -10,12 +10,14 @@ This guide explains how to write and build documentation for ThoughtFlow.
 docs/
 ├── index.md            # Homepage
 ├── quickstart.md       # Getting started
-├── concepts/           # Deep-dive guides
-│   ├── agent.md
-│   ├── adapters.md
-│   └── ...
-└── api/               # Auto-generated API docs
+└── concepts/           # Deep-dive guides
+    ├── llm.md
+    ├── memory.md
+    ├── agent.md
+    └── ...
 ```
+
+The canonical per-primitive API reference lives in `primitives/` at the repo root.
 
 ---
 
@@ -47,12 +49,11 @@ mkdocs serve
 ## Basic Usage
 
 ```python
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
+from thoughtflow import LLM
 
-adapter = OpenAIAdapter()
-agent = Agent(adapter)
-response = agent.call([{"role": "user", "content": "Hello!"}])
+llm = LLM("openai:gpt-4o", key="sk-...")
+response = llm.call([{"role": "user", "content": "Hello!"}])
+print(response[0])
 ```
 ```
 

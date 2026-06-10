@@ -4,7 +4,7 @@ CHAT class for ThoughtFlow.
 Provides an interactive chat loop for testing agents and agentic flows
 locally in a terminal or Jupyter notebook.
 
-The CHAT class wraps any callable that follows the Thoughtflow contract
+The CHAT class wraps any callable that follows the ThoughtFlow contract
 (takes a MEMORY, returns a MEMORY) and provides a simple text-based
 input/output loop around it.
 
@@ -36,9 +36,9 @@ _BUILTIN_EXIT_COMMANDS = frozenset({"q", "quit"})
 
 class CHAT:
     """
-    Interactive chat session with a Thoughtflow agent.
+    Interactive chat session with a ThoughtFlow agent.
 
-    Wraps any callable that follows the Thoughtflow contract — accepts a
+    Wraps any callable that follows the ThoughtFlow contract — accepts a
     MEMORY and returns a MEMORY — and provides a text-based input/output
     loop for testing agent behavior locally in a terminal or Jupyter notebook.
 

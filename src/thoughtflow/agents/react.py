@@ -92,15 +92,8 @@ Available tools: {tool_list}
 
         messages = [{"role": "system", "content": react_prompt}]
 
-        if hasattr(memory, "get_msgs"):
-            for msg in memory.get_msgs():
-                role = msg.get("role", "user")
-                if role not in self.LLM_ROLES:
-                    continue
-                messages.append({
-                    "role": role,
-                    "content": msg.get("content", ""),
-                })
+        for role, content in self._iter_memory_msgs_for_llm(memory):
+            messages.append({"role": role, "content": content})
 
         return messages
 

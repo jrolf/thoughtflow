@@ -2,7 +2,7 @@
 THOUGHT class for ThoughtFlow.
 
 The THOUGHT class represents a single, modular reasoning or action step within an agentic 
-workflow. It is the atomic unit of cognition in the Thoughtflow framework.
+workflow. It is the atomic unit of cognition in the ThoughtFlow framework.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class THOUGHT:
     The THOUGHT class represents a single, modular reasoning or action step within an agentic 
     workflow. It is designed to operate on MEMORY objects, orchestrating LLM calls, memory queries, 
     and variable manipulations in a composable and traceable manner. 
-    THOUGHTs are the atomic units of reasoning, planning, and execution in the Thoughtflow framework, 
+    THOUGHTs are the atomic units of reasoning, planning, and execution in the ThoughtFlow framework, 
     and can be chained or composed to build complex agent behaviors.
 
     CONCEPT:
@@ -88,7 +88,10 @@ class THOUGHT:
         system_prompt (str): Optional system prompt for LLM context (via config)
         parser (str|callable): Response parser ('text', 'json', 'list', or callable)
         parsing_rules (dict): Schema for valid_extract parsing (e.g., {'kind': 'python', 'format': []})
-        validator (str|callable): Response validator ('any', 'has_keys:k1,k2', 'list_min_len:N', or callable)
+        validation (str|callable): Response validator — canonical spelling. Accepts a
+            callable (parsed_result) -> (bool, why) or a built-in string
+            ('any', 'has_keys:k1,k2', 'list_min_len:N', 'summary_v1')
+        validator (str|callable): Config-style alias for `validation`; behaves identically
         max_retries (int): Maximum retry attempts (default: 1)
         retry_delay (float): Delay between retries in seconds (default: 0)
         required_vars (list): Variables required from memory
@@ -96,6 +99,9 @@ class THOUGHT:
         output_var (str): Variable name for storing result (default: '{name}_result')
         pre_hook (callable): Function called before execution: fn(thought, memory, vars, **kwargs)
         post_hook (callable): Function called after execution: fn(thought, memory, result, error)
+        on_token (callable): When set, the LLM response is streamed and this
+            hook receives each text chunk as it arrives: fn(chunk). The full
+            text still flows through parsing/validation normally.
         channel (str): Channel for message tracking (default: 'system')
         add_reflection (bool): Whether to add reflection on success (default: True)
 
@@ -167,6 +173,8 @@ class THOUGHT:
 
         # Store any additional configuration parameters
         self.config = kwargs.copy()
+        if self.config.get("parse") and not self.config.get("parser"):
+            self.config["parser"] = self.config["parse"]
 
         # Optionally, store a description or docstring if provided
         self.description = kwargs.get("description", None)
@@ -640,6 +648,12 @@ class THOUGHT:
         Execute the LLM call with the given messages.
         !!! USE THE EXISTING LLM CLASS !!!
 
+        When an ``on_token`` callable is set in the thought's config, the LLM
+        response is streamed: the hook is invoked with each text chunk as it
+        arrives, and the complete joined text then flows through the normal
+        parse/validate/store pipeline. The memory contract is unchanged —
+        the thought still returns only when complete.
+
         Args:
             msgs (list): List of message dicts.
             **llm_kwargs: Additional LLM parameters.
@@ -649,6 +663,22 @@ class THOUGHT:
         """
         if self.llm is None:
             raise ValueError("No LLM instance provided to this THOUGHT.")
+
+        # Streaming path: when on_token is configured and the LLM supports
+        # streaming, feed chunks to the hook and join the full text.
+        on_token = self.config.get("on_token", None)
+        if on_token and callable(on_token) and hasattr(self.llm, "call"):
+            try:
+                chunks = []
+                for chunk in self.llm.call(msgs, llm_kwargs, stream=True):
+                    chunks.append(chunk)
+                    on_token(chunk)
+                return "".join(chunks)
+            except TypeError:
+                # LLM.call() does not accept stream= — fall through to a
+                # standard non-streaming call below.
+                pass
+
         # The LLM class is expected to be callable: llm(msgs, **kwargs)
         # If LLM is a class with .call, use that (standard interface)
         if hasattr(self.llm, "call") and callable(getattr(self.llm, "call", None)):
@@ -704,9 +734,15 @@ class THOUGHT:
             return response
         elif parser == "json":
             import re
-            # Remove code fences if present
+            # Remove wrapping markdown code fences if present
             text = response.strip()
-            text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+            fence_match = re.match(
+                r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
+                text,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if fence_match:
+                text = fence_match.group(1).strip()
             # Find first JSON object or array
             match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
             if match:
@@ -733,21 +769,29 @@ class THOUGHT:
         """
         Validate the parsed result according to the thought's rules.
 
+        The canonical spelling is the ``validation=`` constructor kwarg, which
+        accepts either a callable ``(parsed_result) -> (bool, why)`` or one of
+        the built-in validator strings ('any', 'has_keys:k1,k2',
+        'list_min_len:N', 'summary_v1'). The ``validator=`` config key is the
+        equivalent config-style spelling and remains fully supported; both
+        behave identically.
+
         Args:
             parsed_result: The parsed output from the LLM.
 
         Returns:
             (bool, why): True if valid, False otherwise, and reason string.
         """
-        # Use custom validation if provided
-        if self.validation and callable(self.validation):
+        # Resolve the validation spec: validation= kwarg takes precedence,
+        # then the validator= config key. Both accept callables or strings.
+        validator = self.validation if self.validation is not None else self.config.get("validator", None)
+
+        if validator is not None and callable(validator):
             try:
-                valid, why = self.validation(parsed_result)
+                valid, why = validator(parsed_result)
                 return bool(valid), why
             except Exception as e:
                 return False, "Validation exception: {}".format(e)
-        # Use built-in validator based on config
-        validator = self.config.get("validator", None)
         if validator is None or validator == "any":
             return True, ""
         elif isinstance(validator, str):
@@ -778,12 +822,6 @@ class THOUGHT:
                     return False, "Summary too short"
             else:
                 return True, ""
-        elif callable(validator):
-            try:
-                valid, why = validator(parsed_result)
-                return bool(valid), why
-            except Exception as e:
-                return False, "Validation exception: {}".format(e)
         else:
             return True, ""
 

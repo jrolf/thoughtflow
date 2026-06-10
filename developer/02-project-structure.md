@@ -28,36 +28,30 @@ The actual library code lives here. This is what gets packaged and published to 
 src/thoughtflow/
 ├── __init__.py             # Package entry point, public API exports
 ├── py.typed                # Marker for PEP 561 type hints
-├── agent.py                # Core Agent class
-├── message.py              # Message schema
+├── llm.py                  # LLM: multi-provider model calls + record/replay
+├── embed.py                # EMBED: multi-provider embeddings + record/replay
+├── memory.py               # MEMORY: event-sourced state container
+├── thought.py              # THOUGHT: prompt + LLM + parsing + validation
+├── action.py               # ACTION: imperative operation wrapper
+├── tool.py                 # TOOL: LLM-selectable capability with schema
+├── agent.py                # AGENT: autonomous tool-use loop
+├── mcp.py                  # MCP: Model Context Protocol client
+├── workflow.py             # WORKFLOW: flow composition
+├── chat.py                 # CHAT: human-in-the-loop conversation
+├── message.py              # Message schema helpers
 ├── _util.py                # Internal utilities (not public API)
 │
-├── adapters/               # Provider adapters
-│   ├── __init__.py         # Adapter exports
-│   ├── base.py             # Adapter interface/protocol
-│   ├── openai.py           # OpenAI adapter
-│   ├── anthropic.py        # Anthropic adapter
-│   └── local.py            # Local model adapter (Ollama)
+├── agents/                 # Agent methodology subclasses
+│   ├── react.py            # ReactAgent (Reason + Act)
+│   ├── reflect.py          # ReflectAgent (critique + revise)
+│   └── planact.py          # PlanActAgent (plan then execute)
 │
-├── tools/                  # Tool system
-│   ├── __init__.py
-│   ├── base.py             # Tool interface
-│   └── registry.py         # Tool registry
-│
-├── memory/                 # Memory hooks
-│   ├── __init__.py
-│   └── base.py             # Memory interface
-│
-├── trace/                  # Tracing/observability
-│   ├── __init__.py
-│   ├── session.py          # Session object
-│   ├── events.py           # Event types
-│   └── schema.py           # Schema versioning
+├── thoughts/               # THOUGHT subclasses (DECIDE, PLAN)
+├── actions/                # Action primitives (SAY, ASK, SEARCH, FETCH, ...)
 │
 └── eval/                   # Evaluation utilities
     ├── __init__.py
-    ├── replay.py           # Record/replay
-    └── harness.py          # Test harness
+    └── harness.py          # Test harness (Harness, TestCase)
 ```
 
 ### Key Files to Know
@@ -65,10 +59,10 @@ src/thoughtflow/
 | File | Purpose | When to Edit |
 |------|---------|--------------|
 | `__init__.py` | Public exports | Adding/removing public API |
-| `agent.py` | Core Agent | Changing agent behavior |
-| `message.py` | Message format | Changing message schema |
-| `adapters/base.py` | Adapter interface | Changing adapter contract |
-| `adapters/openai.py` | OpenAI integration | OpenAI-specific changes |
+| `llm.py` | Provider routing, record/replay | Adding providers, replay changes |
+| `memory.py` | Event-sourced state | Changing event/serialization behavior |
+| `agent.py` | Core agent loop | Changing agent behavior |
+| `thought.py` | Cognition unit | Changing prompt/parse/validate pipeline |
 
 ---
 
@@ -79,16 +73,18 @@ tests/
 ├── __init__.py
 ├── conftest.py             # Shared fixtures, test configuration
 │
-├── unit/                   # Fast, deterministic tests
+├── unit/                   # Fast, deterministic tests (no network)
 │   ├── __init__.py
+│   ├── test_llm.py         # Tests for llm.py (monkeypatched transport)
+│   ├── test_memory.py      # Tests for memory.py
 │   ├── test_agent.py       # Tests for agent.py
-│   ├── test_message.py     # Tests for message.py
-│   └── test_trace.py       # Tests for trace module
+│   ├── test_replay.py      # Tests for record/replay
+│   └── ...                 # One file per module
 │
 └── integration/            # Tests requiring external services
     ├── __init__.py
-    ├── test_openai_adapter.py
-    └── test_anthropic_adapter.py
+    ├── test_llm_providers.py
+    └── ...
 ```
 
 ### Test Naming Convention
@@ -97,7 +93,7 @@ tests/
 - Test class: `Test<ClassName>`
 - Test method: `test_<what_it_tests>`
 
-Example: `test_agent.py` contains `TestAgent` class with `test_agent_requires_adapter` method.
+Example: `test_llm.py` contains `TestLLMInitialization` class with `test_parses_service_and_model` method.
 
 ---
 
@@ -107,14 +103,16 @@ Example: `test_agent.py` contains `TestAgent` class with `test_agent_requires_ad
 docs/
 ├── index.md                # Homepage
 ├── quickstart.md           # Getting started guide
-├── concepts/               # Concept deep-dives
-│   ├── agent.md
-│   ├── adapters.md
-│   ├── tools.md
-│   ├── memory.md
-│   └── tracing.md
-└── api/                    # Auto-generated API docs
+└── concepts/               # Concept deep-dives
+    ├── llm.md
+    ├── memory.md
+    ├── agent.md
+    ├── tools.md
+    ├── replay.md
+    └── rag.md
 ```
+
+The canonical per-primitive API reference lives in `primitives/` at the repo root (e.g. `primitives/LLM.md`).
 
 Documentation is built with [MkDocs](https://www.mkdocs.org/). See [16-writing-documentation.md](16-writing-documentation.md).
 
@@ -122,15 +120,13 @@ Documentation is built with [MkDocs](https://www.mkdocs.org/). See [16-writing-d
 
 ## Examples (`examples/`)
 
-Runnable scripts demonstrating ThoughtFlow usage:
+Runnable code demonstrating ThoughtFlow usage:
 
 ```
 examples/
-├── 01_hello_world.py       # Basic usage
-├── 02_tool_use.py          # Using tools
-├── 03_memory_hooks.py      # Memory integration
-├── 04_trace_replay.py      # Tracing
-└── 05_multi_provider.py    # Multiple providers
+├── scripts/                # Runnable example scripts
+├── notebooks1/             # Jupyter notebooks
+└── serverless/             # Serverless deployment examples
 ```
 
 ---
@@ -196,32 +192,31 @@ When you run `pip install -e .`:
                     │   __init__.py   │  (public API)
                     └────────┬────────┘
                              │
-        ┌────────────────────┼────────────────────┐
-        │                    │                    │
-        ▼                    ▼                    ▼
-   ┌─────────┐         ┌──────────┐         ┌─────────┐
-   │  agent  │         │ message  │         │  trace  │
-   └────┬────┘         └──────────┘         └────┬────┘
-        │                                        │
-        ▼                                        ▼
-   ┌──────────┐                            ┌──────────┐
-   │ adapters │                            │   eval   │
-   └──────────┘                            └──────────┘
-        │
-   ┌────┴────┬────────┐
-   ▼         ▼        ▼
-openai  anthropic   local
+        ┌──────────┬─────────┼──────────┬──────────┐
+        │          │         │          │          │
+        ▼          ▼         ▼          ▼          ▼
+   ┌─────────┐ ┌───────┐ ┌────────┐ ┌────────┐ ┌──────┐
+   │ thought │ │ agent │ │ memory │ │ action │ │ eval │
+   └────┬────┘ └───┬───┘ └────────┘ └────────┘ └──────┘
+        │          │
+        │     ┌────┴────┐
+        ▼     ▼         ▼
+      ┌─────────┐   ┌──────┐
+      │   llm   │   │ tool │
+      └─────────┘   └──────┘
 ```
+
+`llm.py` and `embed.py` contain all provider-specific logic — each provider is a `_call_<service>` method, not a separate module.
 
 ---
 
 ## Finding What You Need
 
-### "Where is the Agent class defined?"
+### "Where is the AGENT class defined?"
 → `src/thoughtflow/agent.py`
 
-### "Where do I add a new adapter?"
-→ Create `src/thoughtflow/adapters/new_adapter.py`
+### "Where do I add a new provider?"
+→ Add a `_call_<service>` method in `src/thoughtflow/llm.py` — see [15-adding-providers.md](15-adding-providers.md)
 
 ### "Where are the tests for messages?"
 → `tests/unit/test_message.py`

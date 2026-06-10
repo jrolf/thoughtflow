@@ -1,10 +1,10 @@
 """
-The Zen of Thoughtflow.
+The Zen of ThoughtFlow.
 
-Prints the guiding principles of Thoughtflow when imported::
+Prints the guiding principles of ThoughtFlow when imported::
 
     >>> from thoughtflow import this
-    The Zen of Thoughtflow
+    The Zen of ThoughtFlow
     <BLANKLINE>
     First principles first.
     ...
@@ -12,7 +12,7 @@ Prints the guiding principles of Thoughtflow when imported::
 
 # Stored in the open—obvious, not abstract.
 zen = """\
-The Zen of Thoughtflow
+The Zen of ThoughtFlow
 
 First principles first.
 Complexity is the enemy.

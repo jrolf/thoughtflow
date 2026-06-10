@@ -2,7 +2,7 @@
 MEMORY class for ThoughtFlow.
 
 The MEMORY class serves as an event-sourced state container for managing events, 
-logs, messages, reflections, and variables within the Thoughtflow framework.
+logs, messages, reflections, and variables within the ThoughtFlow framework.
 
 Example:
     >>> from thoughtflow import MEMORY
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import copy
+import bisect
 import pickle
 import pprint
 import datetime as dtt
@@ -47,7 +48,7 @@ from thoughtflow._util import (
 class MEMORY:
     """
     The MEMORY class serves as an event-sourced state container for managing events, 
-    logs, messages, reflections, and variables within the Thoughtflow framework. 
+    logs, messages, reflections, and variables within the ThoughtFlow framework. 
     
     All state changes are stored as events with sortable IDs (alphabetical = chronological).
     Events are stored in a dictionary for O(1) lookup, with separate sorted indexes for
@@ -80,9 +81,13 @@ class MEMORY:
         valid_channels (set): Set of valid communication channels.
 
     Methods:
-        add_msg(role, content, mode='text', channel='unknown'): Add a message event with channel.
+        add_msg(role, content, mode='text', channel='unknown', metadata=None): Add a message event with channel and optional metadata.
+        add_augment(content, target='last_user', ...): Add tagged context for optional LLM-view merging.
+        get_llm_msgs(merge_augments=False, ...): Build LLM-ready message dicts; optional augment folding.
         add_log(message): Add a log event.
         add_ref(content): Add a reflection event.
+        add_exchange(kind, key, service, model, request, response): Record an LLM/EMBED exchange (powers record/replay).
+        get_exchanges(kind=None): Get recorded model exchanges.
         get_msgs(...): Retrieve messages with filtering (supports channel filter).
         get_events(...): Retrieve all events with filtering.
         get_logs(limit=-1): Get log events.
@@ -91,6 +96,7 @@ class MEMORY:
         last_asst_msg(): Get the last assistant message content.
         last_sys_msg(): Get the last system message content.
         last_log_msg(): Get the last log message content.
+        last_result_msg(): Get the last result message.
         prepare_context(...): Prepare messages for LLM with smart truncation of old messages.
         set_var(key, value, desc=''): Set a variable (appends to history, auto-converts large values to objects).
         del_var(key): Mark a variable as deleted (preserves history).
@@ -165,9 +171,6 @@ class MEMORY:
     """
 
     def __init__(self):
-        import bisect
-        self._bisect = bisect  # Store for use in methods
-        
         self.id = event_stamp()
         
         # DATA LAYER: Single source of truth for all events
@@ -240,7 +243,7 @@ class MEMORY:
             stamp: Event stamp ID
         """
         # bisect.insort sorts by first element of tuple/list (timestamp)
-        self._bisect.insort(index_list, [timestamp, stamp])
+        bisect.insort(index_list, [timestamp, stamp])
 
     def _store_event(self, event_type, obj):
         """
@@ -302,7 +305,7 @@ class MEMORY:
 
     #--- Public Methods ---
 
-    def add_msg(self, role, content, mode='text', channel='unknown'):
+    def add_msg(self, role, content, mode='text', channel='unknown', metadata=None):
         """
         Add a message event with channel tracking.
         
@@ -311,6 +314,8 @@ class MEMORY:
             content: Message content
             mode: Communication mode (text, audio, voice)
             channel: Communication channel (webapp, ios, telegram, etc.)
+            metadata: Optional dict of extension metadata (e.g. {'internal': True}
+                for UI-hidden RAG context). Omitted from the stored event when empty.
         """
         if role not in self.valid_roles:
             raise ValueError("Invalid role '{}'. Must be one of: {}".format(role, sorted(self.valid_roles)))
@@ -318,6 +323,8 @@ class MEMORY:
             raise ValueError("Invalid mode '{}'. Must be one of: {}".format(mode, sorted(self.valid_modes)))
         if channel not in self.valid_channels:
             raise ValueError("Invalid channel '{}'. Must be one of: {}".format(channel, sorted(self.valid_channels)))
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("metadata must be a dict or None")
         
         stamp = event_stamp({'role': role, 'content': content})
         msg = {
@@ -330,7 +337,38 @@ class MEMORY:
             'dt_bog'  : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'  : str(dtt.datetime.now(tz_utc))[:23],
         }
+        if metadata:
+            msg['metadata'] = metadata
         self._store_event('msg', msg)
+
+    def add_augment(
+        self,
+        content,
+        target='last_user',
+        role='system',
+        mode='text',
+        channel='unknown',
+        metadata=None,
+    ):
+        """
+        Add context that can augment a user turn for optional LLM view merging.
+
+        Stores a normal message event tagged with ``metadata['augments']``.
+        The event log is unchanged; only ``get_llm_msgs(merge_augments=True)``
+        (or an AGENT with ``merge_augments=True``) folds this content into the
+        most recent preceding user message when building the LLM payload.
+
+        Args:
+            content: Augmenting text (e.g. retrieved RAG chunks).
+            target: Augmentation target. Only ``'last_user'`` is supported.
+            role: Stored message role (default ``'system'``).
+            mode: Communication mode (default ``'text'``).
+            channel: Communication channel (default ``'unknown'``).
+            metadata: Optional extra metadata (e.g. ``{'internal': True}``).
+        """
+        meta = dict(metadata or {})
+        meta['augments'] = target
+        self.add_msg(role, content, mode=mode, channel=channel, metadata=meta)
 
     def add_log(self, message):
         """
@@ -368,9 +406,65 @@ class MEMORY:
             'dt_bog'  : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'  : str(dtt.datetime.now(tz_utc))[:23],
         }
-        self._store_event('ref', ref) 
+        self._store_event('ref', ref)
+
+    def add_exchange(self, kind, key, service, model, request, response):
+        """
+        Record a model exchange (LLM or EMBED call) as a memory event.
+
+        This is the seam that powers ThoughtFlow's record/replay system:
+        because MEMORY is event-sourced, capturing the nondeterministic
+        boundary (the model call) as an event makes the whole flow
+        deterministically replayable. See LLM.record() / LLM.replay().
+
+        Args:
+            kind: 'chat' for LLM exchanges, 'embed' for EMBED exchanges.
+            key: Deterministic content hash of the request (exchange_key).
+            service: Provider name (e.g. 'openai').
+            model: Model name.
+            request: JSON-serializable dict describing the request.
+            response: JSON-serializable response payload.
+        """
+        stamp = event_stamp({'key': key, 'kind': kind})
+        exchange = {
+            'stamp'    : stamp,
+            'type'     : 'llm',
+            'role'     : 'llm',
+            'kind'     : kind,
+            'key'      : key,
+            'service'  : service,
+            'model'    : model,
+            'request'  : request,
+            'response' : response,
+            'dt_bog'   : str(dtt.datetime.now(tz_bog))[:23],
+            'dt_utc'   : str(dtt.datetime.now(tz_utc))[:23],
+        }
+        self._store_event('llm', exchange)
+
+    def get_exchanges(self, kind=None):
+        """
+        Get recorded model exchanges in chronological order.
+
+        Args:
+            kind: Filter by exchange kind ('chat' or 'embed'). None = all.
+
+        Returns:
+            List of exchange event dicts.
+        """
+        events = self.get_events(event_types=['llm'])
+        if kind:
+            events = [e for e in events if e.get('kind') == kind]
+        return events
 
     #---
+
+    @staticmethod
+    def _metadata_matches(event, metadata_filter):
+        """Return True when every key in metadata_filter matches the event metadata."""
+        if not metadata_filter:
+            return True
+        meta = event.get('metadata') or {}
+        return all(meta.get(key) == value for key, value in metadata_filter.items())
 
     def get_msgs(self, 
                  limit=-1, 
@@ -378,6 +472,8 @@ class MEMORY:
                  exclude=None, 
                  repr='list',
                  channel=None,
+                 metadata_filter=None,
+                 exclude_metadata=None,
                 ):
         """
         Get messages with flexible filtering.
@@ -388,6 +484,10 @@ class MEMORY:
             exclude: List of roles to exclude (None = none)
             repr: Output format ('list', 'str', 'pprint1')
             channel: Filter by channel (None = all)
+            metadata_filter: Keep only messages whose metadata matches all
+                key-value pairs (e.g. {'internal': True})
+            exclude_metadata: Drop messages whose metadata matches all
+                key-value pairs (e.g. {'internal': True} for UI-visible history)
             
         Returns:
             Messages in the specified format
@@ -403,6 +503,10 @@ class MEMORY:
             events = [e for e in events if e.get('role') not in exclude]
         if channel:
             events = [e for e in events if e.get('channel') == channel]
+        if metadata_filter:
+            events = [e for e in events if self._metadata_matches(e, metadata_filter)]
+        if exclude_metadata:
+            events = [e for e in events if not self._metadata_matches(e, exclude_metadata)]
         
         if limit > 0:
             events = events[-limit:]
@@ -415,6 +519,57 @@ class MEMORY:
             return pprint.pformat(events, indent=1)
         else:
             raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
+
+    def get_llm_msgs(self, merge_augments=False, include=None, exclude=None):
+        """
+        Build LLM-ready message dicts from stored events.
+
+        Default (``merge_augments=False``): one ``{'role', 'content'}`` dict per
+        stored message — the same forwarding semantics AGENT uses today.
+
+        When ``merge_augments=True``, events tagged ``metadata['augments'] ==
+        'last_user'`` are prepended into the most recent preceding user message
+        for that turn and omitted as separate messages. Stored events are never
+        modified.
+
+        Args:
+            merge_augments: Fold augmenting events into user messages for the
+                LLM view only (default False).
+            include: Optional list of roles to include (passed to ``get_msgs``).
+            exclude: Optional list of roles to exclude (passed to ``get_msgs``).
+
+        Returns:
+            list[dict]: Messages with ``role`` and ``content`` keys.
+        """
+        events = self.get_msgs(include=include, exclude=exclude)
+
+        if not merge_augments:
+            return [
+                {'role': event.get('role', 'user'), 'content': event.get('content', '')}
+                for event in events
+            ]
+
+        result = []
+        for event in events:
+            meta = event.get('metadata') or {}
+            if meta.get('augments') == 'last_user':
+                augment_content = event.get('content', '')
+                for i in range(len(result) - 1, -1, -1):
+                    if result[i].get('role') == 'user':
+                        merged = augment_content + '\n\n' + result[i]['content']
+                        result[i] = {
+                            'role': result[i]['role'],
+                            'content': merged,
+                        }
+                        break
+                continue
+
+            result.append({
+                'role': event.get('role', 'user'),
+                'content': event.get('content', ''),
+            })
+
+        return result
 
     def get_events(self, limit=-1, event_types=None, channel=None):
         """
@@ -541,6 +696,23 @@ class MEMORY:
         if not logs:
             return '' if content_only else None
         return logs[-1]['content'] if content_only else logs[-1]
+
+    def last_result_msg(self, content_only=False):
+        """
+        Get the last result message.
+
+        Args:
+            content_only: If True, return just the content string.
+                          If False (default), return the full event dict.
+
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no result messages.
+        """
+        msgs = self.get_msgs(include=['result'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
 
     def last_ref(self, content_only=False):
         """
@@ -1377,7 +1549,9 @@ class MEMORY:
                             if (start and dt < start) or (end and dt > end):
                                 continue
                         except Exception:
-                            pass  # Ignore if can't parse
+                            # Unparseable timestamp: keep the event rather
+                            # than silently dropping it from the rendered view
+                            pass
                 filtered.append(ev)
             return filtered
 

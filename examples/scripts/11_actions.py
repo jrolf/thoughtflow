@@ -21,10 +21,9 @@ Categories:
 from thoughtflow import (
     MEMORY,
     # Action Primitives
-    SAY, ASK, NOTIFY,           # Communication
-    SEARCH, FETCH, SCRAPE, READ, # Information Retrieval
-    WRITE, POST,                 # Persistence
-    SLEEP, WAIT, NOOP,           # Temporal Control
+    SAY, NOTIFY,           # Communication
+    READ, # Information Retrieval
+    WRITE, SLEEP, WAIT, NOOP,           # Temporal Control
     RUN, CALL,                   # Execution
 )
 

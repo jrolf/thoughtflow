@@ -17,32 +17,30 @@ Before fixing, understand:
 
 ```python
 # Create a minimal script that reproduces the bug
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
+from thoughtflow import LLM
 
-adapter = OpenAIAdapter()
-agent = Agent(adapter)
+llm = LLM("openai:gpt-4o", key="sk-...")
 
 # This causes the bug:
-result = agent.call([])  # Unexpected behavior here
+result = llm.call([])  # Unexpected behavior here
 ```
 
 ### 3. Write a Failing Test
 
 ```python
-# tests/unit/test_agent.py
+# tests/unit/test_llm.py
 
-def test_agent_call_with_empty_messages_raises_error(self):
-    """Bug #123: Agent.call() should raise error for empty messages."""
-    agent = Agent(mock_adapter)
+def test_llm_call_with_empty_messages_raises_error(self):
+    """Bug #123: LLM.call() should raise error for empty messages."""
+    llm = LLM("openai:gpt-4o", key="test-key")
 
     with pytest.raises(ValueError, match="messages cannot be empty"):
-        agent.call([])
+        llm.call([])
 ```
 
 Run the test to confirm it fails:
 ```bash
-pytest tests/unit/test_agent.py::TestAgent::test_agent_call_with_empty_messages_raises_error -v
+pytest tests/unit/test_llm.py::TestLLMCall::test_llm_call_with_empty_messages_raises_error -v
 # Expected: FAILED
 ```
 
@@ -55,14 +53,10 @@ git checkout -b fix/empty-messages-error
 ### 5. Fix the Bug
 
 ```python
-# src/thoughtflow/agent.py
+# src/thoughtflow/llm.py
 
-def call(
-    self,
-    msg_list: MessageList,
-    params: dict[str, Any] | None = None,
-) -> str:
-    """Call the agent with messages."""
+def call(self, msg_list, params={}, output_schema=None, stream=False):
+    """Call the appropriate LLM API with the given messages and parameters."""
     # Add validation
     if not msg_list:
         raise ValueError("messages cannot be empty")
@@ -74,7 +68,7 @@ def call(
 
 ```bash
 # Run the specific test
-pytest tests/unit/test_agent.py::TestAgent::test_agent_call_with_empty_messages_raises_error -v
+pytest tests/unit/test_llm.py::TestLLMCall::test_llm_call_with_empty_messages_raises_error -v
 # Expected: PASSED
 
 # Run all tests to ensure no regressions
@@ -87,7 +81,7 @@ pytest tests/unit/ -v
 ## [Unreleased]
 
 ### Fixed
-- `Agent.call()` now raises `ValueError` for empty message lists (#123)
+- `LLM.call()` now raises `ValueError` for empty message lists (#123)
 ```
 
 ### 8. Create Pull Request
@@ -96,7 +90,7 @@ Reference the issue in your PR:
 ```markdown
 ## Description
 
-Fixes the bug where `Agent.call()` would silently fail with empty messages.
+Fixes the bug where `LLM.call()` would silently fail with empty messages.
 
 ## Related Issue
 

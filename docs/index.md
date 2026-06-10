@@ -57,14 +57,10 @@ See the [Quick Start Guide](quickstart.md) for more details.
 ## Installation
 
 ```bash
-# Core only (zero dependencies)
 pip install thoughtflow
-
-# With provider support
-pip install thoughtflow[openai]
-pip install thoughtflow[anthropic]
-pip install thoughtflow[all-providers]
 ```
+
+That is the whole installation. Every provider — OpenAI, Anthropic, Groq, Gemini, OpenRouter, Ollama — is reached through the standard library, so there are no provider extras to install.
 
 ---
 

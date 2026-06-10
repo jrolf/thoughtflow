@@ -23,7 +23,7 @@ Before adding a feature, ask:
    - Everything should be traceable
 
 4. **Does it work across providers?**
-   - Provider-specific logic belongs in adapters
+   - Provider-specific logic belongs in the `_call_<service>` methods of llm.py/embed.py
    - Core should be provider-agnostic
 
 ---
@@ -240,174 +240,27 @@ See [09-creating-pull-requests.md](09-creating-pull-requests.md).
 
 ---
 
-## Example: Adding a New Adapter
+## Example: Adding a New Provider
 
-### Step 1: Create the Adapter File
-
-```python
-# src/thoughtflow/adapters/bedrock.py
-
-"""
-AWS Bedrock adapter for ThoughtFlow.
-
-Provides integration with AWS Bedrock managed LLM service.
-
-Requires: pip install thoughtflow[bedrock]
-"""
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any
-
-from thoughtflow.adapters.base import Adapter, AdapterConfig, AdapterResponse
-
-if TYPE_CHECKING:
-    from thoughtflow.message import MessageList
-
-
-class BedrockAdapter(Adapter):
-    """Adapter for AWS Bedrock.
-
-    Example:
-        >>> adapter = BedrockAdapter(region="us-east-1")
-        >>> response = adapter.complete([
-        ...     {"role": "user", "content": "Hello!"}
-        ... ])
-    """
-
-    DEFAULT_MODEL = "anthropic.claude-3-sonnet-20240229-v1:0"
-
-    def __init__(
-        self,
-        region: str | None = None,
-        config: AdapterConfig | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Initialize the Bedrock adapter.
-
-        Args:
-            region: AWS region. Defaults to AWS_DEFAULT_REGION env var.
-            config: Full adapter configuration.
-            **kwargs: Additional config options.
-        """
-        if config is None:
-            config = AdapterConfig(**kwargs)
-        super().__init__(config)
-        self.region = region
-        self._client = None
-
-    @property
-    def client(self) -> Any:
-        """Lazy-load the Bedrock client."""
-        if self._client is None:
-            try:
-                import boto3
-            except ImportError as e:
-                raise ImportError(
-                    "boto3 not installed. "
-                    "Install with: pip install thoughtflow[bedrock]"
-                ) from e
-
-            self._client = boto3.client(
-                "bedrock-runtime",
-                region_name=self.region,
-            )
-        return self._client
-
-    def complete(
-        self,
-        messages: MessageList,
-        params: dict[str, Any] | None = None,
-    ) -> AdapterResponse:
-        """Generate completion using Bedrock."""
-        # Implementation here
-        raise NotImplementedError("BedrockAdapter.complete() not yet implemented")
-
-    def get_capabilities(self) -> dict[str, Any]:
-        """Get Bedrock adapter capabilities."""
-        return {
-            "streaming": True,
-            "tool_calling": True,
-            "vision": True,
-            "json_mode": False,
-        }
-```
-
-### Step 2: Add to Adapters `__init__.py`
+Providers are not separate modules — each one is a `_call_<service>` method on the `LLM` class in `src/thoughtflow/llm.py`, plus a dispatch entry in `call()`. The implementation must use only the standard library (`urllib`, `json`).
 
 ```python
-# src/thoughtflow/adapters/__init__.py
+# src/thoughtflow/llm.py
 
-__all__ = [
-    # ... existing ...
-    "BedrockAdapter",
-]
-
-def __getattr__(name: str):
-    # ... existing ...
-    elif name == "BedrockAdapter":
-        from thoughtflow.adapters.bedrock import BedrockAdapter
-        return BedrockAdapter
-    # ...
+def _call_bedrock(self, msg_list, params):
+    """Calls AWS Bedrock via its OpenAI-compatible REST endpoint."""
+    output_schema = params.pop('_output_schema', None)
+    payload = {
+        "model": self.model,
+        "messages": self._prepare_messages(msg_list),
+        **params
+    }
+    # ... build url/headers, call self._send_request(), parse choices ...
 ```
 
-### Step 3: Add Optional Dependency
+Then add the dispatch branch in `LLM.call()`, a `PROVIDER_ROLE_MAP` entry if the provider needs role translation, unit tests with a monkeypatched transport, and an integration test gated by `THOUGHTFLOW_INTEGRATION_TESTS=1`.
 
-```toml
-# pyproject.toml
-
-[project.optional-dependencies]
-bedrock = ["boto3>=1.28"]
-all-providers = [
-    # ... existing ...
-    "thoughtflow[bedrock]",
-]
-```
-
-### Step 4: Write Tests
-
-```python
-# tests/unit/test_bedrock_adapter.py
-
-from thoughtflow.adapters.bedrock import BedrockAdapter
-
-
-class TestBedrockAdapter:
-    def test_initialization(self):
-        """Should initialize with region."""
-        adapter = BedrockAdapter(region="us-east-1")
-        assert adapter.region == "us-east-1"
-
-    def test_capabilities(self):
-        """Should report correct capabilities."""
-        adapter = BedrockAdapter()
-        caps = adapter.get_capabilities()
-        assert caps["tool_calling"] is True
-```
-
-### Step 5: Add Integration Test
-
-```python
-# tests/integration/test_bedrock_adapter.py
-
-import os
-import pytest
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        os.getenv("THOUGHTFLOW_INTEGRATION_TESTS") != "1",
-        reason="Integration tests disabled",
-    ),
-]
-
-
-class TestBedrockAdapterIntegration:
-    def test_real_completion(self):
-        """Should complete with real Bedrock API."""
-        # Requires AWS credentials configured
-        pass
-```
+See [15-adding-providers.md](15-adding-providers.md) for the complete step-by-step guide.
 
 ---
 

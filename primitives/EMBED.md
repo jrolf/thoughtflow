@@ -16,6 +16,8 @@ Provider routing is by service prefix. OpenAI, Groq, and OpenRouter share the sa
 
 All HTTP is done via `urllib`; no third-party dependencies.
 
+EMBED shares LLM's record/replay seam: `embed.record(memory)` captures every embedding exchange as MEMORY events, and `EMBED.replay(memory)` returns a `ReplayEMBED` that serves the recorded vectors deterministically — no network, no keys. Unrecorded requests raise `ReplayMissError`, or fall back to a live EMBED passed via `on_miss=`.
+
 ## Inputs & Configuration
 
 | Parameter | Description |
@@ -53,6 +55,14 @@ vector = embed.call("Local embedding")
 
 # Truncated dimensions (text-embedding-3-*)
 vector = embed.call("Short vector", params={"dimensions": 256})
+
+# Record & replay
+from thoughtflow import MEMORY
+memory = MEMORY()
+embed.record(memory)
+vector = embed.call("Hello")          # recorded
+replayed = EMBED.replay(memory)
+assert replayed.call("Hello") == vector   # offline, deterministic
 ```
 
 ## Relationship to Other Primitives

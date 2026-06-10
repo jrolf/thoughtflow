@@ -14,11 +14,11 @@ Prerequisites:
     export OPENAI_API_KEY=sk-...  (optional, uses a mock agent by default)
 
 Run:
-    python examples/12_chat.py
+    python examples/scripts/12_chat.py
 """
 
 import os
-from thoughtflow import MEMORY, THOUGHT, CHAT, LLM
+from thoughtflow import THOUGHT, CHAT, LLM
 
 
 # =============================================================================

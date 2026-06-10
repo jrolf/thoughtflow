@@ -108,6 +108,89 @@ class TestAgentInitialization:
         assert "add" in agent._tool_map
         assert "echo" in agent._tool_map
 
+    def test_merge_augments_defaults_false(self):
+        """AGENT must default merge_augments to False."""
+        agent = AGENT(llm=MockLLM(), name="test")
+        assert agent.merge_augments is False
+
+
+class TestAgentMergeAugments:
+    """Tests for optional LLM-view augmentation on AGENT (issue #15)."""
+
+    def test_default_forwards_separate_context_message(self):
+        """Default AGENT must send augment events as separate LLM messages."""
+        llm = MockLLM(responses=["Answer"])
+        agent = AGENT(llm=llm, system_prompt="You are helpful.", name="test")
+        memory = MEMORY()
+        memory.add_msg("user", "Question?")
+        memory.add_augment("RAG context", metadata={"internal": True})
+
+        agent(memory)
+
+        sent = llm.calls[0]["msgs"]
+        roles = [msg["role"] for msg in sent]
+        contents = [msg["content"] for msg in sent]
+
+        assert roles == ["system", "user", "system"]
+        assert contents[1] == "Question?"
+        assert contents[2] == "RAG context"
+
+    def test_merge_augments_folds_context_into_user_message(self):
+        """merge_augments=True must fold augment events into the user LLM message."""
+        llm = MockLLM(responses=["Answer"])
+        agent = AGENT(
+            llm=llm,
+            system_prompt="You are helpful.",
+            name="test",
+            merge_augments=True,
+        )
+        memory = MEMORY()
+        memory.add_msg("user", "Question?")
+        memory.add_augment("RAG context", metadata={"internal": True})
+
+        agent(memory)
+
+        sent = llm.calls[0]["msgs"]
+        roles = [msg["role"] for msg in sent]
+        contents = [msg["content"] for msg in sent]
+
+        assert roles == ["system", "user"]
+        assert contents[1] == "RAG context\n\nQuestion?"
+
+
+class TestParseToolCalls:
+    """Tests for AGENT tool-call JSON parsing."""
+
+    def test_parses_json_wrapped_in_markdown_fence(self):
+        """AGENT must parse tool calls when the LLM wraps JSON in markdown fences."""
+        payload = {"name": "add", "arguments": {"a": 1, "b": 2}}
+        fenced = "```json\n{}\n```".format(json.dumps(payload))
+        agent = AGENT(llm=MockLLM(), name="test")
+
+        calls = agent._parse_tool_calls(fenced)
+
+        assert calls == [payload]
+
+    def test_preserves_inline_backticks_inside_json(self):
+        """Fence stripping must not remove backticks inside JSON string values."""
+        payload = {
+            "name": "echo",
+            "arguments": {"text": "use `backticks` in code"},
+        }
+        fenced = "```\n{}\n```".format(json.dumps(payload))
+        agent = AGENT(llm=MockLLM(), name="test")
+
+        calls = agent._parse_tool_calls(fenced)
+
+        assert calls == [payload]
+
+    def test_plain_json_still_parses(self):
+        """AGENT must continue parsing plain JSON responses unchanged."""
+        payload = {"name": "add", "arguments": {"a": 3, "b": 4}}
+        agent = AGENT(llm=MockLLM(), name="test")
+
+        assert agent._parse_tool_calls(json.dumps(payload)) == [payload]
+
 
 class TestAgentExecution:
     """Tests for AGENT execution behavior."""
@@ -138,11 +221,27 @@ class TestAgentExecution:
 
         assert memory.get_var("test_result") == "The answer is 42."
 
+    def test_tool_call_parses_fenced_json_response(self):
+        """
+        AGENT must execute tools when the LLM returns fenced JSON tool calls.
+        """
+        tool_call_json = json.dumps({"name": "add", "arguments": {"a": 5, "b": 3}})
+        fenced = "```json\n{}\n```".format(tool_call_json)
+        llm = MockLLM(responses=[fenced, "The sum is 8."])
+
+        agent = AGENT(llm=llm, tools=[make_add_tool()], name="calc")
+        memory = MEMORY()
+        memory.add_msg("user", "Add 5 and 3")
+
+        memory = agent(memory)
+
+        assert memory.get_var("calc_result") == "The sum is 8."
+        assert llm.call_count == 2
+
     def test_tool_call_and_response_cycle(self):
         """
         AGENT must execute tools when the LLM requests them, then get a final response.
         """
-        # First response: tool call. Second response: final answer.
         tool_call_json = json.dumps({"name": "add", "arguments": {"a": 5, "b": 3}})
         llm = MockLLM(responses=[tool_call_json, "The sum is 8."])
 
