@@ -12,7 +12,9 @@ The event-sourced architecture means you never overwrite history. When a variabl
 
 MEMORY has four architectural layers. The DATA layer is a dictionary of events keyed by stamp — the single source of truth. The INDEX layer maintains sorted lists of `[timestamp, stamp]` pairs per event type (messages, reflections, logs, variable changes) and a master index for all events. The VARIABLE layer stores variable histories as lists of `[stamp, value]` pairs; each set appends to the list, and deletions append a special tombstone. The OBJECT layer holds compressed large data; values exceeding a size threshold are automatically stored as compressed objects with references in the variable history.
 
-Messages have roles (system, user, assistant, reflection, action, query, result, logger), modes (text, audio, voice), and channels (cli, webapp, api, sms, voice, internal, system). Variables support full history, optional descriptions, and deletion tracking. `prepare_context` builds LLM-ready message lists with smart truncation of older content. Save and load use pickle or JSON; `from_events` rehydrates a MEMORY from an event list for cloud sync.
+Messages have roles (system, user, assistant, reflection, action, query, result, logger), modes (text, audio, voice), and channels (cli, webapp, api, sms, voice, internal, system). Messages also accept an optional `metadata` dict (e.g. `{'internal': True}`), and `get_msgs` can filter on it via `metadata_filter=` / `exclude_metadata=` — the mechanism behind UI-visible histories and tagged RAG context. `add_augment()` tags context for optional LLM-view merging (`get_llm_msgs(merge_augments=True)` or `AGENT(merge_augments=True)`) without mutating stored user messages. Variables support full history, optional descriptions, and deletion tracking. `prepare_context` builds LLM-ready message lists with smart truncation of older content. Save and load use pickle or JSON; `from_events` rehydrates a MEMORY from an event list for cloud sync.
+
+MEMORY is also the storage substrate for record/replay: `add_exchange()` stores an LLM or EMBED exchange (request + response, keyed by content hash) as an event of type `llm`, and `get_exchanges()` returns them in chronological order. Because exchanges are ordinary events, recordings serialize with `to_json` and survive round-trips like everything else.
 
 The contract is: memory flows through primitives — `memory = primitive(memory)`.
 
@@ -26,7 +28,7 @@ The contract is: memory flows through primitives — `memory = primitive(memory)
 | Reflections | Agent reasoning traces (role: reflection) |
 | object_threshold | Size in bytes above which values auto-compress to object refs (default 10KB) |
 
-**Key methods:** `add_msg`, `add_log`, `add_ref`, `set_var`, `del_var`, `get_var`, `get_msgs`, `prepare_context`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
+**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
 
 ## Usage
 

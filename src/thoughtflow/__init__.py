@@ -42,8 +42,8 @@ Basic Usage:
 from __future__ import annotations
 
 # Core primitives
-from thoughtflow.llm import LLM
-from thoughtflow.embed import EMBED
+from thoughtflow.llm import LLM, OpenAICompatibleLLM, ReplayLLM, ReplayMissError
+from thoughtflow.embed import EMBED, ReplayEMBED
 from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
 from thoughtflow.thoughts import DECIDE, PLAN
@@ -94,8 +94,7 @@ from thoughtflow._util import (
 # Keep message types for potential utility
 from thoughtflow.message import Message, MessageList
 
-# Submodule access (trace, eval for advanced usage)
-from thoughtflow import trace
+# Submodule access (eval for harness-style testing)
 from thoughtflow import eval
 
 # Version
@@ -110,7 +109,11 @@ except Exception:
 __all__ = [
     # Core Primitives
     "LLM",
+    "OpenAICompatibleLLM",
+    "ReplayLLM",
+    "ReplayMissError",
     "EMBED",
+    "ReplayEMBED",
     "MEMORY",
     "THOUGHT",
     "DECIDE",
@@ -157,7 +160,6 @@ __all__ = [
     "Message",
     "MessageList",
     # Submodules
-    "trace",
     "eval",
     # Metadata
     "__version__",

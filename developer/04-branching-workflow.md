@@ -60,7 +60,7 @@ Types:
 Examples:
 ```bash
 # Good branch names
-feature/add-bedrock-adapter
+feature/add-bedrock-provider
 fix/message-serialization-error
 docs/improve-quickstart
 refactor/simplify-trace-events

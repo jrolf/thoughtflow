@@ -1,140 +1,136 @@
 # Memory
 
-Memory integration in ThoughtFlow is handled as a service boundary, not a magical built-in. Memory is optional, pluggable, explicit, and recordable.
+MEMORY is the event-sourced state container at the center of ThoughtFlow. Messages, variables, logs, reflections, and recorded model exchanges are all events in one ordered, replayable log. Every primitive reads from it and writes to it — the universal contract is `memory = primitive(memory)`.
 
 ---
 
-## The Memory Hook Interface
+## Events, Not Mutations
+
+Nothing in MEMORY is overwritten. Adding a message appends an event. Setting a variable appends an event. Setting it again appends another. The current state is a view over the log, which means the full history is always available:
 
 ```python
-from thoughtflow.memory import MemoryHook
+from thoughtflow import MEMORY
 
-class MyMemory(MemoryHook):
-    def retrieve(self, query, k=5, filters=None):
-        """Retrieve relevant memories."""
-        ...
+memory = MEMORY()
 
-    def store(self, content, metadata=None):
-        """Store a new memory."""
-        ...
+memory.add_msg("user", "Hello!")
+memory.add_msg("assistant", "Hi there!")
+
+memory.set_var("request_count", 1)
+memory.set_var("request_count", 2)
+
+memory.get_var("request_count")          # 2
+memory.get_var_history("request_count")  # every change, with sortable stamps
 ```
 
+This is what makes ThoughtFlow systems debuggable and replayable: the memory *is* the trace.
+
 ---
 
-## Basic Implementation
+## Messages
+
+`add_msg(role, content, mode='text', channel='unknown', metadata=None)` appends a message event. Roles are open-ended — `user`, `assistant`, `system`, plus ThoughtFlow-internal roles like `action` and `result` (tool interactions from the agent loop).
+
+`get_msgs()` retrieves with flexible filtering:
 
 ```python
-from thoughtflow.memory import MemoryHook
-
-class SimpleMemory(MemoryHook):
-    def __init__(self):
-        self.memories = []
-
-    def retrieve(self, query, k=5, filters=None):
-        # Simple keyword matching
-        matches = []
-        for m in self.memories:
-            if query.lower() in m["content"].lower():
-                matches.append(m)
-        return matches[:k]
-
-    def store(self, content, metadata=None):
-        memory_id = str(len(self.memories))
-        self.memories.append({
-            "id": memory_id,
-            "content": content,
-            "metadata": metadata or {}
-        })
-        return memory_id
+memory.get_msgs()                                  # all messages
+memory.get_msgs(include=["user", "assistant"])     # by role
+memory.get_msgs(exclude=["action", "result"])      # everything but tool traffic
+memory.get_msgs(channel="api")                     # by channel
+memory.get_msgs(repr="str")                        # as a printable string
 ```
 
----
+Shortcuts for the common cases: `last_user_msg()`, `last_asst_msg()`, `last_result_msg()` — each with `content_only=True` to get just the text.
 
-## Usage Pattern
+### Tagging with Metadata
 
-Memory is explicitly used at call sites:
-
-```python
-# Retrieve relevant context
-memories = memory.retrieve("user preferences")
-
-# Build messages with memory context
-messages = [
-    {"role": "system", "content": "You are helpful."},
-    {"role": "system", "content": f"Relevant context: {memories}"},
-    {"role": "user", "content": user_input},
-]
-
-# Call agent
-response = agent.call(messages)
-
-# Optionally store the interaction
-memory.store(
-    f"User: {user_input}\nAssistant: {response}",
-    metadata={"type": "conversation"}
-)
-```
-
----
-
-## Memory Events
-
-Memory operations are tracked as events:
+`metadata` attaches provenance to a message, and `get_msgs` can filter on it:
 
 ```python
-from thoughtflow.memory import MemoryEvent
-
-# Retrieve event
-event = MemoryEvent(
-    event_type="retrieve",
-    query="user preferences",
-    results=[...],
+memory.add_msg(
+    "system",
+    "Relevant context: ...",
+    metadata={"internal": True, "source": "rag"},
 )
 
-# Store event
-event = MemoryEvent(
-    event_type="store",
-    content="New information...",
-)
+# UI-visible history: drop internal events
+memory.get_msgs(exclude_metadata={"internal": True})
+
+# Audit view: only what the system injected
+memory.get_msgs(metadata_filter={"source": "rag"})
+```
+
+This pattern is the backbone of [RAG, the ThoughtFlow Way](rag.md): system-injected context is tagged, never spliced into the user's words in storage. For optional prompt-injection-style LLM views, see `add_augment()` and `get_llm_msgs(merge_augments=True)` in [RAG](rag.md).
+
+---
+
+## Variables and Objects
+
+Variables carry results between primitives — each THOUGHT stores its output in `{name}_result`, and the next THOUGHT can reference it in its prompt:
+
+```python
+memory.set_var("analyze_result", themes, desc="Key themes from the document")
+memory.get_var("analyze_result")
+```
+
+For large payloads, `set_obj()` stores data in compressed form so the event log stays lean:
+
+```python
+memory.set_obj(big_dataframe_dict, name="raw_data", desc="Scraped dataset")
 ```
 
 ---
 
-## Vector Database Example
+## Recorded Exchanges
+
+MEMORY also stores model exchanges — the request/response pairs captured by `llm.record(memory)` and `embed.record(memory)`:
 
 ```python
-class VectorMemory(MemoryHook):
-    def __init__(self, client, collection):
-        self.client = client
-        self.collection = collection
+memory.add_exchange(kind, key, service, model, request, response)  # called by LLM/EMBED
+memory.get_exchanges(kind="chat")                                  # read them back
+```
 
-    def retrieve(self, query, k=5, filters=None):
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=k,
-            where=filters,
-        )
-        return [
-            {"content": doc, "metadata": meta}
-            for doc, meta in zip(results["documents"][0], results["metadatas"][0])
-        ]
+You rarely call these directly; they power the record/replay system. Because exchanges are ordinary events, recordings survive serialization round trips and travel with the rest of the state. See [Deterministic Replay](replay.md).
 
-    def store(self, content, metadata=None):
-        import uuid
-        memory_id = str(uuid.uuid4())
-        self.collection.add(
-            ids=[memory_id],
-            documents=[content],
-            metadatas=[metadata or {}],
-        )
-        return memory_id
+---
+
+## Serialization
+
+State moves as easily as data:
+
+```python
+memory.to_json("state.json")             # JSON export
+restored = MEMORY.from_json("state.json")
+
+memory.save("state.pkl")                 # pickle, optionally compressed
+restored = MEMORY()
+restored.load("state.pkl")
+
+snap = memory.snapshot()                 # dict export
+restored = MEMORY.from_events(event_list)  # rehydrate from raw events
+```
+
+This is what makes serverless deployment trivial: serialize at the end of one invocation, rehydrate at the start of the next.
+
+---
+
+## Rendering
+
+`render()` produces human- or LLM-readable views of the log:
+
+```python
+print(memory.render(format="conversation"))   # clean user/assistant transcript
+print(memory.render(format="markdown", include=("msgs", "logs")))
 ```
 
 ---
 
 ## Design Philosophy
 
-- **Hooks, not hard-coding**: Memory is a service boundary
-- **Explicit insertion**: Memory context explicitly added to messages
-- **Traceable**: All memory operations recorded in session
-- **Pluggable**: Swap implementations without changing agent code
+- **Append-only**: history is never lost, current state is a view
+- **One container**: messages, variables, logs, and recordings share one ordered log
+- **The memory is the trace**: no separate session or tracing machinery
+- **Serializable everywhere**: JSON in, JSON out, replayable on any machine
+
+For the complete API reference, see [primitives/MEMORY.md](https://github.com/jrolf/thoughtflow/blob/main/primitives/MEMORY.md).

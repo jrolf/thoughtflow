@@ -30,6 +30,7 @@ Tool interactions are stored in memory using "action" (the tool request) and "re
 | max_iterations | Max tool-use loop iterations | 10 |
 | name | Identifier for logging and result storage | "agent" |
 | on_tool_call | Callable(tool_name, arguments) called before each execution; return False to block | None |
+| merge_augments | Fold augmenting memory events into user messages for LLM calls only | False |
 
 ## Usage
 

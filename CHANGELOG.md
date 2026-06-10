@@ -8,13 +8,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Nothing yet
+- `MEMORY.add_augment()` — store context tagged for optional LLM-view merging
+  (e.g. RAG chunks) without mutating user messages in the event log
+- `MEMORY.get_llm_msgs(merge_augments=False)` — build LLM-ready message dicts;
+  when `merge_augments=True`, fold `metadata['augments'] == 'last_user'`
+  events into the preceding user turn for the model payload only
+- `AGENT(merge_augments=False)` — opt-in flag to use the merged LLM view in
+  `_build_messages()`; default behavior unchanged
+- Addresses [#15](https://github.com/jrolf/thoughtflow/issues/15) — optional
+  support for prompt-injection-style RAG while preserving event-sourced storage
 
 ### Changed
 - Nothing yet
 
 ### Fixed
 - Nothing yet
+
+---
+
+## [0.2.0] - 2026-06-10
+
+The release where ThoughtFlow's deterministic-replay story becomes real —
+grown from MEMORY itself, with zero new concepts.
+
+### Added
+- **Record/replay system.** `llm.record(memory)` captures every LLM exchange
+  (request + response, keyed by content hash) as MEMORY events. `LLM.replay(memory)`
+  returns a `ReplayLLM` — a drop-in LLM that serves recorded responses
+  deterministically: offline, instant, no API keys. Misses fail loudly
+  (`ReplayMissError`) or fall back to a live LLM via `on_miss=`.
+- `EMBED.record()` / `EMBED.replay()` / `ReplayEMBED` — the identical seam for
+  the embedding boundary
+- `MEMORY.add_exchange()` / `MEMORY.get_exchanges()` — the event-sourced storage
+  powering record/replay; recordings survive `to_json`/`from_json` round-trips
+- **Working eval harness.** `thoughtflow.eval.Harness` now actually runs:
+  a `TestCase` is a name + setup + check predicate over MEMORY; `Harness.run(flow)`
+  executes any `memory -> memory` callable per case in isolated MEMORYs,
+  containing exceptions as failures. The whole package is ~230 lines.
+- **Streaming through THOUGHT.** New `on_token=` config hook: when set, the LLM
+  response streams through the hook chunk-by-chunk, then the complete text flows
+  through the normal parse/validate/store pipeline. LLMs without streaming
+  support fall back to a normal call automatically.
+- `OpenAICompatibleLLM` exported from the package root (local servers: vLLM,
+  LM Studio, llama.cpp, MLX)
+- Python 3.13 classifier
+- Unit tests for record/replay (round-trips, hash stability, miss behavior,
+  end-to-end THOUGHT replay), the eval harness, on_token streaming, and
+  validation-spelling equivalence
+
+### Changed
+- `THOUGHT` validation: `validation=` is the canonical spelling and now accepts
+  both callables and built-in strings (`'any'`, `'has_keys:...'`,
+  `'list_min_len:N'`, `'summary_v1'`); the `validator=` config key remains fully
+  supported and behaves identically
+- Standardized brand casing to "ThoughtFlow" across source docstrings, ZEN.md,
+  and project docs
+
+### Fixed
+- `MEMORY.copy()` — no longer stores a module reference on the instance
+  (`bisect` is now a module-level import), so deep copy works; the previously
+  skipped test is restored and expanded
+
+### Removed
+- `thoughtflow.trace` (Session/Event/TraceSchema) — superseded by MEMORY-native
+  record/replay. The subsystem duplicated MEMORY's event log in a foreign idiom,
+  and its `load()`/`run()` methods were unimplemented stubs with no user surface.
+  MEMORY's JSON serialization already carries a schema version field.
+- `thoughtflow.eval.Replay` stub — replaced by the working `ReplayLLM`
+- Vestigial pyproject extras (`openai`, `anthropic`, `local`, `all-providers`) —
+  these installed SDKs the zero-dependency core never imports (leftovers from a
+  removed adapter-era design)
+- Adapter-era integration test files (`test_openai_adapter.py`,
+  `test_anthropic_adapter.py`) and the legacy `MockAdapter` test fixture —
+  all referenced a `thoughtflow.adapters` module that no longer exists
 
 ---
 
@@ -101,7 +167,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jrolf/thoughtflow/compare/v0.1.3...v0.2.0
+[0.1.3]: https://github.com/jrolf/thoughtflow/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jrolf/thoughtflow/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jrolf/thoughtflow/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jrolf/thoughtflow/compare/v0.0.9...v0.1.0

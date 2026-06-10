@@ -1,7 +1,7 @@
 """
 Unit tests for ``from thoughtflow import this``.
 
-Ensures the Zen of Thoughtflow module prints its text on import
+Ensures the Zen of ThoughtFlow module prints its text on import
 without interfering with the rest of the library.
 """
 
@@ -12,14 +12,14 @@ import sys
 
 
 def test_import_prints_zen(capsys):
-    """Importing thoughtflow.this should print the Zen of Thoughtflow."""
+    """Importing thoughtflow.this should print the Zen of ThoughtFlow."""
     # Remove cached module so the print triggers again
     sys.modules.pop("thoughtflow.this", None)
 
     import thoughtflow.this  # noqa: F401
 
     captured = capsys.readouterr()
-    assert "The Zen of Thoughtflow" in captured.out
+    assert "The Zen of ThoughtFlow" in captured.out
     assert "First principles first." in captured.out
     assert "Python is king." in captured.out
 
@@ -40,4 +40,4 @@ def test_regular_import_unaffected(capsys):
     importlib.reload(sys.modules["thoughtflow"])
 
     captured = capsys.readouterr()
-    assert "The Zen of Thoughtflow" not in captured.out
+    assert "The Zen of ThoughtFlow" not in captured.out

@@ -1883,6 +1883,97 @@ class TestPlanStringRepresentation:
         assert "2 actions" in s
 
 
+class TestValidationSpellings:
+    """
+    Tests asserting validation= (kwarg) and validator= (config) behave identically.
+
+    The canonical spelling is validation=; validator= is the config-style
+    alias. Both accept built-in strings and callables.
+    """
+
+    def test_string_spec_equivalent_in_both_spellings(self, mock_llm):
+        """A built-in string spec must behave the same via either spelling."""
+        t_validation = THOUGHT(name="a", llm=mock_llm(), prompt="x",
+                               validation="has_keys:name")
+        t_validator = THOUGHT(name="b", llm=mock_llm(), prompt="x",
+                              validator="has_keys:name")
+
+        good = {"name": "Ada"}
+        bad = {"other": 1}
+
+        assert t_validation.validate(good) == t_validator.validate(good)
+        assert t_validation.validate(bad) == t_validator.validate(bad)
+        assert t_validation.validate(good)[0] is True
+        assert t_validation.validate(bad)[0] is False
+
+    def test_callable_spec_equivalent_in_both_spellings(self, mock_llm):
+        """A callable spec must behave the same via either spelling."""
+        def check(result):
+            return result == "ok", "must be ok"
+
+        t_validation = THOUGHT(name="a", llm=mock_llm(), prompt="x",
+                               validation=check)
+        t_validator = THOUGHT(name="b", llm=mock_llm(), prompt="x",
+                              validator=check)
+
+        assert t_validation.validate("ok") == t_validator.validate("ok") == (True, "must be ok")
+        assert t_validation.validate("no")[0] is False
+        assert t_validator.validate("no")[0] is False
+
+    def test_validation_kwarg_takes_precedence(self, mock_llm):
+        """When both are given, validation= wins."""
+        thought = THOUGHT(name="a", llm=mock_llm(), prompt="x",
+                          validation="any", validator="has_keys:never")
+
+        assert thought.validate({"anything": True})[0] is True
+
+
+class TestOnTokenStreaming:
+    """
+    Tests for the on_token streaming hook.
+    """
+
+    def test_on_token_receives_chunks_and_result_is_joined(self, memory):
+        """on_token must receive each chunk; the joined text flows onward."""
+        class StreamingLLM:
+            service = "mock"
+            model = "mock-model"
+
+            def call(self, msgs, params=None, output_schema=None, stream=False):
+                if stream:
+                    return iter(["Hel", "lo ", "world"])
+                return ["Hello world"]
+
+        received = []
+        thought = THOUGHT(
+            name="streamer",
+            llm=StreamingLLM(),
+            prompt="Say hello",
+            on_token=lambda chunk: received.append(chunk),
+        )
+
+        memory.add_msg("user", "Hi")
+        memory = thought(memory)
+
+        assert received == ["Hel", "lo ", "world"]
+        assert memory.get_var("streamer_result") == "Hello world"
+
+    def test_on_token_falls_back_when_llm_lacks_streaming(self, mock_llm, memory):
+        """LLMs without stream= support must fall back to a normal call."""
+        received = []
+        thought = THOUGHT(
+            name="fallback",
+            llm=mock_llm(responses=["Plain response"]),
+            prompt="Say something",
+            on_token=lambda chunk: received.append(chunk),
+        )
+
+        memory.add_msg("user", "Hi")
+        memory = thought(memory)
+
+        assert memory.get_var("fallback_result") == "Plain response"
+
+
 class TestPlanCallable:
     """
     Tests for PLAN callable interface.

@@ -10,7 +10,7 @@ Prerequisites:
     pip install thoughtflow
 
 Run:
-    python examples/03_memory.py
+    python examples/scripts/03_memory.py
 """
 
 from thoughtflow import MEMORY

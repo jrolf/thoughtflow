@@ -2,7 +2,7 @@
 ACTION class for ThoughtFlow.
 
 The ACTION class encapsulates an external or internal operation that can be invoked 
-within a Thoughtflow agent workflow.
+within a ThoughtFlow agent workflow.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from thoughtflow._util import event_stamp
 
 class ACTION:
     """
-    The ACTION class encapsulates an external or internal operation that can be invoked within a Thoughtflow agent.
+    The ACTION class encapsulates an external or internal operation that can be invoked within a ThoughtFlow agent.
     It is designed to represent a single, named action (such as a tool call, API request, or function) whose result
     is stored in the agent's state for later inspection, branching, or retry.
     
@@ -97,7 +97,7 @@ class ACTION:
         1. Explicit and inspectable operations with consistent logging
         2. Predictable result storage via memory.set_var
         3. Error handling that doesn't interrupt workflow execution
-        4. Composability with other Thoughtflow components (MEMORY, THOUGHT)
+        4. Composability with other ThoughtFlow components (MEMORY, THOUGHT)
         5. Serialization support for reproducibility
         6. Full execution history with timing for debugging and optimization
     """

@@ -216,19 +216,19 @@ def old_function():
 
 ```python
 <<<<<<< HEAD
-from thoughtflow import Agent, Message
-from thoughtflow.trace import Session
+from thoughtflow import LLM, MEMORY
+from thoughtflow.eval import Harness
 =======
-from thoughtflow import Agent
-from thoughtflow.adapters import OpenAIAdapter
+from thoughtflow import LLM
+from thoughtflow.tool import TOOL
 >>>>>>> upstream/main
 ```
 
 **Resolution:** Merge the imports:
 ```python
-from thoughtflow import Agent, Message
-from thoughtflow.adapters import OpenAIAdapter
-from thoughtflow.trace import Session
+from thoughtflow import LLM, MEMORY
+from thoughtflow.eval import Harness
+from thoughtflow.tool import TOOL
 ```
 
 ### Scenario 4: pyproject.toml Version Conflicts

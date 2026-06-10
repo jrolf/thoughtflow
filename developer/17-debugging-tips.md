@@ -63,17 +63,22 @@ def process(self, data):
 
 ---
 
-## Tracing with Sessions
+## Inspecting the Event Log
+
+MEMORY is the trace — every message, variable change, and log entry is an event:
 
 ```python
-from thoughtflow.trace import Session
+from thoughtflow import MEMORY
 
-session = Session()
-response = agent.call(messages, session=session)
+memory = MEMORY()
+memory = agent(memory)
 
 # Inspect what happened
-for event in session.events:
-    print(f"{event.event_type}: {event.data}")
+for event in memory.get_events():
+    print(f"{event['type']}: {event.get('content', event)}")
+
+# Or render a readable view
+print(memory.render(include=("msgs", "logs")))
 ```
 
 ---

@@ -108,6 +108,55 @@ class TestAgentInitialization:
         assert "add" in agent._tool_map
         assert "echo" in agent._tool_map
 
+    def test_merge_augments_defaults_false(self):
+        """AGENT must default merge_augments to False."""
+        agent = AGENT(llm=MockLLM(), name="test")
+        assert agent.merge_augments is False
+
+
+class TestAgentMergeAugments:
+    """Tests for optional LLM-view augmentation on AGENT (issue #15)."""
+
+    def test_default_forwards_separate_context_message(self):
+        """Default AGENT must send augment events as separate LLM messages."""
+        llm = MockLLM(responses=["Answer"])
+        agent = AGENT(llm=llm, system_prompt="You are helpful.", name="test")
+        memory = MEMORY()
+        memory.add_msg("user", "Question?")
+        memory.add_augment("RAG context", metadata={"internal": True})
+
+        agent(memory)
+
+        sent = llm.calls[0]["msgs"]
+        roles = [msg["role"] for msg in sent]
+        contents = [msg["content"] for msg in sent]
+
+        assert roles == ["system", "user", "system"]
+        assert contents[1] == "Question?"
+        assert contents[2] == "RAG context"
+
+    def test_merge_augments_folds_context_into_user_message(self):
+        """merge_augments=True must fold augment events into the user LLM message."""
+        llm = MockLLM(responses=["Answer"])
+        agent = AGENT(
+            llm=llm,
+            system_prompt="You are helpful.",
+            name="test",
+            merge_augments=True,
+        )
+        memory = MEMORY()
+        memory.add_msg("user", "Question?")
+        memory.add_augment("RAG context", metadata={"internal": True})
+
+        agent(memory)
+
+        sent = llm.calls[0]["msgs"]
+        roles = [msg["role"] for msg in sent]
+        contents = [msg["content"] for msg in sent]
+
+        assert roles == ["system", "user"]
+        assert contents[1] == "RAG context\n\nQuestion?"
+
 
 class TestParseToolCalls:
     """Tests for AGENT tool-call JSON parsing."""

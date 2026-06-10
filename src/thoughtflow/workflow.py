@@ -32,7 +32,7 @@ class WORKFLOW:
     condition returns False. A step can also be a branch point that routes
     to different sub-steps based on runtime state.
 
-    Preserves the Thoughtflow contract: memory = workflow(memory).
+    Preserves the ThoughtFlow contract: memory = workflow(memory).
 
     Attributes:
         name (str): Identifier for this workflow.

@@ -35,7 +35,7 @@ Welcome to the ThoughtFlow developer documentation! These guides provide step-by
 | [12-writing-tests.md](12-writing-tests.md) | Write effective tests |
 | [13-adding-features.md](13-adding-features.md) | Add new functionality |
 | [14-fixing-bugs.md](14-fixing-bugs.md) | Debug and fix issues |
-| [15-adding-adapters.md](15-adding-adapters.md) | Create new provider adapters |
+| [15-adding-providers.md](15-adding-providers.md) | Add new LLM/EMBED providers |
 
 ## Documentation & Quality
 

@@ -87,10 +87,10 @@ ruff check src/ tests/
 
 Use descriptive branch names:
 
-- `feature/add-bedrock-adapter` - New features
+- `feature/add-bedrock-provider` - New features
 - `fix/message-serialization` - Bug fixes
 - `docs/update-quickstart` - Documentation
-- `refactor/simplify-trace-events` - Refactoring
+- `refactor/simplify-memory-events` - Refactoring
 
 ### Commit Messages
 
@@ -115,9 +115,9 @@ Types:
 
 Examples:
 ```
-feat(adapters): add Bedrock adapter for AWS
+feat(llm): add Bedrock provider support
 
-fix(trace): prevent duplicate events in session
+fix(memory): prevent duplicate events in index
 
 docs(readme): add installation instructions for Windows
 ```
@@ -209,8 +209,8 @@ Group imports in this order:
 import json
 from dataclasses import dataclass
 
-from thoughtflow.agent import Agent
-from thoughtflow.trace import Session
+from thoughtflow.agent import AGENT
+from thoughtflow.memory import MEMORY
 ```
 
 ---
@@ -226,7 +226,7 @@ tests/
 │   ├── test_message.py
 │   └── ...
 └── integration/    # Requires API keys, slower
-    ├── test_openai_adapter.py
+    ├── test_llm_providers.py
     └── ...
 ```
 
@@ -295,9 +295,15 @@ THOUGHTFLOW_INTEGRATION_TESTS=1 pytest tests/integration/ -v
 ### Where Documentation Lives
 
 - `README.md` - Project overview, quick start
-- `docs/` - Full documentation (MkDocs)
+- `primitives/` - **Canonical API reference**, one file per primitive
+- `docs/` - Narrative documentation (MkDocs): quickstart, concepts, philosophy
 - Docstrings - API reference (auto-generated)
 - `examples/` - Runnable code examples
+
+**Single source of truth rule:** `primitives/*.md` is the canonical API
+reference. `docs/` is the narrative layer and must never duplicate API
+tables — link to the primitive doc instead. Update `primitives/*.md` in the
+same commit as any API change it documents.
 
 ### Building Docs Locally
 
@@ -386,7 +392,7 @@ When contributing, please keep these principles in mind:
 ✅ Reduces complexity somewhere
 ✅ Improves determinism or replayability
 ✅ Adds capability without increasing surface area
-✅ Strengthens adapter correctness
+✅ Strengthens provider correctness
 ✅ Adds examples that teach patterns
 
 ### What Risky Contributions Look Like

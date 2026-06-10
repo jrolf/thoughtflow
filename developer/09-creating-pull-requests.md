@@ -124,8 +124,8 @@ Fixes #
 Follow commit message format:
 
 ```
-feat(adapters): add AWS Bedrock adapter
-fix(trace): prevent duplicate events in session
+feat(llm): add AWS Bedrock provider
+fix(memory): prevent duplicate events when rehydrating from JSON
 docs(quickstart): add Windows installation instructions
 ```
 
@@ -134,8 +134,8 @@ docs(quickstart): add Windows installation instructions
 ```markdown
 ## Description
 
-Adds a new adapter for AWS Bedrock, allowing ThoughtFlow to work with
-Amazon's managed LLM service. The adapter supports:
+Adds AWS Bedrock as an LLM provider, allowing ThoughtFlow to work with
+Amazon's managed LLM service. The provider supports:
 - Claude models via Bedrock
 - Titan models
 - Streaming responses
@@ -152,17 +152,17 @@ Fixes #42
 
 ## Implementation Details
 
-The adapter uses boto3 to communicate with Bedrock. It follows the same
-pattern as other adapters:
-- Lazy client initialization
-- Message format translation
-- Capability reporting
+The provider is a `_call_bedrock` method in llm.py using stdlib urllib,
+following the same pattern as the other providers:
+- Dispatch entry in LLM.call()
+- PROVIDER_ROLE_MAP entry for role translation
+- Structured output via the provider's native mechanism
 
 ## Testing
 
-- Added unit tests for BedrockAdapter
+- Added unit tests with a monkeypatched transport
 - Tested manually with Claude on Bedrock
-- Integration tests are skipped without AWS credentials
+- Integration tests gated by THOUGHTFLOW_INTEGRATION_TESTS=1
 ```
 
 ---

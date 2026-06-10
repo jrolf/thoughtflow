@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Run unit tests
+        run: pytest tests/unit -q
+
+  # Zero-dependency proof: the core must import and pass tests with nothing
+  # installed beyond the package itself and pytest.
+  zero-deps:
+    name: Zero-dependency install check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package only
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Verify import with no extra dependencies
+        run: |
+          python -c "import thoughtflow; print('ThoughtFlow', thoughtflow.__version__, 'imports clean')"
+          pip install pytest
+          pytest tests/unit -q

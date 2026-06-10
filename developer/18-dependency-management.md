@@ -6,7 +6,7 @@ Managing dependencies in ThoughtFlow.
 
 ## Dependency Philosophy
 
-ThoughtFlow has **zero core dependencies**. All provider integrations are optional extras.
+ThoughtFlow has **zero core dependencies**. Provider integrations are built on the standard library (`urllib`, `json`), so they add no dependencies either. The only extras are for development and documentation tooling.
 
 ---
 
@@ -23,8 +23,6 @@ dependencies = []  # None!
 
 ```toml
 [project.optional-dependencies]
-openai = ["openai>=1.0"]
-anthropic = ["anthropic>=0.18"]
 dev = ["pytest>=7.0", "ruff>=0.1", "mypy>=1.0"]
 docs = ["mkdocs>=1.5", "mkdocs-material>=9.0"]
 ```
@@ -35,23 +33,22 @@ docs = ["mkdocs>=1.5", "mkdocs-material>=9.0"]
 
 ### For Core (Rare)
 
-Only add if absolutely necessary:
+The zero-dependency constraint is a design pillar, not a preference. New providers and primitives must be implemented with the standard library — see [15-adding-providers.md](15-adding-providers.md). Adding a core dependency requires maintainer sign-off:
 
 ```toml
 [project]
 dependencies = [
-    "new-essential-dep>=1.0",
+    "new-essential-dep>=1.0",  # Almost never
 ]
 ```
 
-### For Optional Feature
+### For Tooling
 
 ```toml
 [project.optional-dependencies]
-newfeature = ["new-dep>=1.0"]
-all-providers = [
-    "thoughtflow[openai]",
-    "thoughtflow[newfeature]",  # Add here
+dev = [
+    "pytest>=7.0",
+    "new-dev-tool>=1.0",  # Add here
 ]
 ```
 

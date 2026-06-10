@@ -12,7 +12,7 @@ Prerequisites:
     export GROQ_API_KEY=gsk_...
 
 Run:
-    python examples/06_multi_provider.py
+    python examples/scripts/06_multi_provider.py
 """
 
 import os

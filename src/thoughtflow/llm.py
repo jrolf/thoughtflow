@@ -2,6 +2,12 @@
 LLM class for ThoughtFlow.
 
 A unified interface for calling various language model services.
+
+Also home to ThoughtFlow's record/replay system: LLM.record(memory) captures
+every exchange as MEMORY events, and LLM.replay(memory) returns a ReplayLLM
+that serves those recorded responses deterministically — offline, instant,
+and byte-identical. Because MEMORY is event-sourced, no separate session or
+trace machinery is needed: the memory IS the recording.
 """
 
 from __future__ import annotations
@@ -9,6 +15,12 @@ from __future__ import annotations
 import json
 import urllib.request
 import urllib.error
+
+from thoughtflow._util import exchange_key, TRANSPORT_PARAM_KEYS
+
+
+class ReplayMissError(KeyError):
+    """Raised when a ReplayLLM receives a request that was never recorded."""
 
 
 # Maps ThoughtFlow-internal roles to each provider's accepted role strings.
@@ -86,6 +98,9 @@ class LLM:
         self.last_params = {} 
         self.default_params = {}
 
+        # Optional MEMORY that receives a record of every exchange
+        self._record_memory = kwargs.pop('record', None)
+
         # Recognized constructor-level defaults; anything else is passed
         # through as a provider-specific param (e.g. ollama_url).
         for k, v in kwargs.items():
@@ -94,6 +109,89 @@ class LLM:
 
         # Make the object directly callable
         self.__call__ = self.call
+
+    def record(self, memory):
+        """
+        Start recording every exchange into the given MEMORY.
+
+        Each subsequent call() appends an exchange event (request + response,
+        keyed by content hash) to the memory. Save the memory and use
+        LLM.replay() to re-run the flow deterministically without the network.
+
+        Args:
+            memory: A MEMORY instance, or None to stop recording.
+
+        Returns:
+            self (for chaining: ``llm = LLM(...).record(memory)``).
+        """
+        self._record_memory = memory
+        return self
+
+    def _request_signature(self, msg_list, params, output_schema):
+        """Build the canonical (key, request) pair for an exchange.
+
+        Messages are structurally normalized but NOT provider-role-mapped,
+        and transport-only params are excluded — so the key depends purely
+        on logical content and survives endpoint changes.
+        """
+        clean_params = {
+            k: v for k, v in params.items() if k not in TRANSPORT_PARAM_KEYS
+        }
+        request = {
+            'messages': self._normalize_messages(msg_list),
+            'params': clean_params,
+            'output_schema': output_schema,
+        }
+        key = exchange_key(self.service, self.model, request)
+        return key, request
+
+    def _record_exchange(self, key, request, choices):
+        """Append one exchange event to the recording memory (if any)."""
+        if self._record_memory is None:
+            return
+        self._record_memory.add_exchange(
+            kind='chat',
+            key=key,
+            service=self.service,
+            model=self.model,
+            request=request,
+            response=list(choices),
+        )
+
+    def _record_stream(self, gen, key, request):
+        """Wrap a streaming generator so the joined text is recorded on completion."""
+        chunks = []
+        for chunk in gen:
+            chunks.append(chunk)
+            yield chunk
+        self._record_exchange(key, request, ["".join(chunks)])
+
+    @classmethod
+    def replay(cls, memory, on_miss='raise', model_id=None):
+        """
+        Build a ReplayLLM that serves responses recorded in the given MEMORY.
+
+        The returned object is call-compatible with LLM, so it can be handed
+        to any THOUGHT, AGENT, or WORKFLOW in place of a live model. Requests
+        are matched by content hash; flows replay deterministically, offline,
+        with no API keys.
+
+        Args:
+            memory: A MEMORY containing recorded exchanges (see LLM.record).
+            on_miss: 'raise' (default) to fail loudly on an unrecorded
+                request, or a live LLM instance to fall back to.
+            model_id: 'service:model' to replay as. Only needed when the
+                memory contains recordings from more than one model.
+
+        Returns:
+            ReplayLLM
+
+        Example:
+            >>> recorded = MEMORY.from_json('session.json')
+            >>> llm = LLM.replay(recorded)
+            >>> memory = my_flow(MEMORY(), llm)   # deterministic, offline
+        """
+        return ReplayLLM(memory, on_miss=on_miss, model_id=model_id)
 
     def _normalize_messages(self, msg_list):
         """
@@ -229,27 +327,40 @@ class LLM:
         merged = {**self.default_params, **params}
         self.last_params = dict(merged)
 
+        # Compute the exchange signature up front (params are mutated by the
+        # provider methods) so recording sees the canonical request.
+        recording = self._record_memory is not None
+        if recording:
+            key, request = self._request_signature(msg_list, merged, output_schema)
+
         if stream:
-            return self._stream(msg_list, merged, output_schema)
+            gen = self._stream(msg_list, merged, output_schema)
+            if recording:
+                return self._record_stream(gen, key, request)
+            return gen
 
         call_params = dict(merged)
         if output_schema:
             call_params['_output_schema'] = output_schema
 
         if self.service == 'openai':
-            return self._call_openai(msg_list, call_params)
+            choices = self._call_openai(msg_list, call_params)
         elif self.service == 'groq':
-            return self._call_groq(msg_list, call_params)
+            choices = self._call_groq(msg_list, call_params)
         elif self.service == 'anthropic':
-            return self._call_anthropic(msg_list, call_params)
+            choices = self._call_anthropic(msg_list, call_params)
         elif self.service == 'ollama':
-            return self._call_ollama(msg_list, call_params)
+            choices = self._call_ollama(msg_list, call_params)
         elif self.service == 'gemini':
-            return self._call_gemini(msg_list, call_params)
+            choices = self._call_gemini(msg_list, call_params)
         elif self.service == 'openrouter':
-            return self._call_openrouter(msg_list, call_params)
+            choices = self._call_openrouter(msg_list, call_params)
         else:
             raise ValueError("Unsupported service '{}'.".format(self.service))
+
+        if recording:
+            self._record_exchange(key, request, choices)
+        return choices
 
     def _call_openai(self, msg_list, params):
         url, headers, is_local = self._resolve_openai_transport(params)
@@ -411,7 +522,7 @@ class LLM:
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
             "HTTP-Referer": params.get("referer", "https://your-app.com"),
-            "X-Title": params.get("title", "Thoughtflow"),
+            "X-Title": params.get("title", "ThoughtFlow"),
         }
         res = self._send_request(url, data, headers)
         choices = [a["message"]["content"] for a in res.get("choices", [])]
@@ -525,7 +636,7 @@ class LLM:
                 "Authorization": "Bearer " + self.api_key,
                 "Content-Type": "application/json",
                 "HTTP-Referer": params.get("referer", "https://your-app.com"),
-                "X-Title": params.get("title", "Thoughtflow"),
+                "X-Title": params.get("title", "ThoughtFlow"),
             }
         elif self.service == 'ollama':
             base_url = params.get("ollama_url", "http://localhost:11434")
@@ -655,6 +766,109 @@ class LLM:
             return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}
         except Exception as e:
             return {"error": str(e)}  
+
+
+class ReplayLLM(LLM):
+    """
+    An LLM that serves recorded responses instead of calling the network.
+
+    ReplayLLM is the other half of ThoughtFlow's record/replay system. Feed
+    it a MEMORY that contains recorded exchanges (created via LLM.record),
+    and it answers every call() by content-hash lookup: same request in,
+    same response out. Deterministic, offline, instant.
+
+    Repeated identical requests are served in their recorded order; once
+    recordings for a key are exhausted, the last response repeats (a given
+    request always has an answer once it has one).
+
+    Construct via LLM.replay(memory) or directly.
+
+    Example:
+        >>> live = LLM("openai:gpt-4o", key="sk-...").record(memory)
+        >>> memory = my_flow(memory)          # hits the API, records
+        >>> memory.to_json("session.json")
+        >>>
+        >>> recorded = MEMORY.from_json("session.json")
+        >>> llm = LLM.replay(recorded)
+        >>> memory2 = my_flow(MEMORY())       # no network, same outputs
+    """
+
+    def __init__(self, memory, on_miss='raise', model_id=None):
+        """
+        Args:
+            memory: MEMORY containing recorded 'chat' exchanges.
+            on_miss: 'raise' to raise ReplayMissError on unrecorded requests
+                (default — fail loudly), or a live LLM instance to fall back
+                to (useful for re-recording drifted flows).
+            model_id: 'service:model' to replay as. Optional when the memory
+                contains recordings from exactly one model.
+        """
+        exchanges = memory.get_exchanges(kind='chat')
+
+        identities = {(e.get('service'), e.get('model')) for e in exchanges}
+        if model_id is not None:
+            service, model = model_id.split(':', 1)
+        elif len(identities) == 1:
+            service, model = next(iter(identities))
+        elif len(identities) == 0:
+            service, model = 'replay', 'empty'
+        else:
+            raise ValueError(
+                "Memory contains recordings from multiple models ({}). "
+                "Pass model_id='service:model' to choose one.".format(
+                    ", ".join(sorted("{}:{}".format(s, m) for s, m in identities))
+                )
+            )
+
+        super().__init__(model_id="{}:{}".format(service, model), key='replay')
+        self.on_miss = on_miss
+
+        # key -> list of recorded responses, in chronological order
+        self._responses = {}
+        self._cursor = {}
+        for e in exchanges:
+            if (e.get('service'), e.get('model')) != (service, model):
+                continue
+            self._responses.setdefault(e['key'], []).append(e.get('response', []))
+            self._cursor[e['key']] = 0
+
+    def call(self, msg_list, params={}, output_schema=None, stream=False):
+        """
+        Serve a recorded response for the given request.
+
+        Matches by content hash of (normalized messages, params minus
+        transport keys, output_schema, service, model) — exactly the key
+        used at record time.
+        """
+        merged = {**self.default_params, **params}
+        self.last_params = dict(merged)
+
+        key, _request = self._request_signature(msg_list, merged, output_schema)
+        recorded = self._responses.get(key)
+
+        if recorded is None:
+            if self.on_miss == 'raise' or self.on_miss is None:
+                raise ReplayMissError(
+                    "No recorded response for this request (key={}). The flow "
+                    "has drifted from the recording. Re-record the session, or "
+                    "construct the ReplayLLM with on_miss=<live LLM> to fall "
+                    "back.".format(key)
+                )
+            # Fall back to a live LLM
+            return self.on_miss.call(
+                msg_list, params=params, output_schema=output_schema, stream=stream
+            )
+
+        idx = min(self._cursor[key], len(recorded) - 1)
+        self._cursor[key] += 1
+        choices = list(recorded[idx])
+
+        if stream:
+            def _single_yield():
+                for text in choices[:1]:
+                    yield text
+            return _single_yield()
+        return choices
 
 
 class OpenAICompatibleLLM(LLM):

@@ -12,7 +12,7 @@ repo_name: jrolf/thoughtflow
 repo_url: https://github.com/jrolf/thoughtflow
 edit_uri: edit/main/docs/
 
-copyright: Copyright &copy; 2025 James A. Rolfsen
+copyright: Copyright &copy; 2026 James A. Rolfsen
 
 theme:
   name: material
@@ -50,12 +50,13 @@ nav:
   - Getting Started:
     - Quick Start: quickstart.md
   - Concepts:
-    - Agent: concepts/agent.md
-    - Adapters: concepts/adapters.md
-    - Tools: concepts/tools.md
+    - LLM: concepts/llm.md
     - Memory: concepts/memory.md
-    - Tracing: concepts/tracing.md
-  - API Reference: api/
+    - Agent: concepts/agent.md
+    - Tools: concepts/tools.md
+    - Deterministic Replay: concepts/replay.md
+    - RAG: concepts/rag.md
+  - API Reference: https://github.com/jrolf/thoughtflow/tree/main/primitives
   - Contributing: contributing.md
   - Changelog: changelog.md
 

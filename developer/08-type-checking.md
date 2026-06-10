@@ -245,11 +245,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from thoughtflow.adapters.base import Adapter
+    from thoughtflow.llm import LLM
 
-class Agent:
-    def __init__(self, adapter: Adapter) -> None:
-        self.adapter = adapter
+class AGENT:
+    def __init__(self, llm: LLM) -> None:
+        self.llm = llm
 ```
 
 This avoids circular imports and runtime import overhead.

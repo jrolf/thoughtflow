@@ -1,8 +1,14 @@
-# Thoughtflow: New Primitives Strategy
+# ThoughtFlow: Primitives Design Strategy
 
-This document defines the next wave of primitives for Thoughtflow. Its purpose is to establish precise conceptual boundaries between each new primitive, explain how each one relates to the existing foundation (LLM, MEMORY, THOUGHT, ACTION, CHAT), and lay out the implementation sequence so that each primitive can build on the ones before it.
+> **Historical design document.** This strategy guided the build-out of the
+> higher-level primitives (TOOL, MCP, AGENT, DELEGATE, WORKFLOW, CHRON,
+> SEARCH, SCRAPE, and the action verbs), all of which are now implemented.
+> It is preserved here because the conceptual boundaries it draws between
+> primitives remain the canonical rationale for the library's shape.
 
-The guiding constraint throughout: **Thoughtflow has zero dependencies outside the Python standard library.** Every primitive below must be implementable with `urllib`, `json`, `subprocess`, `socket`, and the rest of the stdlib. Provider-specific SDKs remain optional extras, never requirements.
+This document defines the next wave of primitives for ThoughtFlow. Its purpose is to establish precise conceptual boundaries between each new primitive, explain how each one relates to the existing foundation (LLM, MEMORY, THOUGHT, ACTION, CHAT), and lay out the implementation sequence so that each primitive can build on the ones before it.
+
+The guiding constraint throughout: **ThoughtFlow has zero dependencies outside the Python standard library.** Every primitive below must be implementable with `urllib`, `json`, `subprocess`, `socket`, and the rest of the stdlib. Provider-specific SDKs remain optional extras, never requirements.
 
 ---
 
@@ -20,7 +26,7 @@ Before defining anything new, it helps to name exactly what already exists and w
 | **ACTION** | Imperative operation wrapper with logging, timing, and result storage | `memory = action(memory, **kwargs)` |
 | **CHAT** | Interactive human-in-the-loop conversation wrapper | `chat.run()` or `response = chat.turn(input)` |
 
-The fundamental Thoughtflow contract is: **`memory = primitive(memory)`**. New primitives should preserve this wherever it makes sense.
+The fundamental ThoughtFlow contract is: **`memory = primitive(memory)`**. New primitives should preserve this wherever it makes sense.
 
 ---
 
@@ -93,18 +99,18 @@ result = search_tool(arguments={"query": "latest news"})
 **Key design points:**
 
 - `TOOL(name, description, parameters, fn)` — minimal required surface
-- `.to_schema()` returns the dict structure that LLM providers expect (OpenAI function-calling format as the canonical shape, with adapter methods for other providers if needed)
+- `.to_schema()` returns the dict structure that LLM providers expect (OpenAI function-calling format as the canonical shape, with per-provider variants derived from it if needed)
 - `.from_action(action, description, parameters)` — promote an ACTION to a TOOL
 - Execution is traceable (integrates with the trace/events system's existing `TOOL_CALL` / `TOOL_RESULT` event types)
-- Tools are stubbable: a `TOOL(... fn=mock_fn)` supports deterministic testing, consistent with Thoughtflow's testing philosophy
+- Tools are stubbable: a `TOOL(... fn=mock_fn)` supports deterministic testing, consistent with ThoughtFlow's testing philosophy
 
 ---
 
 ### 3. MCP
 
-**What it is.** MCP is a client that connects to one or more Model Context Protocol servers and discovers their available tools. It speaks the MCP protocol (JSON-RPC over stdio or HTTP+SSE) using only the Python standard library, and it returns TOOL instances that integrate seamlessly with the rest of Thoughtflow.
+**What it is.** MCP is a client that connects to one or more Model Context Protocol servers and discovers their available tools. It speaks the MCP protocol (JSON-RPC over stdio or HTTP+SSE) using only the Python standard library, and it returns TOOL instances that integrate seamlessly with the rest of ThoughtFlow.
 
-**Why it is a primitive and not a library integration.** MCP is not a wrapper around someone else's SDK. It is a protocol client built from scratch with `subprocess` (for stdio transport) and `urllib` / `http.client` (for HTTP+SSE transport). This is deliberate: Thoughtflow has no dependencies, and MCP's wire protocol (JSON-RPC 2.0) is simple enough to implement cleanly with stdlib. The result is a first-class Thoughtflow citizen, not an adapter around a third-party package.
+**Why it is a primitive and not a library integration.** MCP is not a wrapper around someone else's SDK. It is a protocol client built from scratch with `subprocess` (for stdio transport) and `urllib` / `http.client` (for HTTP+SSE transport). This is deliberate: ThoughtFlow has no dependencies, and MCP's wire protocol (JSON-RPC 2.0) is simple enough to implement cleanly with stdlib. The result is a first-class ThoughtFlow citizen, not a shim around a third-party package.
 
 **Relationship to TOOL.** MCP's output is TOOLs. When you connect to an MCP server and call `.list_tools()`, you get back a list of TOOL instances with their schemas already populated. These TOOLs can be handed directly to an AGENT. MCP is the discovery and transport layer; TOOL is the unit of capability.
 
@@ -192,7 +198,7 @@ chat.run()
 
 **Key design points:**
 
-- Preserves the Thoughtflow contract: `memory = agent(memory)`
+- Preserves the ThoughtFlow contract: `memory = agent(memory)`
 - Base AGENT implements: LLM call with tool schemas, tool-call parsing, tool execution, result injection, iteration control
 - Subclasses override: prompt construction strategy, response parsing, stop conditions, inter-step logic
 - `max_iterations` prevents runaway loops
@@ -214,7 +220,7 @@ The core delegation patterns:
 
 - **Broadcast** — Agent A sends the same task to multiple agents (B, C, D) and collects their responses. This is fan-out: parallel research, voting, or ensemble patterns.
 
-**Relationship to AGENT.** DELEGATE operates *between* AGENTs. It is not itself an agent — it is a coordination mechanism. A DELEGATE describes the relationship and the protocol (handoff vs. dispatch vs. broadcast), while the AGENTs do the actual work. DELEGATE transfers MEMORY (or a subset of it) from one agent to another, which is the natural Thoughtflow way of passing state.
+**Relationship to AGENT.** DELEGATE operates *between* AGENTs. It is not itself an agent — it is a coordination mechanism. A DELEGATE describes the relationship and the protocol (handoff vs. dispatch vs. broadcast), while the AGENTs do the actual work. DELEGATE transfers MEMORY (or a subset of it) from one agent to another, which is the natural ThoughtFlow way of passing state.
 
 **Core contract:**
 
@@ -242,7 +248,7 @@ result_memory = dispatch(source_memory)
 **Key design points:**
 
 - Three modes: `handoff`, `dispatch`, `broadcast`
-- MEMORY is the vehicle for passing state between agents — consistent with Thoughtflow's architecture
+- MEMORY is the vehicle for passing state between agents — consistent with ThoughtFlow's architecture
 - `context_filter` controls what subset of memory is transferred (full memory, last N messages, specific variables, etc.)
 - For `dispatch`, the result from the target agent is injected back into the source agent's memory
 - For `broadcast`, results from all target agents are collected and merged
@@ -255,7 +261,7 @@ result_memory = dispatch(source_memory)
 
 **What it is.** WORKFLOW is a lightweight orchestration primitive for composing THOUGHTs, ACTIONs, AGENTs, and DELEGATEs into non-linear execution flows. It supports sequential steps, conditional branching, parallel execution, and loops with exit conditions — but it does all of this in plain Python, not through a graph DSL or YAML configuration.
 
-**Why this is a primitive and not just "use Python."** You can absolutely build any workflow with plain Python `if/else`, `for` loops, and function calls — and Thoughtflow's philosophy encourages that for simple cases. WORKFLOW earns its place as a primitive because it adds three things that raw Python does not give you for free: **(1)** automatic tracing of every step in the workflow, **(2)** the ability to serialize, inspect, and replay a workflow's execution, and **(3)** a consistent interface for defining reusable, composable workflow patterns that other developers can read and understand without reverse-engineering imperative code.
+**Why this is a primitive and not just "use Python."** You can absolutely build any workflow with plain Python `if/else`, `for` loops, and function calls — and ThoughtFlow's philosophy encourages that for simple cases. WORKFLOW earns its place as a primitive because it adds three things that raw Python does not give you for free: **(1)** automatic tracing of every step in the workflow, **(2)** the ability to serialize, inspect, and replay a workflow's execution, and **(3)** a consistent interface for defining reusable, composable workflow patterns that other developers can read and understand without reverse-engineering imperative code.
 
 **Relationship to AGENT and PLAN.** PLAN generates a plan (a data structure describing steps). AGENT executes an autonomous loop. WORKFLOW is the connective tissue that says "run this THOUGHT, then if the result is X, run this AGENT, otherwise run that ACTION, then collect results and run this final THOUGHT." It is the explicit orchestrator — the conductor of the orchestra, where THOUGHTs, ACTIONs, and AGENTs are the musicians.
 
@@ -310,7 +316,7 @@ Streaming support means the LLM class can return tokens incrementally rather tha
 
 Structured output means the LLM can be constrained to produce a response matching a specific JSON schema, using the provider's native structured output API (OpenAI's `response_format`, Anthropic's tool-use-as-schema, etc.) rather than relying on post-hoc text parsing.
 
-**Implementation approach.** The LLM `.call()` method gains an `output_schema=` parameter that accepts a dict (JSON Schema). When provided, the LLM adapter formats it according to the provider's native structured output mechanism. THOUGHT gains an `output_schema=` config option that passes through to the LLM call and bypasses the text-based `valid_extract` parsing, since the response is guaranteed to conform. For providers that do not support native structured output, the system falls back to prompt-based enforcement and `valid_extract`.
+**Implementation approach.** The LLM `.call()` method gains an `output_schema=` parameter that accepts a dict (JSON Schema). When provided, the LLM's provider method formats it according to the provider's native structured output mechanism. THOUGHT gains an `output_schema=` config option that passes through to the LLM call and bypasses the text-based `valid_extract` parsing, since the response is guaranteed to conform. For providers that do not support native structured output, the system falls back to prompt-based enforcement and `valid_extract`.
 
 **Scope of impact:** LLM (primary — schema formatting per provider), THOUGHT (config option + parsing bypass).
 

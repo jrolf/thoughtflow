@@ -151,21 +151,15 @@ pytest tests/unit/ -v
 
 ---
 
-## Step 8: (Optional) Install Provider Dependencies
+## Step 8: (Optional) Install Extra Dependencies
 
-If you're working on specific adapters:
+Providers need no extra packages — they run on the standard library. The only extras are for development and docs:
 
 ```bash
-# For OpenAI adapter development
-pip install -e ".[openai]"
+# For building documentation
+pip install -e ".[docs]"
 
-# For Anthropic adapter development
-pip install -e ".[anthropic]"
-
-# For all providers
-pip install -e ".[all-providers]"
-
-# For everything (dev + docs + all providers)
+# For everything (dev + docs)
 pip install -e ".[all]"
 ```
 

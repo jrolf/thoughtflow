@@ -10,7 +10,7 @@ Prerequisites:
     pip install thoughtflow
 
 Run:
-    python examples/04_valid_extract.py
+    python examples/scripts/04_valid_extract.py
 """
 
 from thoughtflow import valid_extract, ValidExtractError
