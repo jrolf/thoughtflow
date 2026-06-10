@@ -16,8 +16,14 @@ parts of the loop to implement different agentic methodologies.
 from __future__ import annotations
 
 import json
+import re
 
 from thoughtflow._util import event_stamp
+
+_FENCED_JSON_RE = re.compile(
+    r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 class AGENT:
@@ -227,6 +233,23 @@ class AGENT:
             params["tools"] = [t.to_schema() for t in self.tools]
         return params
 
+    @staticmethod
+    def _strip_markdown_fences(response):
+        """
+        Strip wrapping markdown code fences from an LLM response.
+
+        Only removes outer ``` / ```json fences. Inline backticks inside JSON
+        string values are left untouched.
+        """
+        if not response:
+            return response
+
+        match = _FENCED_JSON_RE.match(response)
+        if match:
+            return match.group(1).strip()
+
+        return response
+
     def _parse_tool_calls(self, response):
         """
         Extract tool-call requests from an LLM response.
@@ -247,6 +270,8 @@ class AGENT:
         """
         if not response:
             return []
+
+        response = self._strip_markdown_fences(response)
 
         # Try to parse as JSON
         try:

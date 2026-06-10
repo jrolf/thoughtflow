@@ -303,6 +303,91 @@ class TestMessageOperations:
         assert memory.last_user_msg(content_only=True) == ''
 
 
+class TestResultMessageOperations:
+    """Tests for result-role message accessors."""
+
+    def test_last_result_msg_returns_full_event(self, memory):
+        """last_result_msg must return the full event dict by default."""
+        memory.add_msg('result', 'First result')
+        memory.add_msg('result', 'Last result')
+
+        result = memory.last_result_msg()
+        assert isinstance(result, dict)
+        assert result['content'] == 'Last result'
+        assert result['role'] == 'result'
+
+    def test_last_result_msg_content_only(self, memory):
+        """last_result_msg(content_only=True) must return just the content string."""
+        memory.add_msg('result', 'Tool output')
+
+        assert memory.last_result_msg(content_only=True) == 'Tool output'
+
+    def test_last_result_msg_returns_none_if_none(self, memory):
+        """last_result_msg must return None if no result messages exist."""
+        assert memory.last_result_msg() is None
+
+    def test_last_result_msg_content_only_returns_empty_if_none(self, memory):
+        """last_result_msg(content_only=True) must return empty string if no messages."""
+        assert memory.last_result_msg(content_only=True) == ''
+
+
+class TestMessageMetadata:
+    """Tests for per-message metadata on MEMORY events."""
+
+    def test_add_msg_stores_metadata(self, memory):
+        """add_msg must persist optional metadata on the stored event."""
+        memory.add_msg(
+            'system',
+            'RAG context',
+            channel='webapp',
+            metadata={'internal': True, 'source': 'rag'},
+        )
+
+        msgs = memory.get_msgs()
+        assert msgs[0]['metadata'] == {'internal': True, 'source': 'rag'}
+
+    def test_add_msg_omits_empty_metadata(self, memory):
+        """add_msg must not add a metadata key when metadata is omitted."""
+        memory.add_msg('user', 'Hello', channel='webapp')
+
+        assert 'metadata' not in memory.get_msgs()[0]
+
+    def test_add_msg_rejects_non_dict_metadata(self, memory):
+        """add_msg must reject non-dict metadata values."""
+        with pytest.raises(ValueError, match='metadata must be a dict'):
+            memory.add_msg('user', 'Hello', channel='webapp', metadata='bad')
+
+    def test_get_msgs_exclude_metadata(self, memory):
+        """get_msgs(exclude_metadata=...) must hide tagged internal messages."""
+        memory.add_msg('user', 'Visible question', channel='webapp')
+        memory.add_msg(
+            'system',
+            'Hidden RAG context',
+            channel='webapp',
+            metadata={'internal': True},
+        )
+        memory.add_msg('assistant', 'Visible answer', channel='webapp')
+
+        visible = memory.get_msgs(exclude_metadata={'internal': True})
+        contents = [msg['content'] for msg in visible]
+
+        assert contents == ['Visible question', 'Visible answer']
+
+    def test_get_msgs_metadata_filter(self, memory):
+        """get_msgs(metadata_filter=...) must keep only matching messages."""
+        memory.add_msg('system', 'Public system prompt', channel='webapp')
+        memory.add_msg(
+            'system',
+            'Hidden RAG context',
+            channel='webapp',
+            metadata={'internal': True},
+        )
+
+        internal = memory.get_msgs(metadata_filter={'internal': True})
+        assert len(internal) == 1
+        assert internal[0]['content'] == 'Hidden RAG context'
+
+
 # ============================================================================
 # Log Operation Tests
 # ============================================================================

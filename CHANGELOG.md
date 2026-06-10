@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.3] - 2026-06-10
+
+### Added
+- `MEMORY.last_result_msg()` — convenience accessor for the most recent `result` role message (mirrors `last_user_msg`, `last_log_msg`, etc.)
+- `MEMORY.add_msg(..., metadata=...)` — optional per-message metadata dict for UI and RAG tagging (e.g. `{'internal': True}`)
+- `MEMORY.get_msgs(..., metadata_filter=..., exclude_metadata=...)` — filter messages by metadata for UI-visible history
+- `AGENT._strip_markdown_fences()` — strips wrapping markdown code fences before JSON tool-call parsing
+- Unit tests for all of the above
+
+### Fixed
+- Pre-commit `block-ai-trailer` hook now passes the commit message filename (required by `block-ai-contributors.sh`)
+- Closes [#14](https://github.com/jrolf/thoughtflow/issues/14) — message metadata for UI filtering
+
+---
+
 ## [0.1.2] - 2026-04-01
 
 ### Added

@@ -19,7 +19,7 @@ repos:
         entry: hooks/block-ai-contributors.sh message
         language: script
         always_run: true
-        pass_filenames: false
+        pass_filenames: true
         stages: [commit-msg]
 
       - id: ruff-check

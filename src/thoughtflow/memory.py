@@ -80,7 +80,7 @@ class MEMORY:
         valid_channels (set): Set of valid communication channels.
 
     Methods:
-        add_msg(role, content, mode='text', channel='unknown'): Add a message event with channel.
+        add_msg(role, content, mode='text', channel='unknown', metadata=None): Add a message event with channel and optional metadata.
         add_log(message): Add a log event.
         add_ref(content): Add a reflection event.
         get_msgs(...): Retrieve messages with filtering (supports channel filter).
@@ -91,6 +91,7 @@ class MEMORY:
         last_asst_msg(): Get the last assistant message content.
         last_sys_msg(): Get the last system message content.
         last_log_msg(): Get the last log message content.
+        last_result_msg(): Get the last result message.
         prepare_context(...): Prepare messages for LLM with smart truncation of old messages.
         set_var(key, value, desc=''): Set a variable (appends to history, auto-converts large values to objects).
         del_var(key): Mark a variable as deleted (preserves history).
@@ -302,7 +303,7 @@ class MEMORY:
 
     #--- Public Methods ---
 
-    def add_msg(self, role, content, mode='text', channel='unknown'):
+    def add_msg(self, role, content, mode='text', channel='unknown', metadata=None):
         """
         Add a message event with channel tracking.
         
@@ -311,6 +312,8 @@ class MEMORY:
             content: Message content
             mode: Communication mode (text, audio, voice)
             channel: Communication channel (webapp, ios, telegram, etc.)
+            metadata: Optional dict of extension metadata (e.g. {'internal': True}
+                for UI-hidden RAG context). Omitted from the stored event when empty.
         """
         if role not in self.valid_roles:
             raise ValueError("Invalid role '{}'. Must be one of: {}".format(role, sorted(self.valid_roles)))
@@ -318,6 +321,8 @@ class MEMORY:
             raise ValueError("Invalid mode '{}'. Must be one of: {}".format(mode, sorted(self.valid_modes)))
         if channel not in self.valid_channels:
             raise ValueError("Invalid channel '{}'. Must be one of: {}".format(channel, sorted(self.valid_channels)))
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("metadata must be a dict or None")
         
         stamp = event_stamp({'role': role, 'content': content})
         msg = {
@@ -330,6 +335,8 @@ class MEMORY:
             'dt_bog'  : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'  : str(dtt.datetime.now(tz_utc))[:23],
         }
+        if metadata:
+            msg['metadata'] = metadata
         self._store_event('msg', msg)
 
     def add_log(self, message):
@@ -372,12 +379,22 @@ class MEMORY:
 
     #---
 
+    @staticmethod
+    def _metadata_matches(event, metadata_filter):
+        """Return True when every key in metadata_filter matches the event metadata."""
+        if not metadata_filter:
+            return True
+        meta = event.get('metadata') or {}
+        return all(meta.get(key) == value for key, value in metadata_filter.items())
+
     def get_msgs(self, 
                  limit=-1, 
                  include=None, 
                  exclude=None, 
                  repr='list',
                  channel=None,
+                 metadata_filter=None,
+                 exclude_metadata=None,
                 ):
         """
         Get messages with flexible filtering.
@@ -388,6 +405,10 @@ class MEMORY:
             exclude: List of roles to exclude (None = none)
             repr: Output format ('list', 'str', 'pprint1')
             channel: Filter by channel (None = all)
+            metadata_filter: Keep only messages whose metadata matches all
+                key-value pairs (e.g. {'internal': True})
+            exclude_metadata: Drop messages whose metadata matches all
+                key-value pairs (e.g. {'internal': True} for UI-visible history)
             
         Returns:
             Messages in the specified format
@@ -403,6 +424,10 @@ class MEMORY:
             events = [e for e in events if e.get('role') not in exclude]
         if channel:
             events = [e for e in events if e.get('channel') == channel]
+        if metadata_filter:
+            events = [e for e in events if self._metadata_matches(e, metadata_filter)]
+        if exclude_metadata:
+            events = [e for e in events if not self._metadata_matches(e, exclude_metadata)]
         
         if limit > 0:
             events = events[-limit:]
@@ -541,6 +566,23 @@ class MEMORY:
         if not logs:
             return '' if content_only else None
         return logs[-1]['content'] if content_only else logs[-1]
+
+    def last_result_msg(self, content_only=False):
+        """
+        Get the last result message.
+
+        Args:
+            content_only: If True, return just the content string.
+                          If False (default), return the full event dict.
+
+        Returns:
+            dict or str: Full event dict, or content string if content_only=True.
+                         Returns None (or '' if content_only) if no result messages.
+        """
+        msgs = self.get_msgs(include=['result'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
 
     def last_ref(self, content_only=False):
         """
