@@ -1546,7 +1546,7 @@ class TestPlanValidation:
         valid, reason = plan.validate(missing_param)
         
         assert valid is False
-        assert "requires param 'query'" in reason
+        assert "requires params: query" in reason
 
     def test_rejects_step_not_list(self, mock_llm):
         """

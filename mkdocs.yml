@@ -52,6 +52,7 @@ nav:
   - Concepts:
     - LLM: concepts/llm.md
     - Memory: concepts/memory.md
+    - Thought: concepts/thought.md
     - Agent: concepts/agent.md
     - Tools: concepts/tools.md
     - Deterministic Replay: concepts/replay.md

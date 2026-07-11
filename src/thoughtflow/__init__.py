@@ -43,6 +43,8 @@ from __future__ import annotations
 
 # Core primitives
 from thoughtflow.llm import LLM, OpenAICompatibleLLM, ReplayLLM, ReplayMissError
+from thoughtflow.llm_cache import cached_system, cached_message
+from thoughtflow.providers import GroqLLM, CerebrasLLM, OpenRouterLLM
 from thoughtflow.embed import EMBED, ReplayEMBED
 from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
@@ -103,7 +105,7 @@ try:
 
     __version__ = _get_version("thoughtflow")
 except Exception:
-    __version__ = "0.0.0"
+    __version__ = "0.2.2"
 
 # Public API
 __all__ = [
@@ -112,6 +114,11 @@ __all__ = [
     "OpenAICompatibleLLM",
     "ReplayLLM",
     "ReplayMissError",
+    "GroqLLM",
+    "CerebrasLLM",
+    "OpenRouterLLM",
+    "cached_system",
+    "cached_message",
     "EMBED",
     "ReplayEMBED",
     "MEMORY",

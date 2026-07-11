@@ -244,7 +244,13 @@ def construct_msgs(
 #############################################################################
 
 class ValidExtractError(ValueError):
-    """Raised when extraction or validation fails."""
+    """
+    Raised when extraction or schema validation fails in valid_extract.
+
+    THOUGHT catches this in parse_response and re-raises as ValueError with
+    prefix "Schema-based parsing failed:" so _execute_llm_call can classify
+    failure_kind as schema and humanize repair text.
+    """
 
 def valid_extract(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
     """
@@ -265,11 +271,12 @@ def valid_extract(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
           * {}          : dict of anything
           * {'k': sch}  : dict with required key 'k' matching 'sch'
           * {'k?': sch} : OPTIONAL key 'k' (if present, must match 'sch')
+          * {'oneOf': [sch1, sch2, ...]} : optional dialect; first matching branch wins
           * '' or str   : str
           * 0 or int    : int
           * 0.0 or float: float
           * True/False or bool: bool
-          * None        : NoneType
+          * None        : NoneType (value must be null — not "optional field"; use 'k?' instead)
 
     Returns
     -------
@@ -292,6 +299,20 @@ def valid_extract(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
     >>> txt = "noise { 'num_list':[1,2], 'my_info':{'x':1}, 'name':'Ada' } trailing"
     >>> valid_extract(txt, rules)
     {'num_list': [1, 2], 'my_info': {'x': 1}, 'name': 'Ada'}
+
+    Branch-shaped classification (oneOf dialect — first matching branch wins):
+
+    >>> rules = {
+    ...     'kind': 'python',
+    ...     'format': {
+    ...         'oneOf': [
+    ...             {'verdict': 'found', 'matched_span': ''},
+    ...             {'verdict': 'absent', 'note': ''},
+    ...         ]
+    ...     }
+    ... }
+    >>> valid_extract("{'verdict': 'absent', 'note': 'gone'}", rules)
+    {'verdict': 'absent', 'note': 'gone'}
     """
     if not isinstance(parsing_rules, Mapping):
         raise ValidExtractError("parsing_rules must be a mapping.")
@@ -315,7 +336,9 @@ def valid_extract(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
         ok, msg = _validate_schema(obj, schema)
         if ok:
             return obj
-        last_err = ValidExtractError("Validation failed for candidate: {}".format(msg))
+        last_err = ValidExtractError(
+            humanize_schema_error("Validation failed for candidate: {}".format(msg), schema)
+        )
 
     # If we got here, nothing parsed+validated.
     if last_err:
@@ -381,14 +404,22 @@ def _parse_segment(segment: str, kind: str = "python") -> Any:
 
     raise ValidExtractError("Unsupported kind: {!r}".format(kind))
 
+def _is_oneof_schema(schema: Any) -> bool:
+    """Return True when schema uses the optional oneOf dialect."""
+    return isinstance(schema, dict) and "oneOf" in schema and isinstance(schema["oneOf"], list)
+
+
 def _delims_for_schema(schema: Any) -> Tuple[Optional[str], Optional[str]]:
     """
     Infer top-level delimiters from the schema.
     - list-like → [ ]
     - dict-like → { }
+    - oneOf → { } (branches are usually dict-shaped)
     - tuple-like (if used) → ( )
     - string/number/bool/None → no delimiters (None, None)
     """
+    if _is_oneof_schema(schema):
+        return "{", "}"
     # list
     if isinstance(schema, list):
         return "[", "]"
@@ -473,10 +504,227 @@ def _schema_type(schema: Any) -> Union[type, Tuple[type, ...], None]:
         return tuple
     return None  # composite or unknown marker
 
+def format_schema_annotation(schema: Any) -> str:
+    """
+    Render a compact schema summary for error and repair messages.
+
+    Used by humanize_schema_error and THOUGHT repair suffixes so authors and
+    models see which keys are required vs optional without reading source.
+    Optional keys appear with a trailing ``?``. oneOf branches are labeled
+    ``branch 0``, ``branch 1``, etc.
+
+    Args:
+        schema: A valid_extract format schema (dict, list, or primitive exemplar).
+
+    Returns:
+        str: Compact annotation, e.g. ``{verdict: str, matched_span?: str}``.
+    """
+    if _is_oneof_schema(schema):
+        branches = []
+        for i, branch in enumerate(schema["oneOf"]):
+            branches.append("branch {}: {}".format(i, format_schema_annotation(branch)))
+        return "oneOf [{}]".format("; ".join(branches))
+    if isinstance(schema, dict):
+        parts = []
+        for key, subschema in schema.items():
+            base_key, optional = _is_optional_key(key)
+            label = base_key + ("?" if optional else "")
+            t = _schema_type(subschema)
+            if t is not None and t not in (list, dict, tuple):
+                parts.append("{}: {}".format(label, t.__name__))
+            elif isinstance(subschema, dict):
+                parts.append("{}: {{...}}".format(label))
+            elif isinstance(subschema, list):
+                parts.append("{}: [...]".format(label))
+            else:
+                parts.append("{}: ...".format(label))
+        return "{" + ", ".join(parts) + "}"
+    if isinstance(schema, list):
+        if len(schema) == 0:
+            return "[]"
+        if len(schema) == 1:
+            return "[{}]".format(format_schema_annotation(schema[0]))
+        return "[...]"
+    t = _schema_type(schema)
+    if t is not None:
+        return t.__name__
+    return repr(schema)
+
+
+def humanize_schema_error(message: str, schema: Any = None) -> str:
+    """
+    Turn internal schema errors into author-friendly text.
+
+    Transforms:
+      - JSONPath-style ``$.field`` prefixes into plain field names
+      - ``NoneType`` into ``null`` for model-facing repair text
+      - The None exemplar trap into guidance to use ``key?`` or omit the key
+      - Missing required key errors into ``?`` suffix reminders
+
+    When schema is provided, appends ``Expected schema: ...`` from
+    format_schema_annotation so repair prompts carry a compact shape hint.
+
+    Args:
+        message (str): Raw error from _validate_schema or ValidExtractError.
+        schema: Optional format schema for annotation suffix.
+
+    Returns:
+        str: Human-oriented message suitable for logs and repair suffixes.
+    """
+    text = message
+    if text.startswith("$."):
+        text = text[2:]
+    elif text.startswith("$:"):
+        text = text[2:].lstrip()
+
+    text = text.replace("NoneType", "null")
+    text = re.sub(r"^([^:]+): expected null, got dict", r"Field '\1' must be null but received an object. If the field is optional, use a '?' suffix on the key (e.g. '\1?') or omit it from the format dict. A bare None exemplar means the value must be null, not that the field is optional.", text)
+    text = re.sub(r"^([^:]+): expected null, got (\w+)", r"Field '\1' must be null but got \2", text)
+
+    if "missing required key" in text:
+        key_match = re.search(r"missing required key '([^']+)'", text)
+        if key_match:
+            key = key_match.group(1)
+            text = (
+                "Required key '{}' is missing. Mark optional keys with a '?' suffix "
+                "(e.g. '{}?'). {}".format(key, key, text)
+            )
+
+    if schema is not None:
+        text = "{}. Expected schema: {}".format(text, format_schema_annotation(schema))
+
+    return text
+
+
+def scan_none_exemplars(schema: Any, path: str = "format") -> list:
+    """
+    Find format paths where a bare None exemplar appears.
+
+    None exemplars mean the value must be Python null — almost always a mistake
+    when authors intended optional presence. Used by THOUGHT ``strict_schema=True``
+    construction check to fail fast in CI before production harnesses hit confusing
+    retry loops.
+
+    Args:
+        schema: Format dict/list from parsing_rules.
+        path (str): Dot-path prefix for error messages (internal recursion).
+
+    Returns:
+        list: Paths like ``format.wish`` or ``format.oneOf[1].note``.
+    """
+    found = []
+    if schema is None:
+        return found
+    if isinstance(schema, dict):
+        if _is_oneof_schema(schema):
+            for i, branch in enumerate(schema["oneOf"]):
+                found.extend(scan_none_exemplars(branch, "{}.oneOf[{}]".format(path, i)))
+            return found
+        for key, subschema in schema.items():
+            child_path = "{}.{}".format(path, key)
+            if subschema is None:
+                found.append(child_path)
+            else:
+                found.extend(scan_none_exemplars(subschema, child_path))
+    elif isinstance(schema, list):
+        for i, subschema in enumerate(schema):
+            found.extend(scan_none_exemplars(subschema, "{}[{}]".format(path, i)))
+    return found
+
+
+def extract_balanced_json(text: str) -> Optional[str]:
+    """
+    Return the first balanced JSON object or array substring from text.
+
+    Shared balanced scanner with valid_extract. THOUGHT ``parser='json'`` uses
+    this instead of greedy regex so prose with multiple braces does not produce
+    invalid spans from an early ``{`` to a distant ``}``.
+
+    Args:
+        text (str): Raw text, optionally after fence stripping.
+
+    Returns:
+        str or None: Balanced ``{...}`` or ``[...]`` substring, or None if not found.
+    """
+    text = text.strip()
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = text.find(open_ch)
+        if start == -1:
+            continue
+        slice_ = _balanced_slice(text, open_ch, close_ch)
+        if slice_ is not None:
+            return slice_
+    return None
+
+
+def extract_raw_object(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
+    """
+    Parse the first candidate segment without schema validation.
+
+    Rescue lane helper: when valid_extract rejects a structurally correct payload
+    (e.g. rigid schema, branch mismatch), THOUGHT may parse the object and defer
+    acceptance to the callable validator via validation_mode='rescue'.
+
+    Uses the same candidate-segment strategy as valid_extract (fences, balanced
+    slice, whole text) but skips _validate_schema.
+
+    Args:
+        raw_text (str): Raw LLM output.
+        parsing_rules (dict): Same shape as valid_extract (kind, format).
+
+    Returns:
+        Any: Parsed Python object.
+
+    Raises:
+        ValidExtractError: When no segment parses.
+    """
+    if not isinstance(parsing_rules, Mapping):
+        raise ValidExtractError("parsing_rules must be a mapping.")
+
+    kind = parsing_rules.get("kind", "python")
+    schema = parsing_rules.get("format", None)
+    if schema is None:
+        raise ValidExtractError("parsing_rules['format'] is required.")
+
+    last_err = None
+    for segment in _candidate_segments(raw_text, schema, prefer_fences_first=True):
+        try:
+            return _parse_segment(segment, kind=kind)
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err:
+        raise ValidExtractError(str(last_err))
+    raise ValidExtractError("No parseable candidates found.")
+
+
 def _validate_schema(obj: Any, schema: Any, path: str = "$") -> Tuple[bool, str]:
     """
-    Recursively validate 'obj' against 'schema'. Returns (ok, message).
+    Recursively validate obj against a valid_extract format schema.
+
+    Supports optional-key ``?`` suffix, composite dict/list schemas, primitive
+    exemplars (``''`` -> str, ``0`` -> int), and the optional ``oneOf`` dialect
+    where the first matching branch wins.
+
+    Args:
+        obj: Parsed Python object from LLM output.
+        schema: Format schema from parsing_rules.
+        path (str): JSONPath-style location for error messages.
+
+    Returns:
+        tuple: (ok, message). message is ``ok`` on success or a path-qualified reason.
     """
+    # Optional oneOf dialect — first matching branch wins (classification thoughts)
+    if _is_oneof_schema(schema):
+        errors = []
+        for i, branch in enumerate(schema["oneOf"]):
+            ok, msg = _validate_schema(obj, branch, path)
+            if ok:
+                return True, "ok"
+            errors.append("branch {}: {}".format(i, msg))
+        return False, "no oneOf branch matched ({})".format("; ".join(errors))
+
     # 1) Primitive types via exemplar or type
     t = _schema_type(schema)
     if t is not None and t not in (list, dict, tuple):
@@ -519,9 +767,20 @@ def _validate_schema(obj: Any, schema: Any, path: str = "$") -> Tuple[bool, str]
             if base_key not in obj:
                 if optional:
                     continue
-                return False, "{}: missing required key '{}'".format(path, base_key)
+                hint = (
+                    "{}: missing required key '{}'. Mark optional keys with a '?' suffix "
+                    "(e.g. '{}?').".format(path, base_key, base_key)
+                )
+                return False, hint
             ok, msg = _validate_schema(obj[base_key], subschema, "{}.{}".format(path, base_key))
             if not ok:
+                if subschema is None and "expected null" in msg:
+                    msg = (
+                        "{}. A bare None exemplar means the value must be null, not that the "
+                        "field is optional. Use '{}?' for optional presence or omit the key.".format(
+                            msg, base_key
+                        )
+                    )
                 return ok, msg
         return True, "ok"
 

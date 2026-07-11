@@ -8,6 +8,7 @@ workflow. It is the atomic unit of cognition in the ThoughtFlow framework.
 from __future__ import annotations
 
 import json
+import re
 
 from thoughtflow._util import (
     event_stamp,
@@ -15,6 +16,11 @@ from thoughtflow._util import (
     construct_msgs,
     valid_extract,
     ValidExtractError,
+    extract_balanced_json,
+    extract_raw_object,
+    humanize_schema_error,
+    format_schema_annotation,
+    scan_none_exemplars,
 )
 
 
@@ -87,10 +93,22 @@ class THOUGHT:
         operation (str): Type of operation ('llm_call', 'memory_query', 'variable_set', 'conditional')
         system_prompt (str): Optional system prompt for LLM context (via config)
         parser (str|callable): Response parser ('text', 'json', 'list', or callable)
-        parsing_rules (dict): Schema for valid_extract parsing (e.g., {'kind': 'python', 'format': []})
+        parsing_rules (dict): Schema for valid_extract parsing (e.g., {'kind': 'python', 'format': []}).
+            Keys ending in '?' are optional. For branch-shaped responses, use the optional
+            oneOf dialect: {'format': {'oneOf': [{...}, {...}]}}. Schema validation runs
+            inside parse_response before the validation callable unless validation_mode='rescue'.
         validation (str|callable): Response validator — canonical spelling. Accepts a
-            callable (parsed_result) -> (bool, why) or a built-in string
-            ('any', 'has_keys:k1,k2', 'list_min_len:N', 'summary_v1')
+            callable returning (bool, why) or a bare bool (coerced automatically), or a
+            built-in string ('any', 'has_keys:k1,k2', 'list_min_len:N', 'summary_v1').
+        validation_mode (str): 'strict' (default) or 'rescue'. In rescue mode, a callable
+            validation may accept payloads that fail schema parsing.
+        strict_schema (bool): When True, raise at construction if parsing_rules uses bare
+            None exemplars (opt-in guardrail for production harnesses).
+        on_failure (callable): Optional hook invoked on each failed parse/validation attempt:
+            on_failure(thought, attempt, failure_kind, reason, raw_response=None).
+        hold_msg (bool): When True, assistant messages are held until parse+validate
+            succeed (failed attempts are not written to MEMORY).
+        repair_target (str): For dict prompts, which section key receives repair suffix text.
         validator (str|callable): Config-style alias for `validation`; behaves identically
         max_retries (int): Maximum retry attempts (default: 1)
         retry_delay (float): Delay between retries in seconds (default: 0)
@@ -123,7 +141,7 @@ class THOUGHT:
             name="extract_info",
             llm=llm,
             prompt="Extract name and age from: {text}",
-            parsing_rules={"kind": "python", "format": {"name": "", "age": 0}}
+            parsing_rules={"kind": "python", "format": {"name": str, "age?": int}}
         )
 
         # Memory query example (no LLM)
@@ -158,12 +176,51 @@ class THOUGHT:
         """
         Initialize a THOUGHT instance.
 
+        THOUGHT is callable: ``memory = thought(memory)`` or ``memory = thought(memory, vars)``.
+        For ``llm_call``, the execution order is fixed: build messages, call LLM,
+        ``parse_response`` (schema via ``valid_extract`` when ``parsing_rules`` set),
+        then ``validate`` (callable or built-in). Schema and callable validation run
+        sequentially, not in parallel. Test callables through the full THOUGHT path,
+        not in isolation.
+
         Args:
-            name (str): Name of the thought.
-            llm: LLM interface or callable.
-            prompt: Prompt template (str or dict).
-            operation (str): Operation type (e.g., 'llm_call', 'memory_query', etc).
-            **kwargs: Additional configuration parameters.
+            name (str): Unique identifier. Drives ``{name}_result``, ``{name}_last_error``,
+                and log event labels.
+            llm: LLM instance. Required for ``llm_call``; ignored for other operations.
+            prompt (str|dict): Template with ``{variable}`` placeholders for llm_call,
+                or a dict of values for ``variable_set``.
+            operation (str): One of ``llm_call`` (default), ``memory_query``,
+                ``variable_set``, ``conditional``.
+
+        Keyword args (stored in ``self.config`` unless noted):
+            parsing_rules (dict): Schema for ``valid_extract``. Use ``'key?'`` for optional
+                keys. Optional ``oneOf`` dialect for branch-shaped responses.
+            validation (str|callable): Canonical validator. Callable may return ``(bool, why)``
+                or bare ``bool`` (coerced). Built-ins: ``any``, ``has_keys:k1,k2``,
+                ``list_min_len:N``, ``summary_v1``. Alias: ``validator=``.
+            validation_mode (str): ``strict`` (default) or ``rescue``. Rescue lets a callable
+                accept payloads that fail schema when structurally parseable.
+            strict_schema (bool): When True, raise at construction if format uses bare
+                ``None`` exemplars (opt-in CI guardrail).
+            on_failure (callable): ``fn(thought, attempt, failure_kind, reason, raw_response=None)``
+                invoked on each failed parse/validation attempt.
+            hold_msg (bool): When True, assistant messages are held until parse+validate
+                succeed. Default False preserves prior behavior (failed attempts still
+                write assistant turns to MEMORY).
+            repair_target (str): For dict prompts, which section key receives repair suffix.
+            parser (str|callable): ``text``, ``json``, ``list``, or custom callable.
+            max_retries (int): Retry attempts after parse/validation failure. Default 1.
+            retry_delay (float): Seconds between retries.
+            required_vars, optional_vars (list): Variables pulled from MEMORY for context.
+            output_var (str): Where to store result. Default ``{name}_result``.
+            pre_hook, post_hook (callable): Before/after execution hooks.
+            on_token (callable): Streaming hook ``fn(chunk)`` when LLM supports streaming.
+            channel (str): Message channel for assistant turns. Default ``api``.
+            add_reflection (bool): Write reasoning trace on success. Default True.
+
+        Raises:
+            ValueError: When ``strict_schema=True`` and ``parsing_rules`` contain bare
+                ``None`` exemplars (None means value must be null, not optional field).
         """
         self.name = name
         self.id = event_stamp() 
@@ -202,9 +259,140 @@ class THOUGHT:
         # Allow for custom hooks (pre/post processing)
         self.pre_hook = kwargs.get("pre_hook", None)
         self.post_hook = kwargs.get("post_hook", None)
-        
+        self.on_failure = kwargs.get("on_failure", None)
+
+        # Opt-in production-lane settings (defaults preserve backward compat)
+        self.validation_mode = kwargs.get("validation_mode", "strict")
+        self.strict_schema = kwargs.get("strict_schema", False)
+        self.hold_msg = kwargs.get("hold_msg", False)
+
+        # Transient state for rescue-mode schema errors (per execution)
+        self._pending_schema_error = None
+        self._failure_attempts = []
+
+        if self.strict_schema:
+            self._check_strict_schema()
+
         # Execution history tracking
         self.execution_history = []
+
+    def _check_strict_schema(self):
+        """
+        Raise at construction when opt-in strict_schema finds None exemplars.
+
+        Bare None in a format dict means the field value must be null — a common
+        author mistake when they meant optional presence. Use key? or omit the key.
+        """
+        parsing_rules = self.config.get("parsing_rules")
+        if not parsing_rules:
+            return
+        schema = parsing_rules.get("format")
+        if schema is None:
+            return
+        paths = scan_none_exemplars(schema)
+        if paths:
+            raise ValueError(
+                "strict_schema=True: bare None exemplar at {}. None means the value must "
+                "be null, not optional. Use 'key?' for optional presence, omit the key, "
+                "or use validation_mode='rescue'.".format(", ".join(paths))
+            )
+
+    def _validation_mode(self):
+        return self.config.get("validation_mode", self.validation_mode)
+
+    def _hold_msg(self):
+        return self.config.get("hold_msg", self.hold_msg)
+
+    def _normalize_validator_result(self, result):
+        """
+        Coerce validator return values to (bool, str).
+
+        Callable validators should return ``(bool, why)``, but bare ``bool`` returns
+        are valid Python and are coerced automatically. Without coercion, a bare
+        ``True`` crashed tuple unpack and sent THOUGHT into silent retry loops.
+
+        Args:
+            result: Validator return — ``(bool, str)``, bare ``bool``, or other truthy/falsy.
+
+        Returns:
+            tuple: ``(is_valid, reason_string)``
+        """
+        if isinstance(result, tuple) and len(result) == 2:
+            return bool(result[0]), str(result[1])
+        if isinstance(result, bool):
+            return result, "validator returned bool"
+        return bool(result), "validator returned {!r}".format(result)
+
+    def _record_failure(self, memory, attempt, failure_kind, reason, raw_response=None):
+        """
+        Write structured failure visibility to MEMORY and optional on_failure hook.
+
+        Every failed parse or validation attempt calls this before retry or exhaustion.
+        Default lane always writes:
+          - JSON log event with ``event: thought_failure``
+          - ``{name}_last_error`` var (reason, failure_kind, full attempts list)
+          - ``{name}_attempts`` var (integer count)
+
+        Production lane may also pass ``on_failure=`` for metrics or external tracing.
+
+        Args:
+            memory: MEMORY instance being updated.
+            attempt (int): 1-based attempt number within this execution.
+            failure_kind (str): One of ``schema``, ``validation``, ``contract``,
+                ``exception``, ``extract``.
+            reason (str): Human-oriented failure message (may be humanized for repair).
+            raw_response (str, optional): LLM text preview (truncated to 500 chars in log).
+        """
+        event = {
+            "event": "thought_failure",
+            "thought_name": self.name,
+            "attempt": attempt,
+            "failure_kind": failure_kind,
+            "reason": reason,
+        }
+        if raw_response is not None:
+            preview = str(raw_response)
+            if len(preview) > 500:
+                preview = preview[:500] + "..."
+            event["raw_response_preview"] = preview
+
+        self._failure_attempts.append(event)
+
+        if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
+            memory.add_log(json.dumps(event))
+
+        if self.name:
+            if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+                memory.set_var(
+                    "{}_last_error".format(self.name),
+                    {
+                        "reason": reason,
+                        "failure_kind": failure_kind,
+                        "attempts": list(self._failure_attempts),
+                    },
+                    desc="Last error for thought: {}".format(self.name),
+                )
+                memory.set_var(
+                    "{}_attempts".format(self.name),
+                    attempt,
+                    desc="Attempts for thought: {}".format(self.name),
+                )
+
+        if self.on_failure and callable(self.on_failure):
+            self.on_failure(self, attempt, failure_kind, reason, raw_response)
+
+    def _format_repair_reason(self, why):
+        """Build model-friendly repair text from an internal failure reason."""
+        parsing_rules = self.config.get("parsing_rules")
+        schema = None
+        if parsing_rules:
+            schema = parsing_rules.get("format")
+        friendly = humanize_schema_error(str(why), schema)
+        if schema is not None:
+            return "{} Expected format: {}".format(
+                friendly, format_schema_annotation(schema)
+            )
+        return friendly
 
 
     def __call__(self, memory, vars={}, **kwargs):
@@ -249,19 +437,25 @@ class THOUGHT:
         duration_ms = (time_module.time() - start_time) * 1000
         
         # Build execution event for logging
+        failed = result is None and last_error is not None
         execution_event = {
             'thought_name': self.name,
             'thought_id': self.id,
             'operation': operation,
             'attempts': attempts_made,
-            'success': result is not None,
+            'success': not failed,
+            'failed': failed,
             'duration_ms': round(duration_ms, 2),
             'output_var': self.output_var
         }
 
         # If failed after all retries
-        if result is None and last_error is not None:
+        if failed:
             execution_event['error'] = last_error
+            execution_event['failure_kind'] = (
+                self._failure_attempts[-1]['failure_kind']
+                if self._failure_attempts else 'unknown'
+            )
             if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                 memory.add_log("Thought execution failed: " + json.dumps(execution_event))
             # Store None as result
@@ -277,7 +471,8 @@ class THOUGHT:
             'memory_id': getattr(memory, 'id', None),
             'operation': operation,
             'duration_ms': duration_ms,
-            'success': result is not None or last_error is None,
+            'success': not failed,
+            'failed': failed,
             'attempts': attempts_made,
             'error': self.last_error
         })
@@ -291,22 +486,70 @@ class THOUGHT:
     def _build_repair_suffix(self, why):
         """
         Build the repair suffix for retry attempts.
-        Subclasses can override this to customize repair prompts.
-        
+
+        Subclasses (e.g. PLAN) override this to add domain-specific constraints.
+        Base THOUGHT appends humanized failure reason from _format_repair_reason,
+        which includes schema annotation when parsing_rules are set.
+
         Args:
             why (str): Reason the previous attempt failed.
-        
+
         Returns:
-            str: Suffix to append to the prompt for retry.
+            str: Suffix appended to prompt for the next LLM attempt.
         """
-        return "\n(Please return only the requested format; your last answer failed: {})".format(why)
+        return "\n(Please return only the requested format; your last answer failed: {})".format(
+            self._format_repair_reason(why)
+        )
+
+    def _append_repair_suffix(self, original_prompt, working_prompt, repair_suffix):
+        """
+        Append repair suffix to str or dict prompt, honoring repair_target.
+
+        For dict prompts, repair text goes on ``repair_target`` if set, otherwise
+        the last key. This keeps multi-section prompts from polluting the wrong
+        section on retry.
+
+        Args:
+            original_prompt: Immutable baseline (never mutated).
+            working_prompt: Current prompt copy for this retry iteration.
+            repair_suffix (str): Model-friendly repair text from _build_repair_suffix.
+
+        Returns:
+            Updated prompt (str or dict) for the next attempt.
+        """
+        import copy as copy_module
+
+        if isinstance(original_prompt, str):
+            return original_prompt.rstrip() + repair_suffix
+        if isinstance(original_prompt, dict):
+            updated = copy_module.deepcopy(original_prompt)
+            target = self.config.get("repair_target")
+            if target and target in updated:
+                key = target
+            else:
+                key = list(updated.keys())[-1]
+            updated[key] = updated[key].rstrip() + repair_suffix
+            return updated
+        return working_prompt
 
     def _execute_llm_call(self, memory, vars, **kwargs):
         """
-        Execute an LLM call operation with retry logic.
-        
+        Execute an llm_call with parse-validate-retry loop.
+
+        Pipeline per attempt (order is fixed):
+          1. Build messages from working_prompt + MEMORY context
+          2. Call LLM
+          3. parse_response — schema (valid_extract) runs here, not in validate()
+          4. validate — callable or built-in; may rescue schema miss when configured
+          5. On success: write assistant msg (unless already held), reflection, break
+          6. On failure: _record_failure, append repair suffix, retry
+
+        hold_msg: when True, assistant messages from failed attempts are skipped so
+        retry pollution does not reach downstream context staging.
+
         Returns:
-            tuple: (result, last_error, attempts_made)
+            tuple: (result, last_error, attempts_made). result is None when all
+            retries exhausted; caller stores None on MEMORY and logs failed event.
         """
         import copy as copy_module
         import time as time_module
@@ -315,6 +558,10 @@ class THOUGHT:
         last_error = None
         result = None
         attempts_made = 0
+        self._pending_schema_error = None
+        self._failure_attempts = []
+        had_schema_rejection = False
+        first_failed_keys = None
         
         # Store original prompt to avoid mutation - work with a copy
         original_prompt = copy_module.deepcopy(self.prompt)
@@ -322,37 +569,50 @@ class THOUGHT:
 
         while retries_left > 0:
             attempts_made += 1
+            self._pending_schema_error = None
+            response = None
             try:
-                # Temporarily set working prompt for this iteration
+                # Stage 1: prompt + context — working_prompt may carry repair suffix
                 self.prompt = working_prompt
                 
-                # Build context and prompt/messages
                 ctx = self.get_context(memory)
                 ctx.update(vars)
                 msgs = self.build_msgs(memory, ctx)
 
-                # Run LLM
+                # Stage 2: LLM call
                 llm_kwargs = self.config.get("llm_params", {})
                 llm_kwargs.update(kwargs)
                 response = self.run_llm(msgs, **llm_kwargs)
                 self.last_response = response
 
-                # Get channel from config for message tracking
                 channel = self.config.get("channel", "api")
-                
-                # Add assistant message to memory (if possible)
-                if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
-                    memory.add_msg("assistant", response, channel=channel)
 
-                # Parse
+                # Stage 3: parse — schema validation lives here (valid_extract).
+                # Rescue mode may set _pending_schema_error and return raw object.
                 parsed = self.parse_response(response)
                 self.last_result = parsed
 
-                # Validate
+                # Stage 4: validate — runs after parse; callable does not see
+                # schema rejects unless validation_mode='rescue'.
                 valid, why = self.validate(parsed)
                 if valid:
                     result = parsed
                     self.last_error = None
+                    # Log recovery when rescue mode accepted a schema miss
+                    if had_schema_rejection and hasattr(memory, "add_log"):
+                        recovery = {
+                            "event": "thought_recovery",
+                            "thought_name": self.name,
+                            "recovered_after_schema_rejection": True,
+                        }
+                        if first_failed_keys is not None and isinstance(parsed, dict):
+                            recovery["fields_dropped"] = [
+                                k for k in first_failed_keys if k not in parsed
+                            ]
+                        memory.add_log(json.dumps(recovery))
+                    # Success path: write assistant turn unless hold_msg withheld earlier failures
+                    if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                        memory.add_msg("assistant", response, channel=channel)
                     # Logging
                     if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                         memory.add_log("Thought '{}' completed successfully".format(self.name))
@@ -368,29 +628,39 @@ class THOUGHT:
                 else:
                     last_error = why
                     self.last_error = why
+                    failure_kind = "contract" if why.startswith("validator returned") else "validation"
+                    self._record_failure(
+                        memory, attempts_made, failure_kind, why, raw_response=response
+                    )
                     if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                         memory.add_log("Thought '{}' validation failed: {}".format(self.name, why))
-                    # Create repair suffix for next retry (modify working_prompt, not original)
                     repair_suffix = self._build_repair_suffix(why)
-                    if isinstance(original_prompt, str):
-                        working_prompt = original_prompt.rstrip() + repair_suffix
-                    elif isinstance(original_prompt, dict):
-                        working_prompt = copy_module.deepcopy(original_prompt)
-                        last_key = list(working_prompt.keys())[-1]
-                        working_prompt[last_key] = working_prompt[last_key].rstrip() + repair_suffix
+                    working_prompt = self._append_repair_suffix(
+                        original_prompt, working_prompt, repair_suffix
+                    )
+                    # Failed attempt: record assistant msg unless hold_msg=True
+                    if not self._hold_msg():
+                        if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                            memory.add_msg("assistant", response, channel=channel)
             except Exception as e:
                 last_error = str(e)
                 self.last_error = last_error
+                # Parse failures surface as ValueError with "Schema-based parsing failed"
+                failure_kind = "schema" if "Schema-based parsing failed" in last_error else "exception"
+                if failure_kind == "schema":
+                    had_schema_rejection = True
+                self._record_failure(
+                    memory, attempts_made, failure_kind, last_error, raw_response=response
+                )
+                if not self._hold_msg():
+                    if response is not None and hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                        memory.add_msg("assistant", response, channel=channel)
                 if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                     memory.add_log("Thought '{}' error: {}".format(self.name, last_error))
-                # Create repair suffix for next retry (modify working_prompt, not original)
                 repair_suffix = self._build_repair_suffix(last_error)
-                if isinstance(original_prompt, str):
-                    working_prompt = original_prompt.rstrip() + repair_suffix
-                elif isinstance(original_prompt, dict):
-                    working_prompt = copy_module.deepcopy(original_prompt)
-                    last_key = list(working_prompt.keys())[-1]
-                    working_prompt[last_key] = working_prompt[last_key].rstrip() + repair_suffix
+                working_prompt = self._append_repair_suffix(
+                    original_prompt, working_prompt, repair_suffix
+                )
             retries_left -= 1
             if self.retry_delay:
                 time_module.sleep(self.retry_delay)
@@ -702,27 +972,44 @@ class THOUGHT:
         """
         Parse the LLM response to extract the desired content.
 
+        Resolution order:
+          1. Custom ``parse_fn`` if provided
+          2. ``parsing_rules`` via ``valid_extract`` (schema validation happens here)
+          3. Built-in ``parser``: ``text``, ``json`` (balanced extraction), ``list``
+          4. Default: return raw string
+
+        When ``parsing_rules`` are set, callable ``validation=`` does **not** run for
+        payloads that fail schema unless ``validation_mode='rescue'``. In rescue mode,
+        ``extract_raw_object`` may return a structurally parsed object and stash the
+        schema error in ``_pending_schema_error`` for ``validate()`` to consider.
+
         Args:
-            response (str): Raw LLM response.
+            response (str): Raw LLM response text.
 
         Returns:
-            object: Parsed result (e.g., string, list, dict).
-        
-        Supports:
-            - Custom parse_fn callable
-            - Schema-based parsing via parsing_rules (uses valid_extract)
-            - Built-in parsers: 'text', 'json', 'list'
+            object: Parsed result (str, list, dict, etc.).
+
+        Raises:
+            ValueError: When schema parsing fails and rescue does not recover.
         """
         # Use custom parse_fn if provided
         if self.parse_fn and callable(self.parse_fn):
             return self.parse_fn(response)
         
-        # Check for schema-based parsing rules (using valid_extract)
+        # Schema path: valid_extract enforces parsing_rules before validate() runs
         parsing_rules = self.config.get("parsing_rules")
         if parsing_rules:
             try:
                 return valid_extract(response, parsing_rules)
             except ValidExtractError as e:
+                # Rescue lane: parse structure without schema, let callable validator decide
+                if self._validation_mode() == "rescue" and self._has_callable_validation():
+                    try:
+                        parsed = extract_raw_object(response, parsing_rules)
+                        self._pending_schema_error = str(e)
+                        return parsed
+                    except ValidExtractError:
+                        pass
                 raise ValueError("Schema-based parsing failed: {}".format(e))
         
         # Use built-in parser based on config
@@ -733,8 +1020,7 @@ class THOUGHT:
         if parser == "text":
             return response
         elif parser == "json":
-            import re
-            # Remove wrapping markdown code fences if present
+            # Balanced extraction avoids greedy regex spanning unrelated prose
             text = response.strip()
             fence_match = re.match(
                 r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
@@ -743,15 +1029,12 @@ class THOUGHT:
             )
             if fence_match:
                 text = fence_match.group(1).strip()
-            # Find first JSON object or array
-            match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-            if match:
-                json_str = match.group(1)
+            json_str = extract_balanced_json(text)
+            if json_str:
                 return json.loads(json_str)
-            else:
-                raise ValueError("No JSON object or array found in response.")
+            raise ValueError("No JSON object or array found in response.")
         elif parser == "list":
-            import ast, re
+            import ast
             # Find first list literal
             match = re.search(r"(\[.*\])", response, re.DOTALL)
             if match:
@@ -765,16 +1048,23 @@ class THOUGHT:
             # Unknown parser, return as is
             return response
 
+    def _has_callable_validation(self):
+        validator = self.validation if self.validation is not None else self.config.get("validator", None)
+        return validator is not None and callable(validator)
+
     def validate(self, parsed_result):
         """
         Validate the parsed result according to the thought's rules.
 
         The canonical spelling is the ``validation=`` constructor kwarg, which
-        accepts either a callable ``(parsed_result) -> (bool, why)`` or one of
-        the built-in validator strings ('any', 'has_keys:k1,k2',
-        'list_min_len:N', 'summary_v1'). The ``validator=`` config key is the
-        equivalent config-style spelling and remains fully supported; both
-        behave identically.
+        accepts either a callable returning (bool, why) or a bare bool (coerced
+        automatically), or one of the built-in validator strings ('any',
+        'has_keys:k1,k2', 'list_min_len:N', 'summary_v1'). The ``validator=``
+        config key is the equivalent config-style spelling and remains fully
+        supported; both behave identically.
+
+        When validation_mode='rescue' and schema parsing failed but left a
+        pending schema error, the callable validator may accept the payload.
 
         Args:
             parsed_result: The parsed output from the LLM.
@@ -788,8 +1078,17 @@ class THOUGHT:
 
         if validator is not None and callable(validator):
             try:
-                valid, why = validator(parsed_result)
-                return bool(valid), why
+                if self._pending_schema_error and self._validation_mode() == "rescue":
+                    try:
+                        result = validator(parsed_result, self._pending_schema_error)
+                    except TypeError:
+                        result = validator(parsed_result)
+                else:
+                    result = validator(parsed_result)
+                valid, why = self._normalize_validator_result(result)
+                if valid and self._pending_schema_error:
+                    why = "rescued: {}".format(self._pending_schema_error)
+                return valid, why
             except Exception as e:
                 return False, "Validation exception: {}".format(e)
         if validator is None or validator == "any":

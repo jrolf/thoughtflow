@@ -24,6 +24,18 @@ LLM("myservice:my-model")
 
 `EMBED` in `src/thoughtflow/embed.py` mirrors the same architecture for embedding endpoints. If the provider offers embeddings, add the counterpart there too.
 
+### Param pipeline (required for all providers)
+
+Every `_call_<service>` method receives **pre-split wire params** from `split_call_params()` in `llm_params.py`. Transport keys (`base_url`, `referer`, `extra_headers`, etc.) must never appear in JSON bodies.
+
+When adding a provider:
+
+1. Use `_prepare_messages_for_provider(msg_list)` for messages (includes cache adapters).
+2. Build payload from `wire_params` only — merge with `model` and `messages`.
+3. Read transport context for URLs and headers separately.
+
+See `llm_params.py`, `llm_cache.py`, and `.PLANS/PROVIDER_INTEGRATION_RESPONSE_PLAN.md`.
+
 ### The Stdlib Constraint
 
 ThoughtFlow has **zero dependencies**. Provider methods must be implemented with `urllib.request` and `json` only — no provider SDKs, no `requests`, no optional extras. Use the shared `_send_request(url, data, headers)` helper for the HTTP POST and JSON parsing.

@@ -93,7 +93,7 @@ supply-chain anxiety. The core library uses only Python's standard library —
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.2.0
+pip install thoughtflow==0.2.2
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -381,7 +381,17 @@ ThoughtFlow works with **any LLM provider** through a unified interface:
 | **Groq** | `groq:model` | `groq:llama-3.1-70b-versatile` | Fast inference for open models |
 | **Google Gemini** | `gemini:model` | `gemini:gemini-1.5-pro` | Gemini Pro, Flash, etc. |
 | **OpenRouter** | `openrouter:model` | `openrouter:anthropic/claude-3-opus` | Access any model via OpenRouter |
+| **Cerebras** | `openai:model` + `OpenAICompatibleLLM` | `CerebrasLLM("gpt-oss-120b", key=...)` | OpenAI-compatible; Cloudflare-safe defaults |
 | **Ollama** | `ollama:model` | `ollama:llama3.2` | Local models, no API key needed |
+
+**Native convenience classes** (v0.2.2+) wrap production edge cases while keeping the same `call()` API:
+
+| Class | When to use |
+|-------|-------------|
+| `GroqLLM` | Qwen models on Groq — sets `reasoning_format=hidden` by default |
+| `CerebrasLLM` | Cerebras inference — safe `User-Agent`, optional auth-key fallback |
+| `OpenRouterLLM` | OpenRouter gateway — sets `HTTP-Referer` and `X-Title` headers |
+| `OpenAICompatibleLLM` | Any OpenAI-compatible server (vLLM, MLX, LM Studio, Ollama `/v1`) |
 
 **Switching providers is a one-line change:**
 
@@ -514,6 +524,28 @@ recording.to_json("session.json")
 
 replay_llm = LLM.replay(MEMORY.from_json("session.json"))
 # replay_llm is a drop-in LLM: same flows, no network, identical outputs
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PROMPT CACHING — stable prefixes for agentic loops (v0.2.2+)
+# ═══════════════════════════════════════════════════════════════════════════
+
+from thoughtflow import cached_system, cached_message
+
+llm.call([
+    cached_system("You are a helpful assistant. Follow these rules exactly..."),
+    {"role": "user", "content": "Hello"},
+])
+# Anthropic: cache_control blocks on marked messages
+# OpenAI-compat providers: markers stripped from bodies; opt-in wire params apply
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OBSERVABILITY — last_error, last_usage, request_timeout (v0.2.2+)
+# ═══════════════════════════════════════════════════════════════════════════
+
+llm = LLM("openai:gpt-4o", key="sk-...", request_timeout=30)
+response = llm.call([{"role": "user", "content": "Hi"}])
+print(llm.last_usage)   # normalized token counts when the provider returns them
+print(llm.last_error)   # None on success, error string on provider failure
 ```
 
 **Key features:**
@@ -524,6 +556,9 @@ replay_llm = LLM.replay(MEMORY.from_json("session.json"))
 - **Structured output** — JSON Schema enforcement via each provider's native mechanism
 - **Streaming** — SSE/NDJSON streaming with a plain generator interface
 - **Record/replay** — Capture exchanges into MEMORY; replay them deterministically
+- **Prompt caching** — `cached_system()` / `cache=True` for stable agent prefixes
+- **Production provider classes** — `GroqLLM`, `CerebrasLLM`, `OpenRouterLLM`
+- **Unified param pipeline** — Transport keys (`base_url`, `referer`) never leak into JSON bodies
 
 ---
 
@@ -909,6 +944,23 @@ memory = thought(memory)
 # flows through parsing/validation and lands in memory as usual.
 
 # ═══════════════════════════════════════════════════════════════════════════
+# PRODUCTION LANE — opt-in hardening (v0.2.2+, defaults unchanged)
+# ═══════════════════════════════════════════════════════════════════════════
+
+thought = THOUGHT(
+    name="extract_plan",
+    llm=llm,
+    prompt="Return JSON for: {task}",
+    parser="json",
+    validation_mode="rescue",   # try repair before failing
+    strict_schema=True,         # enforce schema shape strictly
+    hold_msg=True,              # keep failed assistant msg out of history
+    on_failure=lambda m, err: m.add_log("extract_plan failed: " + str(err)),
+    max_retries=2,
+)
+# Failures surface on MEMORY: {name}_last_error, {name}_attempts, failed: true events
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SERIALIZATION — save and restore thoughts
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -944,6 +996,8 @@ thought.last_response    # Raw LLM response
 - **Schema-based parsing** — Via `valid_extract` for bulletproof extraction
 - **Multiple validators** — Built-in or custom, via the `validation=` parameter
 - **Token streaming** — `on_token=` hook streams chunks without breaking the contract
+- **Production lane (opt-in)** — `validation_mode`, `strict_schema`, `hold_msg`, `on_failure`
+- **Structured failure visibility** — `{name}_last_error` and `{name}_attempts` on MEMORY
 - **Four operations** — `llm_call`, `memory_query`, `variable_set`, `conditional`
 - **Pre/post hooks** — Custom processing before and after execution
 - **Full serialization** — Save, restore, and copy thoughts
@@ -1556,7 +1610,14 @@ vectors = embed.call(["Hello", "World"])
 # Record/replay works here too — same seam as LLM
 embed.record(memory)
 replay_embed = EMBED.replay(memory)
+
+# Gemini: text-embedding-004 aliases to gemini-embedding-001 automatically
+embed = EMBED("gemini:text-embedding-004", key="...")
+vector = embed.call("Hello world")
+print(embed.last_error)  # None on success; error string on provider failure
 ```
+
+Supported embedding providers: OpenAI, Gemini, Groq, OpenRouter, and local Ollama (`ollama:all-minilm:33m`, etc.).
 
 ---
 
@@ -2165,6 +2226,18 @@ deterministic: no API keys in CI, no flaky outputs, no spend. The complete
 lifecycle is demonstrated in
 [`examples/scripts/13_record_replay.py`](examples/scripts/13_record_replay.py).
 
+**Integration smoke tests** (optional, real API calls) live under `tests/integration/`.
+Enable with `THOUGHTFLOW_INTEGRATION_TESTS=1` and provider API keys in your environment:
+
+```bash
+THOUGHTFLOW_INTEGRATION_TESTS=1 pytest tests/integration/test_llm_providers.py \
+  tests/integration/test_embed_providers.py -v
+```
+
+These cover base `LLM` routing, native provider classes (`GroqLLM`, `CerebrasLLM`,
+`OpenRouterLLM`), Ollama, prompt caching, record/replay, and `EMBED` providers.
+Tests skip automatically when a key or account lacks access to a provider.
+
 ---
 
 ## 📁 Project Structure
@@ -2174,6 +2247,9 @@ thoughtflow/
 ├── src/thoughtflow/
 │   ├── __init__.py      # Public API exports
 │   ├── llm.py           # LLM — multi-provider model interface
+│   ├── llm_params.py    # Unified model-param pipeline (transport vs wire)
+│   ├── llm_cache.py     # Prompt caching helpers (cached_system, etc.)
+│   ├── providers/       # GroqLLM, CerebrasLLM, OpenRouterLLM
 │   ├── embed.py         # EMBED — multi-provider embeddings
 │   ├── memory.py        # MEMORY — event-sourced state container
 │   ├── thought.py       # THOUGHT — atomic cognitive unit
@@ -2242,9 +2318,10 @@ See [developer/](developer/) for comprehensive development documentation.
 | **Orchestration** | ✅ Stable | WORKFLOW, CHRON |
 | **Action Subclasses** | ✅ Stable | 16 elemental operations (SEARCH, SCRAPE, FETCH, etc.) |
 | **Record/Replay** | ✅ Shipped | LLM/EMBED recording, deterministic replay, eval harness |
+| **Provider convenience classes** | ✅ Shipped (0.2.2) | GroqLLM, CerebrasLLM, OpenRouterLLM, prompt caching |
 | **API Stability** | 🟡 Alpha | May evolve based on feedback |
 | **Documentation** | ✅ Per-primitive docs | `primitives/` folder with Markdown per class |
-| **Test Coverage** | ✅ ~700 unit tests | Plus integration tests gated by API keys |
+| **Test Coverage** | ✅ ~744 unit tests | Plus optional integration smoke tests (API keys) |
 | **Serverless Ready** | ✅ Yes | Zero deps, deployable example in `examples/serverless/` |
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.

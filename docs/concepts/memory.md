@@ -95,6 +95,25 @@ You rarely call these directly; they power the record/replay system. Because exc
 
 ---
 
+## THOUGHT failure variables
+
+When an `llm_call` THOUGHT exhausts retries, it stores `None` in `{name}_result` and returns MEMORY without raising. Inspect these vars and log events to distinguish misconfiguration from model failure:
+
+```python
+memory = thought(memory)
+
+err = memory.get_var("locator_last_error")
+# {"reason": "...", "failure_kind": "schema", "attempts": [...]}
+
+attempts = memory.get_var("locator_attempts")  # integer count for this run
+```
+
+Structured JSON log events use `event: thought_failure` with `failure_kind` one of `schema`, `validation`, `contract`, or `exception`. Execution completion logs include `failed: true` when retries were exhausted with an error. Legitimate `None` results (e.g. memory_query miss) are not marked failed.
+
+Set `hold_msg=True` on the THOUGHT to avoid writing assistant messages from failed attempts into the message log. See [Thought](thought.md) for the full parse-validate pipeline and production-lane knobs.
+
+---
+
 ## Serialization
 
 State moves as easily as data:

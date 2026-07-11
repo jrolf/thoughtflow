@@ -35,7 +35,7 @@ class TestRecording:
     def test_record_captures_exchange(self, monkeypatch):
         """A recorded LLM call must append an exchange event to memory."""
         llm = LLM("openai:gpt-4o", key="test-key")
-        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p: ["Recorded!"])
+        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p, transport=None: ["Recorded!"])
 
         memory = MEMORY()
         llm.record(memory)
@@ -52,7 +52,7 @@ class TestRecording:
         """LLM(record=memory) must enable recording at construction."""
         memory = MEMORY()
         llm = LLM("openai:gpt-4o", key="test-key", record=memory)
-        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p: ["Hi"])
+        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p, transport=None: ["Hi"])
 
         llm.call(MSGS)
 
@@ -62,7 +62,7 @@ class TestRecording:
         """record(None) must stop capturing exchanges."""
         memory = MEMORY()
         llm = LLM("openai:gpt-4o", key="test-key", record=memory)
-        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p: ["Hi"])
+        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p, transport=None: ["Hi"])
 
         llm.call(MSGS)
         llm.record(None)
@@ -123,7 +123,7 @@ class TestReplayLLM:
     def test_replay_miss_falls_back_to_live_llm(self, monkeypatch):
         """on_miss=<live LLM> must delegate unrecorded requests."""
         fallback = LLM("openai:gpt-4o", key="test-key")
-        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p: ["Live answer"])
+        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p, transport=None: ["Live answer"])
 
         replay = ReplayLLM(make_recorded_memory(), on_miss=fallback)
         result = replay.call([{"role": "user", "content": "Never recorded"}])
@@ -144,7 +144,7 @@ class TestReplayLLM:
         llm = LLM("openai:gpt-4o", key="test-key")
         memory = MEMORY()
         llm.record(memory)
-        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p: ["Persisted"])
+        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p, transport=None: ["Persisted"])
         llm.call(MSGS)
 
         restored = MEMORY.from_json(memory.to_json())
@@ -180,7 +180,7 @@ class TestReplayLLM:
         """A THOUGHT flow recorded once must replay without the 'network'."""
         calls = {"count": 0}
 
-        def fake_openai(self, msg_list, params):
+        def fake_openai(self, msg_list, params, transport=None):
             calls["count"] += 1
             return ["The answer is 42."]
 

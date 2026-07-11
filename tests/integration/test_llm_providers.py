@@ -28,7 +28,18 @@ import os
 import pytest
 
 # Note: Integration tests use the actual API which uses model_id parameter
-from thoughtflow import LLM, MEMORY, THOUGHT
+from thoughtflow import (
+    LLM,
+    MEMORY,
+    THOUGHT,
+    GroqLLM,
+    CerebrasLLM,
+    OpenRouterLLM,
+    OpenAICompatibleLLM,
+    cached_system,
+)
+
+from tests.integration.smoke_helpers import assert_llm_smoke, ollama_reachable
 
 
 # ============================================================================
@@ -356,7 +367,8 @@ class TestOpenRouterIntegration:
             ],
             {"max_tokens": 20, "temperature": 0},
         )
-        
+
+        assert_llm_smoke(llm, result, "OpenRouter")
         assert len(result) == 1
         assert "4" in result[0]
 
@@ -518,3 +530,162 @@ class TestEndToEndWorkflows:
         
         explanation = memory.get_var("explanation")
         assert "quantum" in explanation.lower()
+
+
+# ============================================================================
+# Native provider class smoke tests (v0.2.2)
+# ============================================================================
+
+
+_NUMERIC_PROMPT = [
+    {"role": "system", "content": "Reply with only the numeric answer and nothing else."},
+    {"role": "user", "content": "What is 2+2?"},
+]
+_LOW_TOKEN = {"max_tokens": 30, "temperature": 0}
+
+
+@pytest.mark.skipif(
+    not os.getenv("GROQ_API_KEY"),
+    reason="GROQ_API_KEY not set",
+)
+class TestGroqLLMNative:
+    """Smoke GroqLLM native class (not only base LLM groq: routing)."""
+
+    def test_groq_llm_basic_completion(self):
+        llm = GroqLLM(
+            model="llama-3.1-8b-instant",
+            key=os.getenv("GROQ_API_KEY"),
+        )
+        result = llm.call(_NUMERIC_PROMPT, _LOW_TOKEN)
+        assert_llm_smoke(llm, result, "GroqLLM")
+        assert "4" in result[0]
+
+
+@pytest.mark.skipif(
+    not os.getenv("CEREBRAS_API_KEY"),
+    reason="CEREBRAS_API_KEY not set",
+)
+class TestCerebrasLLMNative:
+    """Smoke CerebrasLLM with Cloudflare-safe User-Agent defaults."""
+
+    def test_cerebras_llm_basic_completion(self):
+        fallback = os.getenv("CEREBRAS_API_KEY_FALLBACK")
+        fallback_keys = [fallback] if fallback else None
+        llm = CerebrasLLM(
+            model="gpt-oss-120b",
+            key=os.getenv("CEREBRAS_API_KEY"),
+            fallback_keys=fallback_keys,
+        )
+        result = llm.call(_NUMERIC_PROMPT, {"max_tokens": 40, "temperature": 0})
+        assert_llm_smoke(llm, result, "CerebrasLLM")
+        assert "4" in result[0]
+
+
+@pytest.mark.skipif(
+    not os.getenv("OPENROUTER_API_KEY"),
+    reason="OPENROUTER_API_KEY not set",
+)
+class TestOpenRouterLLMNative:
+    """Smoke OpenRouterLLM native class with attribution header defaults."""
+
+    def test_openrouter_llm_basic_completion(self):
+        llm = OpenRouterLLM(
+            model="openai/gpt-4o-mini",
+            key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        result = llm.call(_NUMERIC_PROMPT, _LOW_TOKEN)
+        assert_llm_smoke(llm, result, "OpenRouterLLM")
+        assert "4" in result[0]
+
+
+@pytest.mark.skipif(
+    not ollama_reachable(),
+    reason="Ollama not reachable at OLLAMA_HOST (default http://localhost:11434)",
+)
+class TestOllamaIntegration:
+    """Smoke local Ollama via base LLM routing."""
+
+    def test_ollama_basic_completion(self):
+        model = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma3:latest")
+        host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        llm = LLM(model_id="ollama:" + model, key="")
+        result = llm.call(
+            _NUMERIC_PROMPT,
+            {"max_tokens": 30, "temperature": 0, "ollama_url": host},
+        )
+        assert_llm_smoke(llm, result, "Ollama")
+        assert "4" in result[0]
+
+
+@pytest.mark.skipif(
+    not ollama_reachable(),
+    reason="Ollama not reachable at OLLAMA_HOST (default http://localhost:11434)",
+)
+class TestOpenAICompatibleLLMIntegration:
+    """Smoke OpenAICompatibleLLM against Ollama's OpenAI-compatible /v1 endpoint."""
+
+    def test_openai_compatible_ollama_completion(self):
+        model = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma3:latest")
+        host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        llm = OpenAICompatibleLLM(
+            model=model,
+            base_url=host + "/v1",
+            key="ollama",
+        )
+        result = llm.call(
+            [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+            {"max_tokens": 20, "temperature": 0},
+        )
+        assert_llm_smoke(llm, result, "OpenAICompatibleLLM")
+        assert "4" in result[0]
+
+
+@pytest.mark.skipif(
+    not os.getenv("ANTHROPIC_API_KEY"),
+    reason="ANTHROPIC_API_KEY not set",
+)
+class TestAnthropicPromptCaching:
+    """Smoke cached_system() wire adapter against live Anthropic."""
+
+    def test_cached_system_completion_and_usage(self):
+        llm = LLM(
+            model_id="anthropic:claude-haiku-4-5",
+            key=os.getenv("ANTHROPIC_API_KEY"),
+        )
+        result = llm.call(
+            [
+                cached_system("You answer math with numbers only."),
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            {"max_tokens": 20, "temperature": 0},
+        )
+        assert_llm_smoke(llm, result, "Anthropic cached_system")
+        assert "4" in result[0]
+        # Usage normalization is best-effort; presence confirms the response path ran.
+        assert llm.last_usage is None or isinstance(llm.last_usage, dict)
+
+
+@pytest.mark.skipif(
+    not os.getenv("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set",
+)
+class TestRecordReplaySmoke:
+    """Smoke record/replay round-trip with one live OpenAI call."""
+
+    def test_record_then_replay_matches_live(self):
+        llm = LLM(
+            model_id="openai:gpt-4o-mini",
+            key=os.getenv("OPENAI_API_KEY"),
+        )
+        memory = MEMORY()
+        recorded = llm.record(memory)
+        prompt = [
+            {"role": "system", "content": "Reply with one word: echo."},
+            {"role": "user", "content": "Say echo."},
+        ]
+        live_result = recorded.call(prompt, {"max_tokens": 10, "temperature": 0})
+        assert_llm_smoke(recorded, live_result, "OpenAI record")
+
+        replay = LLM.replay(memory)
+        replay_result = replay.call(prompt, {"max_tokens": 10, "temperature": 0})
+        assert replay_result == live_result

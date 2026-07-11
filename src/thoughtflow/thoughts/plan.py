@@ -280,16 +280,47 @@ Constraints:
             # Return raw for validation to catch
             return response
     
+    def normalize_plan(self, parsed_result):
+        """
+        Optional hook for deterministic plan repairs before validation.
+
+        Override in subclasses when the model returns JSON that is syntactically
+        valid but needs cleanup: unwrap string plans, lift flat params onto task
+        dicts, unwrap ``{"steps": [...]}`` envelopes, etc. Runs at the start of
+        ``validate()`` before step/task/action checks.
+
+        Default is a no-op pass-through. Keep repairs deterministic — no LLM calls.
+
+        Args:
+            parsed_result: Output from ``parse_response`` (list, dict, or occasionally str).
+
+        Returns:
+            The plan structure ``validate()`` will inspect (expected: list of step lists).
+        """
+        return parsed_result
+
     def validate(self, parsed_result):
         """
         Validate plan structure, action names, and parameters.
-        
+
+        Flow:
+          1. ``normalize_plan(parsed_result)`` — subclass hook
+          2. Top-level shape: non-empty list (unless allow_empty), max_steps
+          3. Per step: list of tasks, max_parallel, non-empty
+          4. Per task: ``_validate_task`` (action, params schema, reason)
+
+        Missing required params are collected per task and reported together so
+        one retry message lists every omission instead of burning max_retries
+        one param at a time.
+
         Args:
-            parsed_result: The parsed plan.
-        
+            parsed_result: Parsed plan from LLM (after normalize_plan).
+
         Returns:
-            tuple: (is_valid, reason_string)
+            tuple: (is_valid, reason_string). reason_string empty when valid.
         """
+        parsed_result = self.normalize_plan(parsed_result)
+
         # Must be a list
         if not isinstance(parsed_result, list):
             return False, "Plan must be a list of steps, got: {}".format(type(parsed_result).__name__)
@@ -330,13 +361,23 @@ Constraints:
     
     def _validate_task(self, task, step_idx, task_idx):
         """
-        Validate a single task.
-        
+        Validate a single task within a plan step.
+
+        Checks:
+          - task is a dict with ``action`` key
+          - action name exists in ``self._actions_list``
+          - ``params`` is a dict when schema exists; all missing required params
+            are collected before returning (aggregate error message)
+          - ``reason`` is a non-empty single-line string
+
+        Parameter schemas use ``?`` suffix for optional params (same convention
+        as THOUGHT parsing_rules).
+
         Args:
-            task: Task dict to validate.
-            step_idx: Step index (for error messages).
-            task_idx: Task index within step (for error messages).
-        
+            task: Task dict from LLM output.
+            step_idx (int): Zero-based step index for error messages.
+            task_idx (int): Zero-based task index within the step.
+
         Returns:
             tuple: (is_valid, reason_string)
         """
@@ -366,14 +407,17 @@ Constraints:
             if not isinstance(task_params, dict):
                 return False, "{}: 'params' must be a dict".format(task_loc)
             
-            # Check required params
+            # Aggregate missing required params — report all at once for one useful retry
+            missing_params = []
             for param_name, param_type in params_schema.items():
                 is_optional = param_type.endswith('?')
-                
                 if not is_optional and param_name not in task_params:
-                    return False, "{}: action '{}' requires param '{}'".format(
-                        task_loc, action_name, param_name
-                    )
+                    missing_params.append(param_name)
+
+            if missing_params:
+                return False, "{}: action '{}' requires params: {}".format(
+                    task_loc, action_name, ", ".join(missing_params)
+                )
         
         # Validate reason field (required)
         if 'reason' not in task:
@@ -397,19 +441,24 @@ Constraints:
     def _build_repair_suffix(self, why):
         """
         Build plan-specific repair prompt for retries.
-        
+
+        Uses THOUGHT's humanized repair text (_format_repair_reason) and appends
+        PLAN-specific constraints: valid actions list, JSON array shape, required
+        action and reason fields.
+
         Args:
-            why: Reason the previous attempt failed.
-        
+            why (str): Reason the previous attempt failed (from validate).
+
         Returns:
-            str: Repair suffix to append to prompt.
+            str: Suffix appended to prompt on next retry.
         """
         actions_str = ", ".join(self._actions_list)
+        friendly = self._format_repair_reason(why)
         return (
             "\n(Your previous response was invalid: {}. "
             "Return ONLY a valid JSON array. Valid actions are: {}. "
             "Each task must include 'action' and 'reason' fields.)"
-        ).format(why, actions_str)
+        ).format(friendly, actions_str)
     
     def to_dict(self):
         """

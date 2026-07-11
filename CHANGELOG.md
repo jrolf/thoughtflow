@@ -5,16 +5,42 @@ All notable changes to ThoughtFlow will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-07-10
+
+Production-hardening release: THOUGHT/PLAN parsing improvements (Foundation Agent feedback) plus unified LLM param pipeline, prompt caching, and native provider convenience classes.
 
 ### Added
-- Nothing yet
+- THOUGHT `on_failure=` hook and structured failure events on MEMORY (`{name}_last_error`, `{name}_attempts`)
+- THOUGHT opt-in production lane: `validation_mode='rescue'`, `strict_schema=True`, `hold_msg=True`, `repair_target=`
+- `valid_extract` optional `oneOf` schema dialect for branch-shaped responses
+- PLAN `normalize_plan()` subclass hook and aggregate missing-param error messages
+- LLM `last_error`, `last_usage`, opt-in `request_timeout=`, `on_usage=` callback
+- Unified model-param pipeline (`split_call_params`) — transport keys never leak into JSON bodies
+- Prompt caching: `cached_system()`, `cached_message()`, `cache=True` on messages; Anthropic `cache_control` wire adapter
+- Native provider classes: `GroqLLM`, `CerebrasLLM`, `OpenRouterLLM`
+- `docs/concepts/thought.md` — parse-validate pipeline guide
+- Regression tests: `test_foundation_agent_response.py`, `test_llm_provider_integration.py`
+- Example: `examples/scripts/15_thought_integration_test.py`
+- Integration smoke tests: `tests/integration/test_llm_providers.py`, `test_embed_providers.py`
 
 ### Changed
-- Nothing yet
+- Validation callables may return bare `bool` (coerced to tuple automatically)
+- Parse-failure and repair-suffix messages are model-friendly
+- `parser='json'` uses balanced JSON extraction
+- Execution events include `failed: true` when retries exhausted with error
+- OpenAI-compatible choice extraction falls back to `message.reasoning` when `content` is empty
+- Expanded `docs/concepts/llm.md`, `primitives/LLM.md`, `primitives/THOUGHT.md`, `primitives/PLAN.md`
 
 ### Fixed
-- Nothing yet
+- Bare-bool `validation=` lambdas no longer crash unpack
+- PLAN param validation reports all missing params at once
+- OpenRouter `referer`/`title` no longer leak into request JSON body
+- EMBED Groq calls include User-Agent (Cloudflare HTTP 1010 without it)
+- EMBED `text-embedding-004` aliases to `gemini-embedding-001`; `last_error` surfaced on failures
+
+## [Unreleased]
+
+_Nothing yet._
 
 ---
 
@@ -171,7 +197,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/jrolf/thoughtflow/compare/v0.2.0...v0.2.2
 [0.2.0]: https://github.com/jrolf/thoughtflow/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/jrolf/thoughtflow/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jrolf/thoughtflow/compare/v0.1.1...v0.1.2
