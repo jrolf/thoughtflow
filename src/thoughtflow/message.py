@@ -14,13 +14,12 @@ Typical structure:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal
 
-
-# Type aliases for clarity
-Role: TypeAlias = Literal["system", "user", "assistant", "tool"]
-MessageDict: TypeAlias = dict[str, Any]
-MessageList: TypeAlias = list[MessageDict]
+# Plain aliases (no TypeAlias — added in Python 3.10; we support 3.9+).
+Role = Literal["system", "user", "assistant", "tool"]
+MessageDict = dict[str, Any]
+MessageList = list[MessageDict]
 
 
 @dataclass

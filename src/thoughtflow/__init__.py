@@ -105,7 +105,7 @@ try:
 
     __version__ = _get_version("thoughtflow")
 except Exception:
-    __version__ = "0.2.2"
+    __version__ = "0.2.3"
 
 # Public API
 __all__ = [

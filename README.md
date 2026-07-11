@@ -93,7 +93,7 @@ supply-chain anxiety. The core library uses only Python's standard library —
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.2.2
+pip install thoughtflow==0.2.3
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
