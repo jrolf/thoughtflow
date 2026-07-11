@@ -1308,20 +1308,19 @@ class TestGetEvents:
 
     def test_get_events_returns_chronological_order(self, memory):
         """
-        get_events must return events in chronological order.
-        
-        Order is determined by event stamps.
-        
-        Remove this test if: We change ordering.
+        get_events must return events in insertion order.
+
+        Stamps embed a random component and are not guaranteed to sort
+        lexicographically when events are created in the same clock tick.
         """
         memory.add_msg('user', 'First', channel='webapp')
         memory.add_log('Second')
         memory.add_ref('Third')
-        
+
         events = memory.get_events()
-        stamps = [e['stamp'] for e in events]
-        
-        assert stamps == sorted(stamps)
+        contents = [e['content'] for e in events]
+
+        assert contents == ['First', 'Second', 'Third']
 
     def test_get_events_respects_limit(self, memory):
         """

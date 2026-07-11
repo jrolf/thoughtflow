@@ -5,6 +5,12 @@ All notable changes to ThoughtFlow will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-07-11
+
+### Fixed
+- MEMORY index tie-breaking: events with identical `dt_utc` now preserve insertion order (fixes flaky replay and get_events tests on CI)
+- `add_exchange()` stamp now includes response payload so duplicate-key recordings are not overwritten
+
 ## [0.2.3] - 2026-07-11
 
 ### Fixed
@@ -202,7 +208,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jrolf/thoughtflow/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jrolf/thoughtflow/compare/v0.2.0...v0.2.2
 [0.2.0]: https://github.com/jrolf/thoughtflow/compare/v0.1.3...v0.2.0

@@ -183,7 +183,8 @@ class MEMORY:
         self.idx_refs = []          # Reflection [timestamp, stamp] pairs
         self.idx_logs = []          # Log [timestamp, stamp] pairs
         self.idx_vars = []          # Variable-change [timestamp, stamp] pairs
-        self.idx_all  = []          # Master index (all [timestamp, stamp] pairs)
+        self.idx_all  = []          # Master index (all [timestamp, seq, stamp] triples)
+        self._index_seq = 0         # Insertion tie-breaker when dt_utc collides
         
         # VARIABLE LAYER: Full history with timestamps
         # vars[key] = [[stamp1, value1], [stamp2, value2], ...]
@@ -235,15 +236,17 @@ class MEMORY:
 
     def _add_to_index(self, index_list, timestamp, stamp):
         """
-        Insert [timestamp, stamp] pair maintaining sorted order by timestamp.
-        
-        Args:
-            index_list: One of the idx_* lists
-            timestamp: ISO timestamp string (dt_utc)
-            stamp: Event stamp ID
+        Insert [timestamp, seq, stamp] maintaining sorted order by timestamp.
+
+        When two events share the same dt_utc string (common in tight loops),
+        seq preserves insertion order instead of falling back to stamp sorting.
         """
-        # bisect.insort sorts by first element of tuple/list (timestamp)
-        bisect.insort(index_list, [timestamp, stamp])
+        self._index_seq += 1
+        bisect.insort(index_list, [timestamp, self._index_seq, stamp])
+
+    def _stamp_from_index_pair(self, pair):
+        """Return the stamp from a 2- or 3-element index pair (legacy compat)."""
+        return pair[-1]
 
     def _store_event(self, event_type, obj):
         """
@@ -278,15 +281,18 @@ class MEMORY:
         Get events from an index, optionally limited to last N.
         
         Args:
-            index: One of the idx_* lists (format: [[timestamp, stamp], ...])
+            index: One of the idx_* lists ([timestamp, stamp] or [timestamp, seq, stamp])
             limit: Max events to return (-1 = all)
             
         Returns:
             List of event dicts
         """
         pairs = index if limit <= 0 else index[-limit:]
-        # Extract stamp (second element) from each [timestamp, stamp] pair
-        return [self.events[ts_stamp[1]] for ts_stamp in pairs if ts_stamp[1] in self.events]
+        return [
+            self.events[self._stamp_from_index_pair(ts_stamp)]
+            for ts_stamp in pairs
+            if self._stamp_from_index_pair(ts_stamp) in self.events
+        ]
 
     def _get_latest_desc(self, key):
         """
@@ -425,7 +431,7 @@ class MEMORY:
             request: JSON-serializable dict describing the request.
             response: JSON-serializable response payload.
         """
-        stamp = event_stamp({'key': key, 'kind': kind})
+        stamp = event_stamp({'key': key, 'kind': kind, 'response': response})
         exchange = {
             'stamp'    : stamp,
             'type'     : 'llm',
@@ -1206,6 +1212,7 @@ class MEMORY:
         self.idx_logs = mem.idx_logs
         self.idx_vars = mem.idx_vars
         self.idx_all = mem.idx_all
+        self._index_seq = mem._index_seq
         self.vars = mem.vars
         self.var_desc_history = mem.var_desc_history
         self.objects = mem.objects
@@ -1328,7 +1335,8 @@ class MEMORY:
         mem.idx_logs = data.get('idx_logs', [])
         mem.idx_vars = data.get('idx_vars', [])
         mem.idx_all = data.get('idx_all', [])
-        
+        mem._index_seq = len(mem.idx_all)
+
         return mem
 
     @classmethod
@@ -1367,8 +1375,9 @@ class MEMORY:
             # Store in data layer
             mem.events[stamp] = ev
             
-            # Create [timestamp, stamp] pair for indexes
-            ts_pair = [timestamp, stamp]
+            # Create index pair; seq is assigned on load for stable ordering
+            seq = len(mem.idx_all) + 1
+            ts_pair = [timestamp, seq, stamp]
             
             # Add to appropriate index (direct append since already sorted by timestamp)
             if event_type == 'msg':
