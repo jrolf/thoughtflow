@@ -78,7 +78,18 @@ except ReplayMissError:
     print("Flow has drifted from the recording. Re-record.")
 ```
 
-Note that primitives with their own error handling absorb the miss into their normal failure path: a THOUGHT, for example, retries and then stores `None` as its result with the error logged in memory, rather than letting the exception propagate. Either way, a drifted flow cannot silently produce stale answers.
+Note that primitives with their own error handling absorb the miss into their normal failure path: a THOUGHT, for example, retries and then stores `None` as its result with the error logged in memory, rather than letting the exception propagate. Inspect `{name}_last_error` and structured `thought_failure` log events to see why. Either way, a drifted flow cannot silently produce stale answers. See [Thought](thought.md) for the full parse-validate-retry pipeline.
+
+### Replay vs provider prompt caching
+
+These are orthogonal:
+
+| Mechanism | Caches | Use |
+|-----------|--------|-----|
+| `LLM.record` / `LLM.replay` | Full responses offline | Tests, CI, deterministic flows |
+| `cache=True` on messages | Input prefixes at the API | Production cost/latency |
+
+Exchange keys strip `cache=True` markers so the same recording works whether or not live calls used provider caching. Model params like `temperature` remain in the key. See [LLM](llm.md).
 
 For gradual re-recording, pass a live LLM as the fallback. Recorded requests replay; unrecorded ones go to the network:
 

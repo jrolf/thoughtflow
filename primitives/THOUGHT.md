@@ -12,7 +12,66 @@ THOUGHT exists because raw LLM calls are messy. Models add prose, code fences, a
 
 THOUGHT is callable. When you invoke it with a MEMORY (and optionally a vars dict), it dispatches to one of four operation types: llm_call, memory_query, variable_set, or conditional. For llm_call, it builds messages from the prompt template and context, calls the LLM, parses the response with a built-in or custom parser, validates with a built-in or custom validator, and retries with a repair prompt if validation fails. The result is stored in memory as `{name}_result`.
 
-Prompt templates use `{variable}` placeholders filled from memory context. Parsers include text, json, list, custom callables, and schema-based parsing via valid_extract. Validation is configured via the canonical `validation=` parameter, which accepts a built-in string (any, has_keys:k1,k2, list_min_len:N) or a callable `(parsed_result) -> (bool, why)`; `validator=` is an equivalent config-style spelling. Pre and post hooks allow custom processing before and after execution. An `on_token=` hook streams the LLM response chunk-by-chunk while the complete text still flows through parsing and validation. DECIDE and PLAN are subclasses that specialize THOUGHT for constrained choice and multi-step planning.
+### llm_call pipeline order
+
+This order is fixed and matters for authoring:
+
+1. Build messages from prompt + MEMORY context
+2. Call LLM (optional `on_token` streaming)
+3. `parse_response` — schema via `valid_extract` when `parsing_rules` set
+4. `validate` — callable or built-in; runs only after parse succeeds (unless `validation_mode='rescue'`)
+5. Store result, logs, optional assistant message, reflection
+
+Schema validation and callable validation are **not** parallel gates. A `validation=` lambda does not run when schema rejects the payload unless rescue mode is enabled.
+
+### Default lane vs production lane
+
+**Default lane (no flags):** flat `format` dict, existing retry semantics, failure logs and `{name}_last_error` on MEMORY, assistant messages recorded on failed attempts.
+
+**Production lane (opt-in):** `strict_schema=True`, `validation_mode='rescue'`, `on_failure=`, `hold_msg=True`, `oneOf` schema dialect. See [docs/concepts/thought.md](../docs/concepts/thought.md) for the full guide.
+
+## Schema parsing (`parsing_rules`)
+
+Prompt templates use `{variable}` placeholders filled from memory context. Parsers include text, json, list, custom callables, and schema-based parsing via `valid_extract`.
+
+| Concept | Meaning |
+|---------|---------|
+| Exemplar `""` or `str` | field must be a string when present |
+| Exemplar `0` or `int` | field must be an int when present |
+| `"key?"` | key is optional (may be omitted) |
+| `"key"` without `?` | key is required |
+| `None` exemplar | value must be null — **not** "optional field" |
+| `oneOf: [...]` | optional dialect; first matching branch wins |
+
+Exemplar values are type markers only. They are not defaults the model should fall back to.
+
+```python
+# Good: optional age, required name
+parsing_rules={"kind": "python", "format": {"name": str, "age?": int}}
+
+# Branch-shaped locator (found vs absent)
+parsing_rules={
+    "kind": "python",
+    "format": {
+        "oneOf": [
+            {"verdict": "found", "matched_span": ""},
+            {"verdict": "absent", "note": ""},
+        ]
+    },
+}
+```
+
+## Validation
+
+Validation is configured via the canonical `validation=` parameter (config alias `validator=`). Accepts built-in strings (`any`, `has_keys:k1,k2`, `list_min_len:N`, `summary_v1`) or a callable. Callable return shape is `(bool, why)`; bare `bool` is coerced automatically.
+
+`validation_mode='strict'` (default) — schema must pass before callable runs. `validation_mode='rescue'` — on schema miss, structurally parsed payload may be accepted by callable validator.
+
+## Failure visibility
+
+Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`). Vars `{name}_last_error` and `{name}_attempts` are set on failure. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` values: `schema`, `validation`, `contract`, `exception`.
+
+After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY without raising. Execution events include `failed: true` when retries were exhausted with an error.
 
 ## Inputs & Configuration
 
@@ -24,9 +83,14 @@ Prompt templates use `{variable}` placeholders filled from memory context. Parse
 | operation | llm_call, memory_query, variable_set, or conditional |
 | system_prompt | Optional system prompt for LLM context |
 | parser | text, json, list, or callable |
-| parsing_rules | Schema for valid_extract (e.g., {'kind': 'python', 'format': []}) |
-| validation | Canonical validator spec: any, has_keys:k1,k2, list_min_len:N, or callable |
+| parsing_rules | Schema for valid_extract. Keys ending in `?` are optional. Optional `oneOf` dialect for branch shapes. |
+| validation | Canonical validator: any, has_keys:k1,k2, list_min_len:N, callable (bool or tuple) |
+| validation_mode | `strict` (default) or `rescue` — rescue lets callable accept schema misses |
+| strict_schema | Opt-in: raise at construction if format uses bare None exemplars |
 | validator | Config-style alias for `validation`; behaves identically |
+| on_failure | Hook: fn(thought, attempt, failure_kind, reason, raw_response=None) |
+| hold_msg | Opt-in: hold assistant messages until successful parse+validate |
+| repair_target | For dict prompts, which section key receives repair suffix text |
 | max_retries | Retry attempts on validation failure |
 | retry_delay | Delay between retries in seconds |
 | required_vars | Variables required from memory |
@@ -54,6 +118,32 @@ thought = THOUGHT(
 )
 memory = thought(memory)
 result = memory.get_var('summarize_result')
+```
+
+```python
+# Schema parsing with optional key
+thought = THOUGHT(
+    name='extract_info',
+    llm=llm,
+    prompt='Extract name and optional age from: {text}',
+    parsing_rules={'kind': 'python', 'format': {'name': str, 'age?': int}},
+)
+```
+
+```python
+# Production lane: observability + strict schema guard
+thought = THOUGHT(
+    name='locator',
+    llm=llm,
+    prompt='Find the relevant span.',
+    parsing_rules={'kind': 'python', 'format': {'oneOf': [...]}},
+    validation=my_validator,
+    validation_mode='rescue',
+    strict_schema=True,
+    on_failure=my_metrics_hook,
+    hold_msg=True,
+    max_retries=3,
+)
 ```
 
 ```python

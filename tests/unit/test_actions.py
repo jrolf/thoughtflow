@@ -524,16 +524,18 @@ class TestSEARCH:
         assert result["query"] == "python"
         assert "results" in result
     
-    def test_brave_requires_api_key(self, memory):
+    def test_brave_requires_api_key(self, memory, monkeypatch):
         """SEARCH with Brave requires API key."""
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
         search = SEARCH(query="test", provider="brave")
         memory = search(memory)
         result = memory.get_var("search_results")
         # Should fail due to missing API key
         assert "error" in str(result).lower() or result.get("error")
     
-    def test_exa_requires_api_key(self, memory):
+    def test_exa_requires_api_key(self, memory, monkeypatch):
         """SEARCH with EXA requires API key."""
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
         search = SEARCH(query="test", provider="exa")
         memory = search(memory)
         result = memory.get_var("search_results")

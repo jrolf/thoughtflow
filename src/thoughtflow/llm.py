@@ -3,6 +3,12 @@ LLM class for ThoughtFlow.
 
 A unified interface for calling various language model services.
 
+Unified param pipeline (v0.2.2+):
+  - Constructor kwargs split into reserved (request_timeout, on_usage, record),
+    transport (base_url, referer, extra_headers), and model (temperature, etc.).
+  - split_call_params() ensures transport keys never leak into JSON bodies.
+  - Prompt caching via cache=True on messages or cached_system() helpers.
+
 Also home to ThoughtFlow's record/replay system: LLM.record(memory) captures
 every exchange as MEMORY events, and LLM.replay(memory) returns a ReplayLLM
 that serves those recorded responses deterministically — offline, instant,
@@ -17,6 +23,19 @@ import urllib.request
 import urllib.error
 
 from thoughtflow._util import exchange_key, TRANSPORT_PARAM_KEYS
+from thoughtflow.llm_params import (
+    LLM_RESERVED_KEYS,
+    merge_call_params,
+    split_call_params,
+    normalize_usage,
+    build_gemini_generation_config,
+    pick_anthropic_wire_params,
+)
+from thoughtflow.llm_cache import (
+    apply_cache_markers,
+    strip_cache_markers,
+    format_anthropic_system,
+)
 
 
 class ReplayMissError(KeyError):
@@ -95,15 +114,24 @@ class LLM:
         self.model = model
         self.api_key = key
         self.api_secret = secret
-        self.last_params = {} 
+        self.last_params = {}
         self.default_params = {}
+        self.last_error = None
+        self.last_usage = None
+        self.request_timeout = None
+        self.on_usage = None
 
-        # Optional MEMORY that receives a record of every exchange
+        # Reserved client keys — never stored in default_params or sent on wire
         self._record_memory = kwargs.pop('record', None)
+        if 'request_timeout' in kwargs:
+            self.request_timeout = kwargs.pop('request_timeout')
+        if 'on_usage' in kwargs:
+            self.on_usage = kwargs.pop('on_usage')
 
-        # Recognized constructor-level defaults; anything else is passed
-        # through as a provider-specific param (e.g. ollama_url).
+        # Model + transport kwargs (transport split out at call time via split_call_params)
         for k, v in kwargs.items():
+            if k in LLM_RESERVED_KEYS:
+                continue
             if v is not None:
                 self.default_params[k] = v
 
@@ -138,7 +166,7 @@ class LLM:
             k: v for k, v in params.items() if k not in TRANSPORT_PARAM_KEYS
         }
         request = {
-            'messages': self._normalize_messages(msg_list),
+            'messages': strip_cache_markers(self._normalize_messages(msg_list)),
             'params': clean_params,
             'output_schema': output_schema,
         }
@@ -214,7 +242,10 @@ class LLM:
             if isinstance(m, dict):
                 role = m.get("role", "user")
                 content = m.get("content", "")
-                norm.append({"role": role, "content": content})
+                entry = {"role": role, "content": content}
+                if m.get("cache"):
+                    entry["cache"] = True
+                norm.append(entry)
             else:
                 # treat as plain user text
                 norm.append({"role": "user", "content": str(m)})
@@ -262,15 +293,47 @@ class LLM:
         normalized = self._normalize_messages(msg_list)
         return self._map_roles(normalized)
 
-    def _resolve_openai_transport(self, params):
-        """Pop transport-only keys from params and return (url, headers, is_local).
-
-        When base_url is provided the request targets that server instead of
-        the OpenAI cloud API.  extra_headers (if any) are merged into the
-        default Authorization + Content-Type headers.
+    def _prepare_messages_for_provider(self, msg_list):
         """
-        base_url = params.pop('base_url', None)
-        extra_headers = params.pop('extra_headers', None)
+        Full message pipeline: normalize, map roles, apply cache wire adapters.
+
+        All network _call_* methods use this so cache=True markers reach the
+        provider in native form.
+        """
+        mapped = self._prepare_messages(msg_list)
+        return apply_cache_markers(mapped, self.service)
+
+    @staticmethod
+    def _extract_message_text(message):
+        """
+        Prefer message content; fall back to reasoning when content is empty.
+
+        Several OpenAI-compatible hosts (Cerebras gpt-oss, etc.) place the
+        user-visible answer in message.reasoning when max_tokens is tight.
+        """
+        if not isinstance(message, dict):
+            return str(message or "").strip()
+        content = message.get("content")
+        if content is not None and content != "":
+            if isinstance(content, str):
+                text = content.strip()
+                if text:
+                    return text
+            else:
+                return str(content).strip()
+        reasoning = str(message.get("reasoning") or "").strip()
+        return reasoning
+
+    def _resolve_openai_transport(self, transport):
+        """
+        Build OpenAI-compatible URL and headers from transport context.
+
+        Transport keys (base_url, extra_headers) never enter JSON bodies —
+        they are split out by split_call_params before _call_* runs.
+        """
+        transport = transport or {}
+        base_url = transport.get('base_url')
+        extra_headers = transport.get('extra_headers')
 
         if base_url:
             url = base_url.rstrip('/') + '/chat/completions'
@@ -324,8 +387,9 @@ class LLM:
             list[str]: Response strings (one per choice) when stream=False.
             generator: Yields string chunks when stream=True.
         """
-        merged = {**self.default_params, **params}
+        merged = merge_call_params(self.default_params, params)
         self.last_params = dict(merged)
+        wire_params, transport = split_call_params(merged)
 
         # Compute the exchange signature up front (params are mutated by the
         # provider methods) so recording sees the canonical request.
@@ -334,27 +398,27 @@ class LLM:
             key, request = self._request_signature(msg_list, merged, output_schema)
 
         if stream:
-            gen = self._stream(msg_list, merged, output_schema)
+            gen = self._stream(msg_list, wire_params, transport, output_schema)
             if recording:
                 return self._record_stream(gen, key, request)
             return gen
 
-        call_params = dict(merged)
+        call_params = dict(wire_params)
         if output_schema:
             call_params['_output_schema'] = output_schema
 
         if self.service == 'openai':
-            choices = self._call_openai(msg_list, call_params)
+            choices = self._call_openai(msg_list, call_params, transport)
         elif self.service == 'groq':
-            choices = self._call_groq(msg_list, call_params)
+            choices = self._call_groq(msg_list, call_params, transport)
         elif self.service == 'anthropic':
-            choices = self._call_anthropic(msg_list, call_params)
+            choices = self._call_anthropic(msg_list, call_params, transport)
         elif self.service == 'ollama':
-            choices = self._call_ollama(msg_list, call_params)
+            choices = self._call_ollama(msg_list, call_params, transport)
         elif self.service == 'gemini':
-            choices = self._call_gemini(msg_list, call_params)
+            choices = self._call_gemini(msg_list, call_params, transport)
         elif self.service == 'openrouter':
-            choices = self._call_openrouter(msg_list, call_params)
+            choices = self._call_openrouter(msg_list, call_params, transport)
         else:
             raise ValueError("Unsupported service '{}'.".format(self.service))
 
@@ -362,11 +426,11 @@ class LLM:
             self._record_exchange(key, request, choices)
         return choices
 
-    def _call_openai(self, msg_list, params):
-        url, headers, is_local = self._resolve_openai_transport(params)
+    def _call_openai(self, msg_list, params, transport=None):
+        url, headers, is_local = self._resolve_openai_transport(transport)
         output_schema = params.pop('_output_schema', None)
 
-        messages = self._prepare_messages(msg_list)
+        messages = self._prepare_messages_for_provider(msg_list)
         if output_schema and is_local:
             messages = messages + [self._schema_prompt_instruction(output_schema)]
 
@@ -387,16 +451,19 @@ class LLM:
 
         data = json.dumps(payload).encode("utf-8")
         res = self._send_request(url, data, headers)
-        choices = [a["message"]["content"] for a in res.get("choices", [])]
+        choices = [
+            self._extract_message_text(a.get("message", {}))
+            for a in res.get("choices", [])
+        ]
         return choices
 
-    def _call_groq(self, msg_list, params):
+    def _call_groq(self, msg_list, params, transport=None):
         url = "https://api.groq.com/openai/v1/chat/completions"
 
         output_schema = params.pop('_output_schema', None)
         payload = {
             "model": self.model,
-            "messages": self._prepare_messages(msg_list),
+            "messages": self._prepare_messages_for_provider(msg_list),
             **params
         }
         if output_schema:
@@ -416,40 +483,50 @@ class LLM:
             "User-Agent": "Groq/Python 0.9.0",
         }
         res = self._send_request(url, data, headers)
-        choices = [a["message"]["content"] for a in res.get("choices", [])]
+        choices = [
+            self._extract_message_text(a.get("message", {}))
+            for a in res.get("choices", [])
+        ]
         return choices
 
     def _split_system_messages(self, msg_list):
         """Extract system prompts for Anthropic's top-level ``system`` field."""
         system_parts = []
+        system_messages = []
         conversation = []
         for msg in self._normalize_messages(msg_list):
             if msg.get("role") == "system":
                 content = msg.get("content", "")
                 if content:
-                    system_parts.append(str(content))
+                    system_messages.append(dict(msg))
+                    if isinstance(content, str):
+                        system_parts.append(content)
+                    else:
+                        system_parts.append(str(content))
             else:
                 conversation.append(msg)
-        return system_parts, self._map_roles(conversation)
+        return system_parts, system_messages, self._map_roles(conversation)
 
-    def _call_anthropic(self, msg_list, params):
+    def _call_anthropic(self, msg_list, params, transport=None):
         url = "https://api.anthropic.com/v1/messages"
 
         output_schema = params.pop('_output_schema', None)
-        system_parts, messages = self._split_system_messages(msg_list)
+        system_parts, system_messages, messages = self._split_system_messages(msg_list)
+        messages = apply_cache_markers(messages, "anthropic")
+
+        anthropic_params = pick_anthropic_wire_params(params)
         payload = {
             "model": self.model,
-            "max_tokens": params.get("max_tokens", 1024),
+            "max_tokens": anthropic_params.get("max_tokens", 1024),
             "messages": messages,
         }
-        if system_parts:
-            payload["system"] = (
-                "\n\n".join(system_parts)
-                if len(system_parts) > 1
-                else system_parts[0]
-            )
-        if "temperature" in params:
-            payload["temperature"] = params["temperature"]
+        for key in ("temperature", "top_p", "top_k", "stop_sequences"):
+            if key in anthropic_params:
+                payload[key] = anthropic_params[key]
+
+        system_value = format_anthropic_system(system_parts, system_messages)
+        if system_value is not None:
+            payload["system"] = system_value
 
         # Anthropic uses a tool-use pattern for structured output: define a
         # tool whose input_schema is the desired output shape, then force the
@@ -484,18 +561,7 @@ class LLM:
         choices = [c.get("text", "") for c in res.get("content", [])]
         return choices
 
-    def _build_gemini_generation_config(self, params):
-        """Map OpenAI-style params to Gemini ``generationConfig`` fields."""
-        generation_config = {}
-        if "max_tokens" in params:
-            generation_config["maxOutputTokens"] = params.pop("max_tokens")
-        if "temperature" in params:
-            generation_config["temperature"] = params.pop("temperature")
-        if "top_p" in params:
-            generation_config["topP"] = params.pop("top_p")
-        return generation_config
-
-    def _call_gemini(self, msg_list, params):
+    def _call_gemini(self, msg_list, params, transport=None):
         """
         Calls Google Gemini/SVertexAI chat-supported models via REST API.
         Requires self.api_key to be set.
@@ -503,16 +569,13 @@ class LLM:
         call_params = dict(params)
         call_params.pop('_output_schema', None)
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
-        # Gemini expects [{"role": "user"/"model", "parts": [{"text": ...}]}].
-        # Role translation (assistant→model, system→user, etc.) is handled by
-        # _prepare_messages() via PROVIDER_ROLE_MAP — no inline mapping needed.
         gemini_msgs = []
-        for m in self._prepare_messages(msg_list):
+        for m in self._prepare_messages_for_provider(msg_list):
             gemini_msgs.append({
                 "role": m["role"],
                 "parts": [{"text": str(m["content"])}] if isinstance(m["content"], str) else m["content"]
             })
-        generation_config = self._build_gemini_generation_config(call_params)
+        generation_config = build_gemini_generation_config(call_params)
         payload = {"contents": gemini_msgs}
         if generation_config:
             payload["generationConfig"] = generation_config
@@ -521,7 +584,6 @@ class LLM:
             "Content-Type": "application/json",
         }
         res = self._send_request(url, data, headers)
-        # Gemini returns { "candidates": [ { "content": { "parts": [ { "text": ... } ] } } ] }
         choices = []
         for cand in res.get("candidates", []):
             parts = cand.get("content", {}).get("parts", [])
@@ -529,17 +591,18 @@ class LLM:
             choices.append(text)
         return choices
 
-    def _call_openrouter(self, msg_list, params):
+    def _call_openrouter(self, msg_list, params, transport=None):
         """
         Calls an LLM via the OpenRouter API. Requires self.api_key.
         API docs: https://openrouter.ai/docs
         Model list: https://openrouter.ai/docs#models
         """
+        transport = transport or {}
         output_schema = params.pop('_output_schema', None)
         url = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": self.model,
-            "messages": self._prepare_messages(msg_list),
+            "messages": self._prepare_messages_for_provider(msg_list),
             **params
         }
         if output_schema:
@@ -555,14 +618,17 @@ class LLM:
         headers = {
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
-            "HTTP-Referer": params.get("referer", "https://your-app.com"),
-            "X-Title": params.get("title", "ThoughtFlow"),
+            "HTTP-Referer": transport.get("referer", "https://your-app.com"),
+            "X-Title": transport.get("title", "ThoughtFlow"),
         }
         res = self._send_request(url, data, headers)
-        choices = [a["message"]["content"] for a in res.get("choices", [])]
+        choices = [
+            self._extract_message_text(a.get("message", {}))
+            for a in res.get("choices", [])
+        ]
         return choices
 
-    def _call_ollama(self, msg_list, params):
+    def _call_ollama(self, msg_list, params, transport=None):
         """
         Calls a local model served via Ollama (http://localhost:11434 by default).
         Expects no authentication. Ollama messages format is like OpenAI's.
@@ -572,7 +638,7 @@ class LLM:
         url = base_url.rstrip('/') + "/api/chat"
         payload = {
             "model": self.model,
-            "messages": self._prepare_messages(msg_list),
+            "messages": self._prepare_messages_for_provider(msg_list),
             "stream": False,
             **{k: v for k, v in params.items() if k not in ("ollama_url", "model")}
         }
@@ -619,7 +685,7 @@ class LLM:
             choices = []
         return choices
 
-    def _stream(self, msg_list, params, output_schema=None):
+    def _stream(self, msg_list, wire_params, transport, output_schema=None):
         """
         Stream a response from the LLM, yielding text chunks as they arrive.
 
@@ -633,21 +699,25 @@ class LLM:
 
         Args:
             msg_list (list): Messages to send.
-            params (dict): Provider-specific parameters.
+            wire_params (dict): Model params for the wire (transport already split).
+            transport (dict): Transport context (base_url, referer, etc.).
             output_schema (dict, optional): Structured output schema.
 
         Yields:
             str: Text chunks as they arrive from the provider.
         """
+        transport = transport or {}
+        params = dict(wire_params)
+
         # For providers without SSE streaming support, fall back to full call
         if self.service in ('anthropic', 'gemini'):
             call_params = dict(params)
             if output_schema:
                 call_params['_output_schema'] = output_schema
             if self.service == 'anthropic':
-                result = self._call_anthropic(msg_list, call_params)
+                result = self._call_anthropic(msg_list, call_params, transport)
             else:
-                result = self._call_gemini(msg_list, call_params)
+                result = self._call_gemini(msg_list, call_params, transport)
             for text in result:
                 yield text
             return
@@ -656,7 +726,7 @@ class LLM:
 
         # Build the URL and headers per provider
         if self.service == 'openai':
-            url, headers, is_local = self._resolve_openai_transport(params)
+            url, headers, is_local = self._resolve_openai_transport(transport)
         elif self.service == 'groq':
             url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {
@@ -669,8 +739,8 @@ class LLM:
             headers = {
                 "Authorization": "Bearer " + self.api_key,
                 "Content-Type": "application/json",
-                "HTTP-Referer": params.get("referer", "https://your-app.com"),
-                "X-Title": params.get("title", "ThoughtFlow"),
+                "HTTP-Referer": transport.get("referer", "https://your-app.com"),
+                "X-Title": transport.get("title", "ThoughtFlow"),
             }
         elif self.service == 'ollama':
             base_url = params.get("ollama_url", "http://localhost:11434")
@@ -683,15 +753,12 @@ class LLM:
         if self.service == 'ollama':
             payload = {
                 "model": self.model,
-                "messages": self._prepare_messages(msg_list),
+                "messages": self._prepare_messages_for_provider(msg_list),
                 "stream": True,
                 **{k: v for k, v in params.items() if k not in ("ollama_url", "model")}
             }
         else:
-            params.pop('base_url', None)
-            params.pop('extra_headers', None)
-
-            messages = self._prepare_messages(msg_list)
+            messages = self._prepare_messages_for_provider(msg_list)
             if output_schema and is_local:
                 messages = messages + [self._schema_prompt_instruction(output_schema)]
 
@@ -715,7 +782,10 @@ class LLM:
         req = urllib.request.Request(url, data=data, headers=headers)
 
         try:
-            response = urllib.request.urlopen(req)
+            open_kwargs = {}
+            if self.request_timeout is not None:
+                open_kwargs["timeout"] = self.request_timeout
+            response = urllib.request.urlopen(req, **open_kwargs)
         except Exception:
             return
 
@@ -781,25 +851,51 @@ class LLM:
                 yield line.strip()
 
     def _send_request(self, url, data, headers):
-        """Send an HTTP POST request and return the parsed JSON response."""
+        """
+        Send an HTTP POST request and return the parsed JSON response.
+
+        Updates last_error and last_usage on every call. Invokes on_usage
+        when configured and the response includes a usage block.
+        """
         try:
             req = urllib.request.Request(url, data=data, headers=headers)
-            with urllib.request.urlopen(req) as response:
-                response_data = response.read().decode("utf-8")  
-                # Attempt to parse JSON response; handle plain-text responses
+            open_kwargs = {}
+            if self.request_timeout is not None:
+                open_kwargs["timeout"] = self.request_timeout
+            with urllib.request.urlopen(req, **open_kwargs) as response:
+                response_data = response.read().decode("utf-8")
                 try:
-                    return json.loads(response_data)  # Parse JSON response
+                    parsed = json.loads(response_data)
                 except json.JSONDecodeError:
-                    # If response is not JSON, return it as-is in a structured format
+                    self.last_error = "Non-JSON response"
+                    self.last_usage = None
                     return {"error": "Non-JSON response", "response_data": response_data}
-                
+
+                if isinstance(parsed, dict) and "error" in parsed:
+                    err = parsed["error"]
+                    self.last_error = str(err)[:500]
+                    self.last_usage = None
+                    return parsed
+
+                self.last_error = None
+                self.last_usage = normalize_usage(parsed, self.service, self.model)
+                if self.on_usage and callable(self.on_usage) and self.last_usage:
+                    self.on_usage(self.last_usage)
+                return parsed
+
         except urllib.error.HTTPError as e:
-            # Return the error details in case of an HTTP error
             error_msg = e.read().decode("utf-8")
-            print("HTTP Error:", error_msg)  # Log HTTP error for debugging
-            return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}
+            print("HTTP Error:", error_msg)
+            self.last_error = error_msg[:500]
+            self.last_usage = None
+            try:
+                return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}
+            except json.JSONDecodeError:
+                return {"error": error_msg or "Unknown HTTP error"}
         except Exception as e:
-            return {"error": str(e)}  
+            self.last_error = str(e)[:500]
+            self.last_usage = None
+            return {"error": str(e)}
 
 
 class ReplayLLM(LLM):
@@ -874,7 +970,7 @@ class ReplayLLM(LLM):
         transport keys, output_schema, service, model) — exactly the key
         used at record time.
         """
-        merged = {**self.default_params, **params}
+        merged = merge_call_params(self.default_params, params)
         self.last_params = dict(merged)
 
         key, _request = self._request_signature(msg_list, merged, output_schema)

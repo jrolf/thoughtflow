@@ -75,6 +75,7 @@ class EMBED:
         self.api_secret = secret
         self.last_params = {}
         self.last_meta = {}
+        self.last_error = None
         self.default_params = {}
 
         # Optional MEMORY that receives a record of every exchange
@@ -265,6 +266,8 @@ class EMBED:
         headers = {
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
+            # Groq sits behind Cloudflare; missing User-Agent triggers HTTP 1010.
+            "User-Agent": "Groq/Python 0.9.0",
         }
         res = self._send_request(url, data, headers)
         return self._parse_openai_response(res)
@@ -347,16 +350,21 @@ class EMBED:
         Returns:
             list[list[float]]: Embedding vectors.
         """
+        # Google renamed the public embedding slug; keep the older doc name working.
+        model = self.model
+        if model == "text-embedding-004":
+            model = "gemini-embedding-001"
+
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            "{}:batchEmbedContents?key={}".format(self.model, self.api_key)
+            "{}:batchEmbedContents?key={}".format(model, self.api_key)
         )
         task_type = params.get("task_type", "RETRIEVAL_DOCUMENT")
 
         requests_list = []
         for t in texts:
             requests_list.append({
-                "model": "models/" + self.model,
+                "model": "models/" + model,
                 "content": {"parts": [{"text": t}]},
                 "taskType": task_type,
             })
@@ -390,6 +398,10 @@ class EMBED:
         Returns:
             list[list[float]]: Embedding vectors ordered by input index.
         """
+        if isinstance(res, dict) and "error" in res:
+            self.last_error = str(res["error"])[:500]
+            return []
+
         items = res.get("data", [])
         # Sort by index to guarantee input order
         items.sort(key=lambda x: x.get("index", 0))
@@ -424,20 +436,30 @@ class EMBED:
             with urllib.request.urlopen(req) as response:
                 response_data = response.read().decode("utf-8")
                 try:
-                    return json.loads(response_data)
+                    parsed = json.loads(response_data)
                 except json.JSONDecodeError:
+                    self.last_error = "Non-JSON response"
                     return {
                         "error": "Non-JSON response",
                         "response_data": response_data,
                     }
 
+                if isinstance(parsed, dict) and "error" in parsed:
+                    self.last_error = str(parsed["error"])[:500]
+                else:
+                    self.last_error = None
+                return parsed
+
         except urllib.error.HTTPError as e:
             error_msg = e.read().decode("utf-8")
             try:
-                return {"error": json.loads(error_msg)}
+                parsed = {"error": json.loads(error_msg)}
             except (json.JSONDecodeError, ValueError):
-                return {"error": error_msg or "Unknown HTTP error"}
+                parsed = {"error": error_msg or "Unknown HTTP error"}
+            self.last_error = str(parsed["error"])[:500]
+            return parsed
         except Exception as e:
+            self.last_error = str(e)[:500]
             return {"error": str(e)}
 
     def __str__(self):
