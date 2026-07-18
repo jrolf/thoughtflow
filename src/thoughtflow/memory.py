@@ -86,6 +86,8 @@ class MEMORY:
         get_llm_msgs(merge_augments=False, ...): Build LLM-ready message dicts; optional augment folding.
         add_log(message): Add a log event.
         add_ref(content): Add a reflection event.
+        emit(kind, payload, schema_version=1): Store a typed machine-readable lifecycle event.
+        get_emits(kind=None, limit=-1): Retrieve typed emit events in chronological order.
         add_exchange(kind, key, service, model, request, response): Record an LLM/EMBED exchange (powers record/replay).
         get_exchanges(kind=None): Get recorded model exchanges.
         get_msgs(...): Retrieve messages with filtering (supports channel filter).
@@ -232,8 +234,6 @@ class MEMORY:
             'unknown',
         }
 
-    #--- Internal Methods ---
-
     def _add_to_index(self, index_list, timestamp, stamp):
         """
         Insert [timestamp, seq, stamp] maintaining sorted order by timestamp.
@@ -252,27 +252,30 @@ class MEMORY:
         """
         Store event in data layer and add to appropriate indexes.
         This is the single entry point for all event creation.
-        
+
         Args:
-            event_type: One of 'msg', 'ref', 'log', 'var'
+            event_type: One of 'msg', 'ref', 'log', 'var', 'llm', or
+                'emit'. LLM and emit events use only the master index.
             obj: The full event dict (must contain 'stamp' and 'dt_utc' keys)
         """
-        stamp = obj['stamp']
-        timestamp = obj['dt_utc']
-        
+        stamp = obj["stamp"]
+        timestamp = obj["dt_utc"]
+
         # Store in data layer
         self.events[stamp] = obj
-        
-        # Add to type-specific index (with [timestamp, stamp] format)
-        if event_type == 'msg':
+
+        # Message, reflection, log, and variable events also use a
+        # type-specific [timestamp, sequence, stamp] index. LLM and emit
+        # events intentionally remain master-index-only.
+        if event_type == "msg":
             self._add_to_index(self.idx_msgs, timestamp, stamp)
-        elif event_type == 'ref':
+        elif event_type == "ref":
             self._add_to_index(self.idx_refs, timestamp, stamp)
-        elif event_type == 'log':
+        elif event_type == "log":
             self._add_to_index(self.idx_logs, timestamp, stamp)
-        elif event_type == 'var':
+        elif event_type == "var":
             self._add_to_index(self.idx_vars, timestamp, stamp)
-        
+
         # Always add to master index
         self._add_to_index(self.idx_all, timestamp, stamp)
 
@@ -309,7 +312,70 @@ class MEMORY:
             return ''
         return history[-1][1]  # Return description from last [stamp, desc] pair
 
-    #--- Public Methods ---
+    @staticmethod
+    def _validate_emit_kind(kind):
+        """
+        Validate an emit event kind before any MEMORY mutation.
+
+        Args:
+            kind: Must be a non-whitespace string naming the lifecycle fact.
+
+        Raises:
+            ValueError: When kind is not a string or contains only whitespace.
+        """
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError(
+                "emit kind must be a non-empty string, got {!r}".format(kind)
+            )
+
+    @staticmethod
+    def _validate_emit_payload(payload):
+        """
+        Validate an emit payload before any MEMORY mutation.
+
+        Payloads must be plain dicts whose contents survive JSON export.
+        Callers remain responsible for redacting secrets and bounding size.
+
+        Args:
+            payload: Must be a dict serializable by json.dumps.
+
+        Raises:
+            ValueError: When payload is not a dict or is not JSON-safe.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "emit payload must be a dict, got {!r}".format(type(payload).__name__)
+            )
+        try:
+            json.dumps(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "emit payload must be JSON-serializable: {}".format(exc)
+            ) from exc
+
+    @staticmethod
+    def _validate_emit_schema_version(schema_version):
+        """
+        Validate emit schema_version before any MEMORY mutation.
+
+        Args:
+            schema_version: Positive integer version for the kind's payload shape.
+
+        Raises:
+            ValueError: When schema_version is not a positive integer.
+        """
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise ValueError(
+                "emit schema_version must be a positive integer, got {!r}".format(
+                    schema_version
+                )
+            )
+        if schema_version < 1:
+            raise ValueError(
+                "emit schema_version must be a positive integer, got {!r}".format(
+                    schema_version
+                )
+            )
 
     def add_msg(self, role, content, mode='text', channel='unknown', metadata=None):
         """
@@ -414,6 +480,89 @@ class MEMORY:
         }
         self._store_event('ref', ref)
 
+    def emit(self, kind, payload, schema_version=1):
+        """
+        Store a typed, machine-readable lifecycle event in the event log.
+
+        Use ``emit`` for structured facts that harnesses, evaluators, and
+        lifecycle helpers can query with ``get_emits``. This is the typed
+        channel alongside human-oriented ``add_log`` prose and model
+        ``add_exchange`` record/replay events.
+
+        Each emit is a normal event with ``type='emit'``. Payloads are
+        deep-copied on write so caller mutation cannot rewrite history.
+        Callers must keep payloads JSON-safe, redact secrets, and bound size;
+        MEMORY does not enforce a payload size cap.
+
+        Args:
+            kind: String containing non-whitespace characters that names the
+                lifecycle fact (e.g.
+                ``'plan_rejected'``, ``'run_started'``).
+            payload: JSON-serializable dict of structured fields for this kind.
+            schema_version: Positive integer version of the payload shape for
+                this kind (default 1).
+
+        Raises:
+            ValueError: When kind, payload, or schema_version fail validation.
+        """
+        self._validate_emit_kind(kind)
+        self._validate_emit_payload(payload)
+        self._validate_emit_schema_version(schema_version)
+
+        stored_payload = copy.deepcopy(payload)
+
+        stamp_doc = {"kind": kind, "payload": stored_payload}
+        stamp = event_stamp(stamp_doc)
+        collision = 0
+        while stamp in self.events:
+            collision += 1
+            collision_doc = copy.deepcopy(stamp_doc)
+            collision_doc["collision"] = collision
+            stamp = event_stamp(collision_doc)
+        emit_event = {
+            "stamp": stamp,
+            "type": "emit",
+            "kind": kind,
+            "payload": stored_payload,
+            "schema_version": schema_version,
+            "dt_bog": str(dtt.datetime.now(tz_bog))[:23],
+            "dt_utc": str(dtt.datetime.now(tz_utc))[:23],
+        }
+        self._store_event("emit", emit_event)
+
+    def get_emits(self, kind=None, limit=-1):
+        """
+        Get typed emit events in chronological order.
+
+        Reads from the master event index so ordering matches insertion order,
+        including multiple emits in the same clock tick.
+
+        Args:
+            kind: When provided, keep only events with this kind string.
+                Must contain non-whitespace characters when not None.
+            limit: Max events to return (-1 = all). When positive, returns
+                the most recent N events after kind filtering.
+
+        Returns:
+            Deep-copied list of emit event dicts. Mutating a returned payload
+            cannot rewrite the stored event.
+
+        Raises:
+            ValueError: When kind is not a string or contains only whitespace.
+        """
+        if kind is not None:
+            self._validate_emit_kind(kind)
+
+        events = self.get_events(event_types=["emit"])
+
+        if kind is not None:
+            events = [event for event in events if event.get("kind") == kind]
+
+        if limit > 0:
+            events = events[-limit:]
+
+        return copy.deepcopy(events)
+
     def add_exchange(self, kind, key, service, model, request, response):
         """
         Record a model exchange (LLM or EMBED call) as a memory event.
@@ -461,8 +610,6 @@ class MEMORY:
         if kind:
             events = [e for e in events if e.get('kind') == kind]
         return events
-
-    #---
 
     @staticmethod
     def _metadata_matches(event, metadata_filter):
@@ -580,25 +727,26 @@ class MEMORY:
     def get_events(self, limit=-1, event_types=None, channel=None):
         """
         Get all events, optionally filtered by type and channel.
-        
+
         Args:
             limit: Max events (-1 = all)
-            event_types: List like ['msg', 'log', 'ref', 'var'] (None = all)
+            event_types: List like ['msg', 'log', 'ref', 'var', 'llm', 'emit']
+                (None = all)
             channel: Filter by channel (None = all)
-            
+
         Returns:
             List of event dicts
         """
         events = self._get_events_from_index(self.idx_all, -1)
-        
+
         if event_types:
-            events = [e for e in events if e.get('type') in event_types]
+            events = [e for e in events if e.get("type") in event_types]
         if channel:
-            events = [e for e in events if e.get('channel') == channel]
-        
+            events = [e for e in events if e.get("channel") == channel]
+
         if limit > 0:
             events = events[-limit:]
-        
+
         return events
 
     def get_logs(self, limit=-1):
@@ -819,8 +967,6 @@ class MEMORY:
         
         return result
 
-    #---
-    
     def set_var(self, key, value, desc=''):
         """
         Store a variable by appending to its history list.
@@ -1040,8 +1186,6 @@ class MEMORY:
         """
         return list(self.var_desc_history.get(key, []))
 
-    #--- Object Methods ---
-
     def set_obj(self, data, name=None, desc='', content_type='auto'):
         """
         Store a large object in compressed form.
@@ -1149,8 +1293,6 @@ class MEMORY:
             'content_type': obj_dict['content_type'],
             'compression_ratio': obj_dict['size_compressed'] / obj_dict['size_original'] if obj_dict['size_original'] > 0 else 0,
         }
-
-    #---
 
     def snapshot(self):
         """
@@ -1418,10 +1560,6 @@ class MEMORY:
         
         return mem
 
-    #---
-
-    # The render method provides a flexible way to display or export the MEMORY's messages or events.
-    # It supports event type selection, output format, advanced filtering, metadata inclusion, pretty-printing, and message condensing.
     def render(
         self,
         include=('msgs',),           # Tuple/list of event types to include: 'msgs', 'logs', 'refs', 'vars', 'events'

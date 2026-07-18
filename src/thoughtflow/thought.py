@@ -14,6 +14,7 @@ from thoughtflow._util import (
     event_stamp,
     construct_prompt,
     construct_msgs,
+    render_template,
     valid_extract,
     ValidExtractError,
     extract_balanced_json,
@@ -109,6 +110,8 @@ class THOUGHT:
         hold_msg (bool): When True, assistant messages are held until parse+validate
             succeed (failed attempts are not written to MEMORY).
         repair_target (str): For dict prompts, which section key receives repair suffix text.
+        template_mode (str): Prompt rendering mode: format (default) or substitute.
+        include_history (bool): Whether to include projected MEMORY history. Default True.
         validator (str|callable): Config-style alias for `validation`; behaves identically
         max_retries (int): Maximum retry attempts (default: 1)
         retry_delay (float): Delay between retries in seconds (default: 0)
@@ -168,9 +171,6 @@ class THOUGHT:
     THOUGHT OPERATIONS MUST BE CALLABLE.
 
     """
-    
-    # Valid operation types
-    VALID_OPERATIONS = {'llm_call', 'memory_query', 'variable_set', 'conditional'}
 
     def __init__(self, name=None, llm=None, prompt=None, operation=None, **kwargs):
         """
@@ -208,6 +208,8 @@ class THOUGHT:
                 succeed. Default False preserves prior behavior (failed attempts still
                 write assistant turns to MEMORY).
             repair_target (str): For dict prompts, which section key receives repair suffix.
+            template_mode (str): ``format`` (default) or ``substitute``.
+            include_history (bool): Include projected MEMORY history. Default True.
             parser (str|callable): ``text``, ``json``, ``list``, or custom callable.
             max_retries (int): Retry attempts after parse/validation failure. Default 1.
             retry_delay (float): Seconds between retries.
@@ -223,7 +225,7 @@ class THOUGHT:
                 ``None`` exemplars (None means value must be null, not optional field).
         """
         self.name = name
-        self.id = event_stamp() 
+        self.id = event_stamp()
         self.llm = llm
         self.prompt = prompt
         self.operation = operation
@@ -247,7 +249,9 @@ class THOUGHT:
         self.optional_vars = kwargs.get("optional_vars", [])
 
         # Optionally, store output variable name
-        self.output_var = kwargs.get("output_var", "{}_result".format(self.name) if self.name else None)
+        self.output_var = kwargs.get(
+            "output_var", "{}_result".format(self.name) if self.name else None
+        )
 
         # Internal state for tracking last result, errors, etc.
         self.last_result = None
@@ -265,6 +269,21 @@ class THOUGHT:
         self.validation_mode = kwargs.get("validation_mode", "strict")
         self.strict_schema = kwargs.get("strict_schema", False)
         self.hold_msg = kwargs.get("hold_msg", False)
+
+        template_mode = kwargs.get("template_mode", "format")
+        if template_mode not in ("format", "substitute"):
+            raise ValueError(
+                "template_mode must be 'format' or 'substitute', got: {!r}".format(
+                    template_mode
+                )
+            )
+        self.template_mode = template_mode
+        include_history = kwargs.get("include_history", True)
+        if not isinstance(include_history, bool):
+            raise ValueError(
+                "include_history must be a bool, got: {!r}".format(include_history)
+            )
+        self.include_history = include_history
 
         # Transient state for rescue-mode schema errors (per execution)
         self._pending_schema_error = None
@@ -302,6 +321,67 @@ class THOUGHT:
 
     def _hold_msg(self):
         return self.config.get("hold_msg", self.hold_msg)
+
+    def _template_mode(self):
+        mode = self.config.get("template_mode", self.template_mode)
+        if mode not in ("format", "substitute"):
+            raise ValueError(
+                "template_mode must be 'format' or 'substitute', got: {!r}".format(mode)
+            )
+        return mode
+
+    def _include_history(self):
+        include_history = self.config.get(
+            "include_history",
+            self.include_history,
+        )
+        if not isinstance(include_history, bool):
+            raise ValueError(
+                "include_history must be a bool, got: {!r}".format(include_history)
+            )
+        return include_history
+
+    def _render_template_value(self, template, ctx):
+        """
+        Render a configured prompt value without touching MEMORY messages.
+
+        String templates use the selected rendering mode. Dict templates retain
+        legacy format-mode behavior, while substitute mode renders each string
+        section before assembly. Historical message content is never passed
+        through this helper.
+        """
+        mode = self._template_mode()
+        if isinstance(template, dict):
+            if mode == "format":
+                return construct_prompt(template)
+            rendered = {}
+            for key, text in template.items():
+                if isinstance(text, str):
+                    rendered[key] = render_template(text, ctx, mode)
+                else:
+                    rendered[key] = text
+            return construct_prompt(rendered)
+        if isinstance(template, str):
+            return render_template(template, ctx, mode)
+        return str(template)
+
+    def _prepare_and_validate(self, parsed_result):
+        """
+        Prepare and validate one parsed result.
+
+        The base implementation preserves the public subclass contract by
+        calling ``self.validate(parsed_result)`` polymorphically and returning
+        the parsed value unchanged. PLAN overrides this protected seam to
+        normalize once before its internal plan checks.
+
+        Args:
+            parsed_result: Parsed output from the model response.
+
+        Returns:
+            tuple: ``(prepared_result, is_valid, reason_string)``.
+        """
+        valid, why = self.validate(parsed_result)
+        return parsed_result, valid, why
 
     def _normalize_validator_result(self, result):
         """
@@ -393,7 +473,6 @@ class THOUGHT:
                 friendly, format_schema_annotation(schema)
             )
         return friendly
-
 
     def __call__(self, memory, vars={}, **kwargs):
         """
@@ -540,7 +619,7 @@ class THOUGHT:
           1. Build messages from working_prompt + MEMORY context
           2. Call LLM
           3. parse_response — schema (valid_extract) runs here, not in validate()
-          4. validate — callable or built-in; may rescue schema miss when configured
+          4. Prepare/normalize if needed, then validate polymorphically
           5. On success: write assistant msg (unless already held), reflection, break
           6. On failure: _record_failure, append repair suffix, retry
 
@@ -553,7 +632,7 @@ class THOUGHT:
         """
         import copy as copy_module
         import time as time_module
-        
+
         retries_left = self.max_retries
         last_error = None
         result = None
@@ -562,7 +641,7 @@ class THOUGHT:
         self._failure_attempts = []
         had_schema_rejection = False
         first_failed_keys = None
-        
+
         # Store original prompt to avoid mutation - work with a copy
         original_prompt = copy_module.deepcopy(self.prompt)
         working_prompt = copy_module.deepcopy(self.prompt)
@@ -574,7 +653,7 @@ class THOUGHT:
             try:
                 # Stage 1: prompt + context — working_prompt may carry repair suffix
                 self.prompt = working_prompt
-                
+
                 ctx = self.get_context(memory)
                 ctx.update(vars)
                 msgs = self.build_msgs(memory, ctx)
@@ -590,13 +669,39 @@ class THOUGHT:
                 # Stage 3: parse — schema validation lives here (valid_extract).
                 # Rescue mode may set _pending_schema_error and return raw object.
                 parsed = self.parse_response(response)
-                self.last_result = parsed
 
-                # Stage 4: validate — runs after parse; callable does not see
-                # schema rejects unless validation_mode='rescue'.
-                valid, why = self.validate(parsed)
+                # Stage 3b: prepare/normalize, then validate. The returned value
+                # is the exact value tracked and stored on successful validation.
+                try:
+                    prepared, valid, why = self._prepare_and_validate(parsed)
+                except Exception as e:
+                    last_error = str(e)
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "validation",
+                        last_error,
+                        raw_response=response,
+                    )
+                    if not self._hold_msg():
+                        if hasattr(memory, "add_msg") and callable(
+                            getattr(memory, "add_msg", None)
+                        ):
+                            memory.add_msg("assistant", response, channel=channel)
+                    repair_suffix = self._build_repair_suffix(last_error)
+                    working_prompt = self._append_repair_suffix(
+                        original_prompt, working_prompt, repair_suffix
+                    )
+                    retries_left -= 1
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
+
+                self.last_result = prepared
+
                 if valid:
-                    result = parsed
+                    result = prepared
                     self.last_error = None
                     # Log recovery when rescue mode accepted a schema miss
                     if had_schema_rejection and hasattr(memory, "add_log"):
@@ -605,58 +710,94 @@ class THOUGHT:
                             "thought_name": self.name,
                             "recovered_after_schema_rejection": True,
                         }
-                        if first_failed_keys is not None and isinstance(parsed, dict):
+                        if first_failed_keys is not None and isinstance(prepared, dict):
                             recovery["fields_dropped"] = [
-                                k for k in first_failed_keys if k not in parsed
+                                k for k in first_failed_keys if k not in prepared
                             ]
                         memory.add_log(json.dumps(recovery))
                     # Success path: write assistant turn unless hold_msg withheld earlier failures
-                    if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                    if hasattr(memory, "add_msg") and callable(
+                        getattr(memory, "add_msg", None)
+                    ):
                         memory.add_msg("assistant", response, channel=channel)
                     # Logging
-                    if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
-                        memory.add_log("Thought '{}' completed successfully".format(self.name))
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' completed successfully".format(self.name)
+                        )
                     # Add reflection for reasoning trace (if configured)
                     if self.config.get("add_reflection", True):
-                        if hasattr(memory, "add_ref") and callable(getattr(memory, "add_ref", None)):
+                        if hasattr(memory, "add_ref") and callable(
+                            getattr(memory, "add_ref", None)
+                        ):
                             # Truncate response for reflection if too long
                             response_preview = str(response)[:300]
                             if len(str(response)) > 300:
                                 response_preview += "..."
-                            memory.add_ref("Thought '{}': {}".format(self.name, response_preview))
+                            memory.add_ref(
+                                "Thought '{}': {}".format(self.name, response_preview)
+                            )
                     break
                 else:
                     last_error = why
                     self.last_error = why
-                    failure_kind = "contract" if why.startswith("validator returned") else "validation"
+                    failure_kind = (
+                        "contract"
+                        if why.startswith("validator returned")
+                        else "validation"
+                    )
                     self._record_failure(
                         memory, attempts_made, failure_kind, why, raw_response=response
                     )
-                    if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
-                        memory.add_log("Thought '{}' validation failed: {}".format(self.name, why))
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' validation failed: {}".format(self.name, why)
+                        )
                     repair_suffix = self._build_repair_suffix(why)
                     working_prompt = self._append_repair_suffix(
                         original_prompt, working_prompt, repair_suffix
                     )
                     # Failed attempt: record assistant msg unless hold_msg=True
                     if not self._hold_msg():
-                        if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                        if hasattr(memory, "add_msg") and callable(
+                            getattr(memory, "add_msg", None)
+                        ):
                             memory.add_msg("assistant", response, channel=channel)
             except Exception as e:
                 last_error = str(e)
                 self.last_error = last_error
                 # Parse failures surface as ValueError with "Schema-based parsing failed"
-                failure_kind = "schema" if "Schema-based parsing failed" in last_error else "exception"
+                failure_kind = (
+                    "schema"
+                    if "Schema-based parsing failed" in last_error
+                    else "exception"
+                )
                 if failure_kind == "schema":
                     had_schema_rejection = True
                 self._record_failure(
-                    memory, attempts_made, failure_kind, last_error, raw_response=response
+                    memory,
+                    attempts_made,
+                    failure_kind,
+                    last_error,
+                    raw_response=response,
                 )
                 if not self._hold_msg():
-                    if response is not None and hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                    if (
+                        response is not None
+                        and hasattr(memory, "add_msg")
+                        and callable(getattr(memory, "add_msg", None))
+                    ):
                         memory.add_msg("assistant", response, channel=channel)
-                if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
-                    memory.add_log("Thought '{}' error: {}".format(self.name, last_error))
+                if hasattr(memory, "add_log") and callable(
+                    getattr(memory, "add_log", None)
+                ):
+                    memory.add_log(
+                        "Thought '{}' error: {}".format(self.name, last_error)
+                    )
                 repair_suffix = self._build_repair_suffix(last_error)
                 working_prompt = self._append_repair_suffix(
                     original_prompt, working_prompt, repair_suffix
@@ -667,7 +808,7 @@ class THOUGHT:
 
         # Restore original prompt after execution (prevents permanent mutation)
         self.prompt = original_prompt
-        
+
         return result, last_error, attempts_made
 
     def _execute_memory_query(self, memory, vars, **kwargs):
@@ -811,7 +952,11 @@ class THOUGHT:
 
     def build_prompt(self, memory, context_vars=None):
         """
-        Build the prompt for the LLM using construct_prompt.
+        Build the prompt for the LLM from the configured template and context.
+
+        Template rendering is separate from conversation history. Only the
+        configured prompt template is rendered here; MEMORY message content is
+        never rewritten during this step.
 
         Args:
             memory: MEMORY object providing context.
@@ -820,28 +965,22 @@ class THOUGHT:
         Returns:
             str: The constructed prompt string.
         """
-        # Get context variables (merge get_context and context_vars)
         ctx = self.get_context(memory)
         if context_vars:
             ctx.update(context_vars)
-        prompt_template = self.prompt
-        # If prompt is a dict, use construct_prompt, else format as string
-        if isinstance(prompt_template, dict):
-            prompt = construct_prompt(prompt_template)
-        elif isinstance(prompt_template, str):
-            try:
-                prompt = prompt_template.format(**ctx)
-            except Exception:
-                # fallback: just return as is
-                prompt = prompt_template
-        else:
-            prompt = str(prompt_template)
+        prompt = self._render_template_value(self.prompt, ctx)
         self.last_prompt = prompt
         return prompt
 
     def build_msgs(self, memory, context_vars=None):
         """
-        Build the messages list for the LLM using construct_msgs.
+        Build the messages list for the LLM.
+
+        Conversation history and prompt rendering are separate concerns.
+        When ``include_history`` is True (default), prior turns come from
+        ``MEMORY.get_llm_msgs()`` and are forwarded without template substitution.
+        When False, only the configured system prompt plus one rendered user
+        prompt are sent.
 
         Args:
             memory: MEMORY object providing context.
@@ -853,20 +992,36 @@ class THOUGHT:
         ctx = self.get_context(memory)
         if context_vars:
             ctx.update(context_vars)
-        # Compose system and user prompts
-        sys_prompt = self.config.get("system_prompt", "")
+
+        sys_prompt = self._render_template_value(
+            self.config.get("system_prompt", ""),
+            ctx,
+        )
         usr_prompt = self.build_prompt(memory, ctx)
-        # Optionally, allow for prior messages from memory
+
         msgs = []
-        if hasattr(memory, "get_msgs"):
-            # Optionally, get recent messages for context
-            msgs = memory.get_msgs(repr="list") if callable(getattr(memory, "get_msgs", None)) else []
-        # Build messages using construct_msgs
+        if self._include_history():
+            if hasattr(memory, "get_llm_msgs") and callable(
+                getattr(memory, "get_llm_msgs", None)
+            ):
+                msgs = list(memory.get_llm_msgs())
+            elif hasattr(memory, "get_msgs") and callable(
+                getattr(memory, "get_msgs", None)
+            ):
+                raw_events = memory.get_msgs(repr="list")
+                msgs = [
+                    {
+                        "role": event.get("role", "user"),
+                        "content": event.get("content", ""),
+                    }
+                    for event in raw_events
+                ]
+
         msgs_out = construct_msgs(
             usr_prompt=usr_prompt,
-            vars=ctx,
+            vars={},
             sys_prompt=sys_prompt,
-            msgs=msgs
+            msgs=msgs,
         )
         self.last_msgs = msgs_out
         return msgs_out
@@ -886,7 +1041,9 @@ class THOUGHT:
         if hasattr(self, "required_vars") and self.required_vars:
             for var in self.required_vars:
                 # Try to get from memory.get_var if available
-                if hasattr(memory, "get_var") and callable(getattr(memory, "get_var", None)):
+                if hasattr(memory, "get_var") and callable(
+                    getattr(memory, "get_var", None)
+                ):
                     val = memory.get_var(var)
                 else:
                     val = getattr(memory, var, None)
@@ -895,22 +1052,35 @@ class THOUGHT:
         # Optionally, add optional_vars if present in memory
         if hasattr(self, "optional_vars") and self.optional_vars:
             for var in self.optional_vars:
-                if hasattr(memory, "get_var") and callable(getattr(memory, "get_var", None)):
+                if hasattr(memory, "get_var") and callable(
+                    getattr(memory, "get_var", None)
+                ):
                     val = memory.get_var(var)
                 else:
                     val = getattr(memory, var, None)
                 if val is not None:
                     ctx[var] = val
         # Add some common context keys if available (content_only=True for prompt templates)
-        if hasattr(memory, "last_user_msg") and callable(getattr(memory, "last_user_msg", None)):
+        if hasattr(memory, "last_user_msg") and callable(
+            getattr(memory, "last_user_msg", None)
+        ):
             ctx["last_user_msg"] = memory.last_user_msg(content_only=True)
-        if hasattr(memory, "last_asst_msg") and callable(getattr(memory, "last_asst_msg", None)):
+        if hasattr(memory, "last_asst_msg") and callable(
+            getattr(memory, "last_asst_msg", None)
+        ):
             ctx["last_asst_msg"] = memory.last_asst_msg(content_only=True)
         if hasattr(memory, "get_msgs") and callable(getattr(memory, "get_msgs", None)):
             ctx["messages"] = memory.get_msgs(repr="list")
-        # Add all memory.vars if present
         if hasattr(memory, "vars"):
-            ctx.update(getattr(memory, "vars", {}))
+            for var_name in memory.vars:
+                if hasattr(memory, "get_var") and callable(
+                    getattr(memory, "get_var", None)
+                ):
+                    val = memory.get_var(var_name)
+                else:
+                    val = memory.vars.get(var_name)
+                if val is not None:
+                    ctx[var_name] = val
         return ctx
 
     def run_llm(self, msgs, **llm_kwargs):

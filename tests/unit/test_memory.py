@@ -1336,3 +1336,192 @@ class TestGetEvents:
         events = memory.get_events(limit=3)
         
         assert len(events) == 3
+
+
+class TestEmitOperations:
+    """
+    Tests for typed MEMORY.emit / get_emits lifecycle events.
+    """
+
+    def test_emit_stores_typed_event(self, memory):
+        """emit must store a machine-readable event retrievable via get_emits."""
+        memory.emit("plan_rejected", {"reason": "bad step", "step": 1})
+
+        emits = memory.get_emits()
+        assert len(emits) == 1
+        assert emits[0]["type"] == "emit"
+        assert emits[0]["kind"] == "plan_rejected"
+        assert emits[0]["payload"] == {"reason": "bad step", "step": 1}
+        assert emits[0]["schema_version"] == 1
+        assert "stamp" in emits[0]
+        assert "dt_utc" in emits[0]
+        assert "dt_bog" in emits[0]
+
+    def test_get_emits_filters_by_kind(self, memory):
+        """get_emits(kind=...) must return only matching kinds in order."""
+        memory.emit("run_started", {"run_id": "a"})
+        memory.emit("plan_rejected", {"reason": "x"})
+        memory.emit("run_started", {"run_id": "b"})
+
+        started = memory.get_emits(kind="run_started")
+        assert [event["payload"]["run_id"] for event in started] == ["a", "b"]
+
+        rejected = memory.get_emits(kind="plan_rejected")
+        assert len(rejected) == 1
+        assert rejected[0]["payload"]["reason"] == "x"
+
+    def test_get_emits_respects_limit(self, memory):
+        """get_emits(limit=N) must return the most recent N events after filtering."""
+        for i in range(5):
+            memory.emit("tick", {"n": i})
+
+        recent = memory.get_emits(kind="tick", limit=2)
+        assert [event["payload"]["n"] for event in recent] == [3, 4]
+
+    def test_emit_validates_before_mutation(self, memory):
+        """Invalid emit calls must raise before changing MEMORY state."""
+        with pytest.raises(ValueError, match="non-empty string"):
+            memory.emit("", {"x": 1})
+
+        with pytest.raises(ValueError, match="must be a dict"):
+            memory.emit("bad", ["not", "a", "dict"])
+
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            memory.emit("bad", {"obj": object()})
+
+        with pytest.raises(ValueError, match="schema_version"):
+            memory.emit("bad", {"x": 1}, schema_version=0)
+
+        assert len(memory.events) == 0
+        assert memory.get_emits() == []
+
+    def test_emit_rejects_whitespace_only_kind(self, memory):
+        """emit must reject whitespace-only kinds before storing an event."""
+        with pytest.raises(ValueError, match="non-empty string"):
+            memory.emit("   \t", {"x": 1})
+
+        assert memory.events == {}
+
+    def test_emit_preserves_original_non_whitespace_kind(self, memory):
+        """emit must validate with strip without normalizing the stored kind."""
+        kind = "  plan_rejected  "
+        memory.emit(kind, {"reason": "bad step"})
+
+        emits = memory.get_emits(kind=kind)
+        assert len(emits) == 1
+        assert emits[0]["kind"] == kind
+
+    def test_get_emits_validates_kind_filter(self, memory):
+        """get_emits must reject an empty kind filter string."""
+        memory.emit("ok", {"x": 1})
+
+        with pytest.raises(ValueError, match="non-empty string"):
+            memory.get_emits(kind="")
+
+    def test_get_emits_rejects_whitespace_only_kind(self, memory):
+        """get_emits must reject a whitespace-only kind filter."""
+        memory.emit("ok", {"x": 1})
+
+        with pytest.raises(ValueError, match="non-empty string"):
+            memory.get_emits(kind=" \n ")
+
+    def test_emit_deep_copies_payload_on_write(self, memory):
+        """Caller mutation after emit must not rewrite stored history."""
+        payload = {"items": [1, 2]}
+        memory.emit("snapshot", payload)
+
+        payload["items"].append(3)
+        payload["extra"] = "added"
+
+        stored = memory.get_emits()[0]["payload"]
+        assert stored == {"items": [1, 2]}
+
+    def test_get_emits_returns_independent_event_copies(self, memory):
+        """Caller mutation after reading must not rewrite stored history."""
+        memory.emit("snapshot", {"items": [1, 2]})
+
+        returned = memory.get_emits()
+        returned[0]["payload"]["items"].append(3)
+
+        stored = memory.get_emits()[0]["payload"]
+        assert stored == {"items": [1, 2]}
+
+    def test_repeated_emits_same_tick_preserved(self, memory, monkeypatch):
+        """Identical emits must retry a colliding stamp instead of overwriting."""
+        stamps = iter(["same_stamp", "same_stamp", "unique_stamp"])
+        monkeypatch.setattr(
+            "thoughtflow.memory.event_stamp",
+            lambda doc=None: next(stamps),
+        )
+        payload = {"same": True}
+        memory.emit("duplicate", payload)
+        memory.emit("duplicate", payload)
+
+        emits = memory.get_emits(kind="duplicate")
+        assert len(emits) == 2
+        assert emits[0]["stamp"] != emits[1]["stamp"]
+
+    def test_emits_survive_snapshot_from_events(self, memory):
+        """emit events must round-trip through snapshot and from_events."""
+        memory.emit("run_started", {"run_id": "r1"})
+        memory.add_msg("user", "Hello", channel="webapp")
+
+        snap = memory.snapshot()
+        restored = MEMORY.from_events(snap["events"].values(), objects=snap["objects"])
+
+        assert restored.get_emits("run_started")[0]["payload"] == {"run_id": "r1"}
+        assert restored.last_user_msg(content_only=True) == "Hello"
+
+    def test_emits_survive_json_roundtrip(self, memory):
+        """emit events must round-trip through to_json and from_json."""
+        memory.emit("plan_rejected", {"reason": "schema", "step": 2})
+
+        restored = MEMORY.from_json(memory.to_json())
+        emits = restored.get_emits("plan_rejected")
+
+        assert len(emits) == 1
+        assert emits[0]["payload"] == {"reason": "schema", "step": 2}
+
+    def test_emits_survive_pickle_save_load(self, memory, temp_file):
+        """emit events must round-trip through pickle save and load."""
+        memory.emit("run_completed", {"run_id": "r1", "status": "ok"})
+
+        memory.save(str(temp_file))
+        restored = MEMORY()
+        restored.load(str(temp_file))
+
+        assert restored.get_emits("run_completed")[0]["payload"]["status"] == "ok"
+
+    def test_emits_survive_copy(self, memory):
+        """copy must preserve emit events independently from the original."""
+        memory.emit("checkpoint", {"n": 1})
+
+        duplicate = memory.copy()
+        duplicate.emit("checkpoint", {"n": 2})
+
+        assert memory.get_emits()[0]["payload"]["n"] == 1
+        assert duplicate.get_emits()[-1]["payload"]["n"] == 2
+        assert len(memory.get_emits()) == 1
+        assert len(duplicate.get_emits()) == 2
+
+    def test_get_exchanges_unaffected_by_emit(self, memory):
+        """emit must not interfere with add_exchange / get_exchanges."""
+        memory.emit("run_started", {"run_id": "r1"})
+        memory.add_exchange(
+            "chat",
+            "key123",
+            "openai",
+            "gpt-4",
+            {"messages": []},
+            {"content": "hi"},
+        )
+        memory.emit("run_completed", {"run_id": "r1"})
+
+        exchanges = memory.get_exchanges(kind="chat")
+        assert len(exchanges) == 1
+        assert exchanges[0]["type"] == "llm"
+        assert exchanges[0]["response"] == {"content": "hi"}
+
+        emits = memory.get_emits()
+        assert len(emits) == 2
+        assert all(event["type"] == "emit" for event in emits)

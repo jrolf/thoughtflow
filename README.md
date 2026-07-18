@@ -93,7 +93,7 @@ supply-chain anxiety. The core library uses only Python's standard library —
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.2.4
+pip install thoughtflow==0.2.5
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -232,18 +232,6 @@ ThoughtFlow is the right choice when:
 - **You're building production agents**, not prototypes — Serious error handling, retry logic, validation.
 - **You prefer composition over configuration** — Plain Python, not YAML or JSON configs.
 - **You work across multiple LLM providers** — One interface for OpenAI, Anthropic, Groq, Gemini, Ollama, and more.
-
-## ❌ When NOT to Use ThoughtFlow
-
-Be honest with yourself — ThoughtFlow isn't for everyone:
-
-- **You need pre-built RAG pipelines out of the box** → Consider [LlamaIndex](https://github.com/run-llama/llama_index)
-- **You want visual workflow builders** → Consider [Flowise](https://github.com/FlowiseAI/Flowise), [Langflow](https://github.com/langflow-ai/langflow)
-- **You need very large-scale multi-agent swarms** → Consider [AutoGen](https://github.com/microsoft/autogen), [CrewAI](https://github.com/joaomdmoura/crewai) (ThoughtFlow supports multi-agent via AGENT + DELEGATE, but optimizes for clarity over massive swarms)
-- **You prefer batteries-included over minimal** → Consider [LangChain](https://github.com/langchain-ai/langchain)
-- **You need built-in vector stores and retrievers** → ThoughtFlow doesn't include these (but see [ThoughtBase](#-sister-library-thoughtbase))
-
-**ThoughtFlow is opinionated:** we trade breadth for clarity. We do fewer things, but we do them well.
 
 ---
 
@@ -611,6 +599,34 @@ visible = memory.get_msgs(exclude_metadata={"internal": True})
 rag_events = memory.get_msgs(metadata_filter={"source": "rag"})
 
 # ═══════════════════════════════════════════════════════════════════════════
+# RAG AUGMENTS — optional LLM-view merging (event log unchanged)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Store retrieved context as a tagged augment event
+memory.add_augment(
+    "Retrieved context:\n" + context,
+    metadata={"internal": True, "source": "rag"},
+)
+
+# Default LLM view: augment is a separate message
+memory.get_llm_msgs()
+
+# Opt-in: fold augment into the preceding user turn for the model only
+memory.get_llm_msgs(merge_augments=True)
+
+# AGENT(merge_augments=True) uses the merged view automatically
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LIFECYCLE EMITS — typed, JSON-safe machine-readable events
+# ═══════════════════════════════════════════════════════════════════════════
+
+memory.emit("run_started", {"run_id": "abc123", "trigger": {"source": "cron"}})
+memory.emit("plan_committed", {"step_count": 3, "plan_id": "p1"})
+
+started = memory.get_emits(kind="run_started")
+all_emits = memory.get_emits()  # chronological, deep-copied payloads
+
+# ═══════════════════════════════════════════════════════════════════════════
 # LOGS & REFLECTIONS — internal agent reasoning
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -765,6 +781,8 @@ memory.get_var("attachment")  # Returns decompressed data
 - **Full variable history** — See every change with timestamps
 - **Channel tracking** — Build omni-channel agents (web, mobile, Telegram, etc.)
 - **Message metadata** — Tag events and filter views (UI-visible vs internal)
+- **RAG augments** — `add_augment()` + `get_llm_msgs(merge_augments=True)` for optional LLM-view merging
+- **Lifecycle emits** — `emit()` / `get_emits()` for typed JSON-safe run facts alongside prose logs
 - **Tombstone deletion** — History is never lost
 - **Auto-compression** — Large values handled automatically
 - **Multiple export formats** — JSON, Pickle, snapshots for cloud sync
@@ -944,6 +962,20 @@ memory = thought(memory)
 # flows through parsing/validation and lands in memory as usual.
 
 # ═══════════════════════════════════════════════════════════════════════════
+# PROMPT RENDERING — substitute mode and history control
+# ═══════════════════════════════════════════════════════════════════════════
+
+thought = THOUGHT(
+    name="extract_plan",
+    llm=llm,
+    prompt='Return JSON with key "steps": {task}',
+    template_mode="substitute",  # exact {key} replacement (no .format() escaping issues)
+    include_history=False,       # only system + rendered user prompt (no prior turns)
+)
+# When include_history=True (default), prior turns come from MEMORY.get_llm_msgs()
+# and are forwarded without template substitution on historical content.
+
+# ═══════════════════════════════════════════════════════════════════════════
 # PRODUCTION LANE — opt-in hardening (v0.2.2+, defaults unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -996,6 +1028,8 @@ thought.last_response    # Raw LLM response
 - **Schema-based parsing** — Via `valid_extract` for bulletproof extraction
 - **Multiple validators** — Built-in or custom, via the `validation=` parameter
 - **Token streaming** — `on_token=` hook streams chunks without breaking the contract
+- **Prompt rendering** — `template_mode='substitute'` for JSON-heavy prompts; `include_history=False` for single-turn calls
+- **History via MEMORY** — Prior turns come from `get_llm_msgs()` without mutating stored events
 - **Production lane (opt-in)** — `validation_mode`, `strict_schema`, `hold_msg`, `on_failure`
 - **Structured failure visibility** — `{name}_last_error` and `{name}_attempts` on MEMORY
 - **Four operations** — `llm_call`, `memory_query`, `variable_set`, `conditional`
@@ -1294,6 +1328,8 @@ planner = PLAN(
 - **Configurable limits** — `max_steps` and `max_parallel` constraints
 - **Inherits from THOUGHT** — Full retry, serialization, and hook support
 
+For an executable, offline plan-commit-reflect loop built from PLAN, MEMORY, and plain Python, see the copy-and-edit [Foundation agent loop reference](examples/reference/README.md). The recipe demonstrates bounded execution, receipts, step-result resolution, approval gates, lifecycle emits, and isolated sub-runs without adding a framework layer.
+
 ---
 
 ### ACTION Subclasses — Elemental Operations
@@ -1477,6 +1513,7 @@ agent = AGENT(
     tools=tools,
     system_prompt="You are a helpful weather assistant.",
     max_iterations=10,
+    merge_augments=False,  # set True to fold RAG augments into user messages for the LLM
 )
 
 memory = MEMORY()
@@ -1690,6 +1727,21 @@ rules = {
 }
 ```
 
+**Branch-shaped responses (oneOf dialect):**
+
+```python
+# First matching branch wins — useful for classification thoughts
+rules = {
+    "kind": "python",
+    "format": {
+        "oneOf": [
+            {"verdict": "found", "matched_span": ""},
+            {"verdict": "absent", "note": ""},
+        ]
+    },
+}
+```
+
 **List element validation:**
 
 ```python
@@ -1745,6 +1797,7 @@ except ValidExtractError as e:
 - `{}` → dict (any contents)
 - `{"k": schema}` → dict with required key "k"
 - `{"k?": schema}` → dict with optional key "k"
+- `{"oneOf": [schema, ...]}` → first matching branch wins (classification)
 
 ---
 
@@ -2075,26 +2128,34 @@ lives in [`examples/serverless/`](examples/serverless/).
 
 ### RAG, the ThoughtFlow Way
 
-Retrieved context enters MEMORY as **tagged events** — the user's original
-message is never mutated, so the event log stays a truthful audit of what the
-user said versus what the system added:
+Retrieved context enters MEMORY as **tagged augment events** — the user's
+original message is never mutated, so the event log stays a truthful audit of
+what the user said versus what the system added:
 
 ```python
 # Retrieve (EMBED + cosine similarity, a vector DB, or any retriever you like)
 context = retrieve_relevant_chunks(memory.last_user_msg(content_only=True))
 
-# Inject as a tagged system message — auditable, filterable
-memory.add_msg("system", f"Relevant context:\n{context}",
-               metadata={"internal": True, "source": "rag"})
+# Store as an augment — auditable, filterable, separate in the event log
+memory.add_augment(
+    f"Relevant context:\n{context}",
+    metadata={"internal": True, "source": "rag"},
+)
 
-memory = answer_thought(memory)   # the THOUGHT sees the context
+# Default: THOUGHT/AGENT see context as a separate system message
+memory = answer_thought(memory)
+
+# Opt-in: fold context into the user turn for the LLM payload only
+agent = AGENT(llm=llm, merge_augments=True)
+memory = agent(memory)
 
 # The UI shows only what the user should see
 visible_history = memory.get_msgs(exclude_metadata={"internal": True})
 ```
 
 ThoughtFlow deliberately ships no vector store — compose with whatever
-retrieval you already trust. The full doctrine is in
+retrieval you already trust. The full walkthrough is in
+[`examples/scripts/14_rag_llm_view.py`](examples/scripts/14_rag_llm_view.py) and
 [`docs/concepts/rag.md`](docs/concepts/rag.md).
 
 ---
@@ -2269,7 +2330,8 @@ thoughtflow/
 │   └── eval/            # Evaluation harness (record/replay lives in llm.py/memory.py)
 ├── primitives/          # Per-primitive documentation (Markdown) — canonical API reference
 ├── examples/            # Working, runnable examples
-│   ├── scripts/         # Numbered walkthroughs (01_hello_world ... 13_record_replay)
+│   ├── scripts/         # Numbered walkthroughs (01_hello_world ... 15_thought_integration_test)
+│   ├── reference/       # Copy-and-edit agent loop recipes with focused tests
 │   └── serverless/      # Deployable AWS Lambda chat handler
 ├── tests/               # Comprehensive test suite
 │   ├── unit/
@@ -2318,10 +2380,11 @@ See [developer/](developer/) for comprehensive development documentation.
 | **Orchestration** | ✅ Stable | WORKFLOW, CHRON |
 | **Action Subclasses** | ✅ Stable | 16 elemental operations (SEARCH, SCRAPE, FETCH, etc.) |
 | **Record/Replay** | ✅ Shipped | LLM/EMBED recording, deterministic replay, eval harness |
+| **Lifecycle emits & RAG augments** | ✅ Shipped | `emit()`/`get_emits()`, `add_augment()`/`get_llm_msgs(merge_augments=)` |
 | **Provider convenience classes** | ✅ Shipped (0.2.2) | GroqLLM, CerebrasLLM, OpenRouterLLM, prompt caching |
 | **API Stability** | 🟡 Alpha | May evolve based on feedback |
 | **Documentation** | ✅ Per-primitive docs | `primitives/` folder with Markdown per class |
-| **Test Coverage** | ✅ ~744 unit tests | Plus optional integration smoke tests (API keys) |
+| **Test Coverage** | ✅ ~870 unit tests | Plus optional integration smoke tests (API keys) |
 | **Serverless Ready** | ✅ Yes | Zero deps, deployable example in `examples/serverless/` |
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.

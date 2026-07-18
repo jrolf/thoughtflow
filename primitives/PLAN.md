@@ -14,7 +14,7 @@ In the ThoughtFlow ecosystem, PLAN bridges high-level goals and low-level execut
 
 PLAN builds a prompt by appending a formatted list of available actions (with descriptions and parameter schemas when provided) and format instructions. The LLM is asked to return a JSON array: outer list = sequential steps, inner list = tasks that can run in parallel within that step. Each task is an object with `action`, optional `params`, and required `reason`.
 
-`parse_response` extracts JSON from the LLM output, handling markdown code blocks and stray text. Subclasses may override `normalize_plan(parsed)` to apply deterministic repairs before validation (unwrap string plans, lift params, etc.). `validate` checks: the result is a list, step count does not exceed `max_steps`, task count per step does not exceed `max_parallel`, each task has a valid `action` from the actions dict, all missing required params are reported together when schemas exist, and `reason` is a non-empty string without newlines.
+`parse_response` extracts JSON from the LLM output, handling markdown code blocks and stray text. Subclasses may override `normalize_plan(parsed)` to apply deterministic repairs before validation (unwrap string plans, lift params, etc.). The normalized value is what THOUGHT validates, assigns to `last_result`, returns from the retry loop, and stores in MEMORY. `validate()` still normalizes once for direct callers via the shared internal path. `validate` checks: the result is a list, step count does not exceed `max_steps`, task count per step does not exceed `max_parallel`, each task has a valid `action` from the actions dict, all missing required params are reported together when schemas exist, and `reason` is a non-empty string without newlines.
 
 On validation failure, PLAN appends a repair suffix and retries (default `max_retries` 3). Repair text is humanized (no raw JSONPath or `NoneType` noise) via the shared THOUGHT repair helpers. The result is stored at `{name}_result`. Tasks can reference previous step results via `{step_N_result}` in parameter values.
 
@@ -37,7 +37,9 @@ class MyPlanner(PLAN):
         return parsed_result
 ```
 
-Default implementation is a no-op pass-through. The hook runs at the start of `validate()`, before step/task checks.
+Default implementation is a no-op pass-through. The hook runs once before step/task checks; the transformed plan is validated and stored on MEMORY, not merely accepted during validation.
+
+Compatibility note: a PLAN subclass that overrides public `validate()` keeps the legacy retry behavior. Its validator receives the raw parsed value, and that raw value is stored on success. Override the protected preparation/validation seam explicitly only when custom validation must also propagate a transformed result.
 
 ### Aggregate missing-param errors
 

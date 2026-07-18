@@ -5,6 +5,27 @@ All notable changes to ThoughtFlow will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.5] - 2026-07-17
+
+Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.
+
+### Added
+- `MEMORY.emit()` and `get_emits()` for JSON-safe, typed lifecycle and evaluation events
+- THOUGHT `template_mode='substitute'` for exact `{key}` replacement in JSON-heavy prompts
+- THOUGHT `include_history=False` for requests containing only the configured system and user prompts
+- Executable plan-commit-reflect reference recipe with receipts, bounded loops, step-result resolution, lifecycle events, sub-run isolation, and CHRON adapter guidance
+
+### Changed
+- THOUGHT now builds included history through `MEMORY.get_llm_msgs()` and no longer applies bare substring replacement to historical message content
+- THOUGHT prompt context now exposes each MEMORY variable's latest value instead of its internal event history
+- Dict-shaped prompt sections retain their previous format-mode behavior and support exact placeholder rendering in substitute mode
+- README aligned with current capabilities (lifecycle emits, RAG augments, THOUGHT rendering options)
+
+### Fixed
+- PLAN now validates, returns, and stores the same value produced by `normalize_plan()`, including across validation retries
+
 ## [0.2.4] - 2026-07-11
 
 ### Fixed
@@ -48,10 +69,6 @@ Production-hardening release: THOUGHT/PLAN parsing improvements (Foundation Agen
 - OpenRouter `referer`/`title` no longer leak into request JSON body
 - EMBED Groq calls include User-Agent (Cloudflare HTTP 1010 without it)
 - EMBED `text-embedding-004` aliases to `gemini-embedding-001`; `last_error` surfaced on failures
-
-## [Unreleased]
-
-_Nothing yet._
 
 ---
 
@@ -208,7 +225,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jrolf/thoughtflow/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jrolf/thoughtflow/compare/v0.2.0...v0.2.2

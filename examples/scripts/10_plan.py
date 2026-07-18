@@ -288,8 +288,8 @@ def main():
              "reason": "Find comparative analysis to understand positioning."},
         ],
         [
-            {"action": "fetch_page", "params": {"url": "{step_0_result[0].url}"},
-             "reason": "Retrieve most relevant page from first search."},
+            {"action": "fetch_page", "params": {"url": "{step_0_result}"},
+             "reason": "Retrieve most relevant page from first search (whole step ref)."},
             {"action": "fetch_page", "params": {"url": "https://pypi.org/project/thoughtflow/"},
              "reason": "Get official PyPI page for authoritative info."},
         ],
@@ -354,6 +354,9 @@ Requirements:
     
     print("Research Workflow Plan:")
     print("-" * 50)
+    print("Note: bracket/dotted refs like {step_0_result[0].url} are NOT supported")
+    print("in version 1; use exact whole-value {step_N_result} placeholders only.")
+    print("-" * 50)
     for i, step in enumerate(plan):
         parallel_note = " (PARALLEL)" if len(step) > 1 else ""
         print(f"\nStep {i}{parallel_note}:")
@@ -389,6 +392,8 @@ Requirements:
     
     4. Step References:
        - Tasks can reference {step_N_result} from previous steps
+       - Version 1 supports exact whole-value placeholders only
+       - Bracket indexes and dotted paths (e.g. {step_0_result[0].url}) are unsupported
     
     5. Validation:
        - Action names must be in defined actions

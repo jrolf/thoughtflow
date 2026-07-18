@@ -26,9 +26,22 @@ Schema validation and callable validation are **not** parallel gates. A `validat
 
 ### Default lane vs production lane
 
-**Default lane (no flags):** flat `format` dict, existing retry semantics, failure logs and `{name}_last_error` on MEMORY, assistant messages recorded on failed attempts.
+**Default lane (no flags):** flat `format` dict, existing retry semantics, failure logs and `{name}_last_error` on MEMORY, assistant messages recorded on failed attempts. Conversation history is included via `MEMORY.get_llm_msgs()` and is never rewritten by prompt templating.
 
-**Production lane (opt-in):** `strict_schema=True`, `validation_mode='rescue'`, `on_failure=`, `hold_msg=True`, `oneOf` schema dialect. See [docs/concepts/thought.md](../docs/concepts/thought.md) for the full guide.
+**Production lane (opt-in):** `strict_schema=True`, `validation_mode='rescue'`, `on_failure=`, `hold_msg=True`, `template_mode='substitute'`, `include_history=False`, `oneOf` schema dialect. See [docs/concepts/thought.md](../docs/concepts/thought.md) for the full guide.
+
+### Prompt templates vs conversation history
+
+Template rendering and history inclusion are separate concerns:
+
+- **`template_mode='format'`** (default): renders the configured prompt with `str.format(**ctx)` and keeps the legacy silent fallback when formatting fails.
+- **`template_mode='substitute'`**: replaces only explicit `{key}` placeholders for keys present in context. Literal JSON braces and unknown placeholders stay untouched; bare words such as `messages` are not replaced unless the template contains `{messages}`.
+- **`include_history=True`** (default): prior turns come from `MEMORY.get_llm_msgs()` and are forwarded without template substitution.
+- **`include_history=False`**: sends only the configured system prompt plus one rendered user prompt.
+
+Both user and system prompt strings follow the selected rendering mode. Dict-shaped prompts retain their legacy unrendered sections in format mode; substitute mode renders each string section before assembly. MEMORY variables enter template context as their latest values, not their internal event histories. `include_history=False` disables automatic history messages, but an explicit context placeholder such as `{messages}` or `{last_user_msg}` can still place MEMORY content in the configured prompt.
+
+JSON-heavy prompts should prefer `template_mode='substitute'`.
 
 ## Schema parsing (`parsing_rules`)
 
@@ -91,6 +104,8 @@ After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY wit
 | on_failure | Hook: fn(thought, attempt, failure_kind, reason, raw_response=None) |
 | hold_msg | Opt-in: hold assistant messages until successful parse+validate |
 | repair_target | For dict prompts, which section key receives repair suffix text |
+| template_mode | Opt-in prompt rendering: `format` (default, str.format) or `substitute` ({key} only) |
+| include_history | Opt-in history control: True (default) forwards MEMORY turns via get_llm_msgs; False sends system + user only |
 | max_retries | Retry attempts on validation failure |
 | retry_delay | Delay between retries in seconds |
 | required_vars | Variables required from memory |
@@ -143,6 +158,17 @@ thought = THOUGHT(
     on_failure=my_metrics_hook,
     hold_msg=True,
     max_retries=3,
+)
+```
+
+```python
+# JSON-heavy prompt: safe substitution without rewriting history
+thought = THOUGHT(
+    name='extract',
+    llm=llm,
+    prompt='Extract fields from: {text}. Example shape: {"name": "", "score": 0}',
+    template_mode='substitute',
+    include_history=False,
 )
 ```
 

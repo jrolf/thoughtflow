@@ -148,6 +148,72 @@ chron.add("critical", schedule="0 * * * *", action=hourly_check, catch_up=True)
 - **NOTIFY**: Natural pairing — CHRON fires a job, and the job's last step sends a NOTIFY with the results.
 - **MEMORY**: Each job execution receives a MEMORY. By default it's fresh; `memory=` shares one; `memory_factory=` creates custom ones.
 
+## Firing into an agent outer loop
+
+Scheduled jobs often need to re-enter a product-specific **outer loop** (triage, session lifecycle, inner plan engine) rather than run an isolated THOUGHT. CHRON does not ship that outer loop; it invokes your action with a MEMORY instance only.
+
+### Recommended closure adapter (docs-only pattern)
+
+Build a plain function action that synthesizes a trigger dict and calls your outer loop. Generate a **fresh execution id** per fire; do not treat the job name as a dedupe key.
+
+```python
+import copy
+import uuid
+from thoughtflow import CHRON, MEMORY
+
+def normalize_trigger(raw):
+    # Local helper in your agent: explicit source, kind, payload.
+    ...
+
+def outer_loop(trigger, agent, run_id=None):
+    # Your vessel: triage, inner_loop, run lifecycle emits.
+    ...
+
+def make_chron_adapter(outer_loop_fn, agent_template):
+    def chron_action(memory):
+        execution_id = "chron_{}".format(uuid.uuid4().hex[:12])
+        trigger = {
+            "id": execution_id,
+            "source": "chron",
+            "kind": "scheduled_tick",
+            "payload": {"execution_id": execution_id},
+        }
+        non_memory_state = {
+            key: value
+            for key, value in agent_template.items()
+            if key != "memory"
+        }
+        agent = copy.deepcopy(non_memory_state)
+        agent["memory"] = memory
+        outer_loop_fn(trigger, agent, run_id=execution_id)
+    return chron_action
+
+chron = CHRON(name="ops")
+adapter = make_chron_adapter(
+    outer_loop,
+    {"effort_cap": 2},
+)
+chron.add(
+    "hourly",
+    schedule="0 * * * *",
+    action=adapter,
+)
+results = chron.tick()
+```
+
+See `examples/reference/plan_commit_reflect_loop.py` for a tested variant with run lifecycle emits and honest limitations.
+
+### Current limitations (honest)
+
+| Topic | Today | Implication |
+|-------|-------|-------------|
+| Action arguments | `(memory)` only | No job name, schedule, manual vs catch-up mode, or occurrence id in the callable |
+| Dedupe identity | Not provided | Reuse job name as id can suppress legitimate future runs |
+| Delivery semantics | At-least-once ticks | Outer loop handlers should be idempotent |
+| Atomic handoff | Not guaranteed | CHRON state update and outer-loop completion are not one transaction |
+
+Catch-up mode replays missed ticks one per `tick()` call; each replay still receives only MEMORY. Hold durable dedupe guidance until CHRON exposes explicit execution context in a future release.
+
 ## Considerations for Future Development
 
 - **Async execution**: Support for `asyncio`-based actions and non-blocking execution of multiple due jobs.

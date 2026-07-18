@@ -178,6 +178,71 @@ Never mix boundaries. Each block is separate.
 This is to improve your ease-of-reading.
 '''
 
+def substitute_placeholders(text, ctx):
+    """
+    Replace ``{key}`` placeholders only when ``key`` is present in ``ctx``.
+
+    Unknown placeholders and literal JSON braces are left untouched. Bare words
+    such as ``messages`` are never replaced unless the template contains
+    ``{messages}``.
+
+    Args:
+        text (str): Template string.
+        ctx (dict): Context variables available for substitution.
+
+    Returns:
+        str: Rendered string.
+    """
+    if not isinstance(text, str):
+        return str(text)
+
+    pattern = re.compile(r"\{([^}]+)\}")
+
+    def replacer(match):
+        key = match.group(1)
+        if key in ctx:
+            return str(ctx[key])
+        return match.group(0)
+
+    return pattern.sub(replacer, text)
+
+
+def render_template(template, ctx, mode="format"):
+    """
+    Render a prompt template using the selected template mode.
+
+    ``format`` uses ``str.format(**ctx)`` with the legacy silent fallback that
+    returns the raw template when formatting fails. ``substitute`` replaces
+    only explicit ``{key}`` placeholders for keys present in ``ctx``.
+
+    Args:
+        template (str): Prompt template string.
+        ctx (dict): Context variables for rendering.
+        mode (str): ``format`` or ``substitute``.
+
+    Returns:
+        str: Rendered prompt text.
+
+    Raises:
+        ValueError: When ``mode`` is not ``format`` or ``substitute``.
+    """
+    if mode not in ("format", "substitute"):
+        raise ValueError(
+            "template_mode must be 'format' or 'substitute', got: {!r}".format(mode)
+        )
+
+    if not isinstance(template, str):
+        return str(template)
+
+    if mode == "substitute":
+        return substitute_placeholders(template, ctx)
+
+    try:
+        return template.format(**ctx)
+    except Exception:
+        return template
+
+
 def construct_prompt(
     prompt_obj = {},
     order = [],

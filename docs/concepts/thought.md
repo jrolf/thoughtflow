@@ -14,6 +14,7 @@ Understanding order matters. Two validation layers look composable but run **seq
 prompt + context
     → LLM call
     → parse_response()        # schema via valid_extract when parsing_rules set
+    → prepare / normalize     # optional deterministic transform for PLAN
     → validate()              # callable or built-in validator
     → MEMORY update           # {name}_result, logs, optional assistant msg
 ```
@@ -23,6 +24,19 @@ prompt + context
 On failure after all retries, THOUGHT stores `None` in `{name}_result` and returns MEMORY normally (no exception). Inspect `{name}_last_error` and structured log events to distinguish misconfiguration from model failure.
 
 ---
+
+## Prompt templates vs conversation history
+
+Template rendering and history inclusion are separate opt-in controls on THOUGHT:
+
+| Flag | Default | Behavior |
+|------|---------|----------|
+| `template_mode='format'` | yes | Render configured prompts with `str.format(**ctx)`; legacy silent fallback on format errors |
+| `template_mode='substitute'` | no | Replace only `{key}` placeholders for keys present in context; leave literal JSON braces and unknown placeholders untouched |
+| `include_history=True` | yes | Forward prior turns from `MEMORY.get_llm_msgs()` without rewriting their content |
+| `include_history=False` | no | Send only configured system prompt plus one rendered user prompt |
+
+Historical message content is never template-substituted. Both user and system prompt strings use the selected rendering mode. Dict-shaped prompts retain their legacy unrendered sections in format mode; substitute mode renders each string section before assembly. MEMORY variables enter template context as their latest values rather than internal event histories. `include_history=False` disables automatic history messages, but explicit placeholders such as `{messages}` or `{last_user_msg}` can still place MEMORY content in the configured prompt. JSON-heavy prompts should use `template_mode='substitute'`.
 
 ## Schema language (`parsing_rules`)
 
@@ -154,6 +168,8 @@ Opt-in settings for high-volume harnesses (none required for simple use):
 | `validation_mode='rescue'` | Let callable validators accept schema-rigid misses |
 | `on_failure=fn` | Per-attempt callback for metrics or tracing |
 | `hold_msg=True` | Skip assistant messages from failed attempts |
+| `template_mode='substitute'` | Safe `{key}` substitution for JSON-heavy prompts |
+| `include_history=False` | Omit prior MEMORY turns from the LLM request |
 | `oneOf` in format | Branch-shaped classification without weak optional schemas |
 
 ---

@@ -28,7 +28,19 @@ The contract is: memory flows through primitives — `memory = primitive(memory)
 | Reflections | Agent reasoning traces (role: reflection) |
 | object_threshold | Size in bytes above which values auto-compress to object refs (default 10KB) |
 
-**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
+**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `emit`, `get_emits`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
+
+## Channel selection: logs, emits, and exchanges
+
+MEMORY offers three distinct write paths for non-message facts. Pick the channel that matches the consumer:
+
+| Channel | Method | Consumer | Shape |
+|---------|--------|----------|-------|
+| Human / legacy logs | `add_log(message)` | Operators, debugging prose | Plain string content |
+| Machine-readable lifecycle / eval | `emit(kind, payload, schema_version=1)` | Harnesses, batch eval, run lifecycle helpers | Typed dict with `type='emit'`, `kind`, JSON-safe `payload`, `schema_version` |
+| Model record / replay | `add_exchange(...)` | `LLM.record` / `LLM.replay`, `EMBED.record` | `type='llm'` exchange events |
+
+`emit` stores normal events through the existing `_store_event` path. Payloads are deep-copied on write, and `get_emits` returns independent event copies so callers cannot rewrite stored history through a read result. Callers must keep payloads JSON-serializable, redact secrets, and bound size. MEMORY is not thread-safe; callers own synchronization.
 
 ## Usage
 
@@ -47,6 +59,10 @@ memory.save('memory.pkl')
 ```python
 # Rehydrate from events
 memory2 = MEMORY.from_events(event_list, objects=obj_dict)
+
+# Typed lifecycle events for harnesses and eval
+memory.emit('plan_rejected', {'reason': 'invalid step', 'step': 2})
+events = memory.get_emits('plan_rejected')
 
 # Export to JSON
 memory.to_json('backup.json')

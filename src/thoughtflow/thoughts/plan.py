@@ -286,8 +286,8 @@ Constraints:
 
         Override in subclasses when the model returns JSON that is syntactically
         valid but needs cleanup: unwrap string plans, lift flat params onto task
-        dicts, unwrap ``{"steps": [...]}`` envelopes, etc. Runs at the start of
-        ``validate()`` before step/task/action checks.
+        dicts, unwrap ``{"steps": [...]}`` envelopes, etc. Runs once before
+        step/task/action checks.
 
         Default is a no-op pass-through. Keep repairs deterministic — no LLM calls.
 
@@ -295,16 +295,38 @@ Constraints:
             parsed_result: Output from ``parse_response`` (list, dict, or occasionally str).
 
         Returns:
-            The plan structure ``validate()`` will inspect (expected: list of step lists).
+            The plan structure validation will inspect (expected: list of step lists).
         """
         return parsed_result
+
+    def _prepare_and_validate(self, parsed_result):
+        """
+        Normalize once, then validate the exact plan that will be stored.
+
+        A subclass that overrides public ``validate()`` keeps the legacy
+        polymorphic path: its validator receives the raw parsed value, and that
+        same value remains the stored result. Subclasses that only override
+        ``normalize_plan()`` use PLAN's normalize-once path.
+
+        Args:
+            parsed_result: Parsed plan from the model response.
+
+        Returns:
+            tuple: ``(result_for_storage, is_valid, reason_string)``.
+        """
+        if type(self).validate is not PLAN.validate:
+            return super()._prepare_and_validate(parsed_result)
+
+        prepared = self.normalize_plan(parsed_result)
+        valid, why = self._validate_plan(prepared)
+        return prepared, valid, why
 
     def validate(self, parsed_result):
         """
         Validate plan structure, action names, and parameters.
 
         Flow:
-          1. ``normalize_plan(parsed_result)`` — subclass hook
+          1. ``normalize_plan(parsed_result)``
           2. Top-level shape: non-empty list (unless allow_empty), max_steps
           3. Per step: list of tasks, max_parallel, non-empty
           4. Per task: ``_validate_task`` (action, params schema, reason)
@@ -314,14 +336,24 @@ Constraints:
         one param at a time.
 
         Args:
-            parsed_result: Parsed plan from LLM (after normalize_plan).
+            parsed_result: Parsed plan from LLM (normalized before checks).
 
         Returns:
             tuple: (is_valid, reason_string). reason_string empty when valid.
         """
-        parsed_result = self.normalize_plan(parsed_result)
+        prepared = self.normalize_plan(parsed_result)
+        return self._validate_plan(prepared)
 
-        # Must be a list
+    def _validate_plan(self, parsed_result):
+        """
+        Validate an already-normalized plan without running normalize again.
+
+        Args:
+            parsed_result: Normalized plan structure.
+
+        Returns:
+            tuple: (is_valid, reason_string)
+        """
         if not isinstance(parsed_result, list):
             return False, "Plan must be a list of steps, got: {}".format(type(parsed_result).__name__)
         

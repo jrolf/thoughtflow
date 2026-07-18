@@ -95,6 +95,30 @@ You rarely call these directly; they power the record/replay system. Because exc
 
 ---
 
+## Typed lifecycle events (`emit`)
+
+For machine-readable facts at loop boundaries (run lifecycle, plan rejection, eval checkpoints), use `emit` instead of prose logs:
+
+```python
+memory.emit("plan_rejected", {"reason": "invalid step", "step": 2})
+memory.get_emits("plan_rejected")   # filter by kind
+memory.get_emits(limit=5)           # most recent five emits
+```
+
+Each emit is a normal event with `type='emit'`, a non-empty `kind` string, a JSON-serializable `payload` dict, and `schema_version` (default 1). Payloads are deep-copied on write, and `get_emits` returns independent event copies so read-side mutation cannot alter stored history.
+
+### Channel selection
+
+| Need | Use | Why |
+|------|-----|-----|
+| Human debugging prose | `add_log(message)` | Legacy string logs for operators |
+| Structured lifecycle / eval facts | `emit(kind, payload)` | Harness-friendly typed events |
+| Model request/response capture | `add_exchange(...)` | Record/replay only; do not reuse for lifecycle |
+
+Callers must keep emit payloads JSON-safe, redact secrets, and bound size. MEMORY does not enforce payload size limits and is not thread-safe; callers own synchronization.
+
+---
+
 ## THOUGHT failure variables
 
 When an `llm_call` THOUGHT exhausts retries, it stores `None` in `{name}_result` and returns MEMORY without raising. Inspect these vars and log events to distinguish misconfiguration from model failure:
