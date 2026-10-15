@@ -124,6 +124,18 @@ def _parse_range(token):
     return int(parts[0]), int(parts[1])
 
 
+# Common shorthand accepted anywhere a cron expression is. "@daily" and "@midnight" are the same.
+CRON_ALIASES = {
+    "@hourly": "0 * * * *",
+    "@daily": "0 0 * * *",
+    "@midnight": "0 0 * * *",
+    "@weekly": "0 0 * * 0",
+    "@monthly": "0 0 1 * *",
+    "@yearly": "0 0 1 1 *",
+    "@annually": "0 0 1 1 *",
+}
+
+
 def parse_cron(expression):
     """
     Parse a 5-field cron expression into a dict of allowed value sets.
@@ -137,7 +149,8 @@ def parse_cron(expression):
     matching can apply the correct logic.
 
     Args:
-        expression: Cron string like "0 9 * * 1-5".
+        expression: Cron string like "0 9 * * 1-5", or an alias such as
+            ``@hourly``, ``@daily``, ``@weekly``, ``@monthly``, ``@yearly``.
 
     Returns:
         dict: Keys are ``minute``, ``hour``, ``day``, ``month``,
@@ -157,6 +170,7 @@ def parse_cron(expression):
         >>> fields["weekday_restricted"]
         True
     """
+    expression = CRON_ALIASES.get(expression.strip().lower(), expression)
     tokens = expression.strip().split()
     if len(tokens) != 5:
         raise ValueError(
