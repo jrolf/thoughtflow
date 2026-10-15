@@ -313,6 +313,29 @@ class TestMCPHttp:
         assert tools[0].name == "fetch"
 
     @patch('urllib.request.urlopen')
+    def test_http_sends_custom_headers_and_timeout(self, mock_urlopen):
+        """
+        HTTP requests must carry the configured headers and request timeout.
+
+        Remove this test if: We change how HTTP headers or timeouts are configured.
+        """
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.read.return_value = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": {"tools": []},
+        }).encode("utf-8")
+        mock_urlopen.return_value = mock_response
+
+        mcp = MCP("https://example.com/mcp", headers={"Authorization": "Bearer abc"}, timeout=7)
+        mcp.list_tools()
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.get_header("Authorization") == "Bearer abc"
+        assert request.get_header("Content-type") == "application/json"
+        assert mock_urlopen.call_args[1]["timeout"] == 7
+
+    @patch('urllib.request.urlopen')
     def test_http_call_tool(self, mock_urlopen):
         """
         call_tool() over HTTP must send correct JSON-RPC and parse response.
