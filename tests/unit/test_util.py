@@ -33,7 +33,19 @@ from thoughtflow._util import (
     estimate_size,
     is_obj_ref,
     truncate_content,
+    TemplateRenderError,
+    render_template,
 )
+
+
+def test_render_template_reports_missing_placeholder():
+    with pytest.raises(TemplateRenderError, match="'goal'"):
+        render_template("Plan for {goal}", {})
+
+
+def test_render_template_reports_malformed_brace():
+    with pytest.raises(TemplateRenderError):
+        render_template("Plan for {goal", {"goal": "x"})
 
 
 # ============================================================================

@@ -18,6 +18,28 @@ import pytest
 from thoughtflow import THOUGHT, DECIDE, PLAN, MEMORY
 
 
+def test_missing_required_prompt_variable_fails_before_llm_call(mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(
+        name="plan",
+        llm=llm,
+        prompt="Plan for {goal}",
+        required_vars=["goal"],
+    )
+    thought(memory)
+    assert llm.call_count == 0
+    assert memory.get_var("plan_last_error")["failure_kind"] == "template"
+    assert "goal" in memory.get_var("plan_last_error")["reason"]
+
+
+def test_malformed_prompt_fails_before_llm_call(mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(name="plan", llm=llm, prompt="Plan for {goal")
+    thought(memory)
+    assert llm.call_count == 0
+    assert memory.get_var("plan_last_error")["failure_kind"] == "template"
+
+
 # ============================================================================
 # Initialization Tests
 # ============================================================================

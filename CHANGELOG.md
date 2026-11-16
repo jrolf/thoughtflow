@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fail loudly on malformed or missing prompt template variables and enforce `required_vars` before an LLM call.
 ## [0.2.5] - 2026-07-17
 
 Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.

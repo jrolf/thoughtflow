@@ -12,6 +12,10 @@ from __future__ import annotations
 ### IMPORTS AND SETTINGS
 
 import time, pickle, json
+
+
+class TemplateRenderError(ValueError):
+    """A configured prompt template could not be rendered safely."""
 import re, ast
 from typing import Mapping, Any, Iterable, Optional, Tuple, Union
 
@@ -239,8 +243,10 @@ def render_template(template, ctx, mode="format"):
 
     try:
         return template.format(**ctx)
-    except Exception:
-        return template
+    except (KeyError, IndexError, ValueError, AttributeError) as exc:
+        raise TemplateRenderError(
+            "Prompt template could not be rendered: {}".format(exc)
+        ) from exc
 
 
 def construct_prompt(

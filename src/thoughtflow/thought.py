@@ -22,6 +22,7 @@ from thoughtflow._util import (
     humanize_schema_error,
     format_schema_annotation,
     scan_none_exemplars,
+    TemplateRenderError,
 )
 
 
@@ -772,7 +773,9 @@ class THOUGHT:
                 self.last_error = last_error
                 # Parse failures surface as ValueError with "Schema-based parsing failed"
                 failure_kind = (
-                    "schema"
+                    "template"
+                    if isinstance(e, TemplateRenderError)
+                    else "schema"
                     if "Schema-based parsing failed" in last_error
                     else "exception"
                 )
@@ -968,6 +971,14 @@ class THOUGHT:
         ctx = self.get_context(memory)
         if context_vars:
             ctx.update(context_vars)
+        missing = [
+            var for var in self.required_vars
+            if var not in ctx or ctx[var] is None
+        ]
+        if missing:
+            raise TemplateRenderError(
+                "Required prompt variables missing: {}".format(", ".join(missing))
+            )
         prompt = self._render_template_value(self.prompt, ctx)
         self.last_prompt = prompt
         return prompt

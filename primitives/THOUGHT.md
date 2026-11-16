@@ -82,7 +82,7 @@ Validation is configured via the canonical `validation=` parameter (config alias
 
 ## Failure visibility
 
-Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`). Vars `{name}_last_error` and `{name}_attempts` are set on failure. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` values: `schema`, `validation`, `contract`, `exception`.
+Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`). Vars `{name}_last_error` and `{name}_attempts` are set on failure. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` values: `template`, `schema`, `validation`, `contract`, `exception`. Prompt rendering errors fail before the LLM call; missing `required_vars` are reported instead of sending a raw template.
 
 After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY without raising. Execution events include `failed: true` when retries were exhausted with an error.
 
