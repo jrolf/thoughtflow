@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
+- `LLM` now defaults `request_timeout` to `120` seconds (pass `request_timeout=None` for blocking), rejects unsupported `n > 1` on providers/streaming that cannot honor it, and stops printing HTTP errors to stdout in `call()`.
+
+### Fixed
+- `DELEGATE._copy_memory` now uses `memory.copy()` so delegated agents receive actual variable values, descriptions, and tombstones instead of nested `[stamp, value]` history lists.
+- `DECIDE.parse_response` requires an exact, leading, or single non-negated word-boundary choice match so negated replies such as `"I do not approve this. Revise."` trigger repair retries instead of matching `"approve"`.
+- `ReactAgent` preserves multi-line `Final Answer:` responses and appends a policy-veto `Observation:` when `on_tool_call` returns `False`.
+- `WORKFLOW` treats exceptions raised inside `condition` callables as step errors honoring `on_error` rather than silently skipping as `condition_false`.
+- `CHRON` captures returned `MEMORY` objects from job actions, writes `state_file` atomically, and surfaces corrupt/failed state I/O via `RuntimeWarning` + `last_state_error` (or raises with `on_state_error='raise'`).
 ## [0.2.5] - 2026-07-17
 
 Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.

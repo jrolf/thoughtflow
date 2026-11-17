@@ -14,7 +14,7 @@ WORKFLOW composes THOUGHTs, ACTIONs, AGENTs, and DELEGATEs. A step can be any ca
 
 **Branch registration** — `branch(router_fn, branches, name=None)` adds a branch step. `router_fn(memory)` returns a key; `branches[key]` is the callable to run. A "default" key handles unknown keys.
 
-**Execution** — For each step: evaluate condition, skip if False. Execute the step. If it raises, apply `on_error` strategy:
+**Execution** — For each step: evaluate condition, skip if False. If the condition or step callable raises an exception, record the step with `status="error"` and apply `on_error`:
 - `stop` (default): log and break.
 - `skip`: continue to next step.
 - `retry`: try once more; if it fails again, log and break.

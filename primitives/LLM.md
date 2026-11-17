@@ -25,7 +25,7 @@ Record/replay exchange keys use messages with cache markers stripped — semanti
 | `model_id` | `service:model` format |
 | `key` | API key |
 | `secret` | Optional API secret |
-| `request_timeout` | Opt-in socket timeout in seconds (default None = blocking) |
+| `request_timeout` | Socket timeout in seconds (default 120; pass `None` for no timeout) |
 | `on_usage` | Optional callback `fn(record)` after successful calls with usage |
 | `record` | Optional MEMORY to record exchanges into |
 | `**kwargs` | Default model + transport params (see buckets below) |
