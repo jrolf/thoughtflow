@@ -898,3 +898,29 @@ class TestChronStartStop:
         chron = CHRON()
         chron.stop()
         assert chron.running is False
+
+
+class TestCronAliases:
+    """Aliases like @daily expand to the standard five fields."""
+
+    def test_aliases_match_their_expansions(self):
+        """
+        Each alias must parse to the same fields as its expansion.
+
+        Remove this test if: We drop alias support from parse_cron.
+        """
+        assert parse_cron("@hourly") == parse_cron("0 * * * *")
+        assert parse_cron("@daily") == parse_cron("0 0 * * *")
+        assert parse_cron("@weekly") == parse_cron("0 0 * * 0")
+        assert parse_cron("@monthly") == parse_cron("0 0 1 * *")
+        assert parse_cron("  @DAILY ") == parse_cron("0 0 * * *")
+
+    def test_unknown_alias_is_an_error(self):
+        """
+        An unknown alias must raise ValueError like any bad expression.
+
+        Remove this test if: We drop alias support from parse_cron.
+        """
+        import pytest
+        with pytest.raises(ValueError):
+            parse_cron("@sometimes")

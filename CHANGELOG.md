@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Fail loudly on malformed or missing prompt template variables and enforce `required_vars` before an LLM call.
+### Added
+- `LLM.chat()`: structured chat completion for OpenAI-compatible services (`openai` with any `base_url`, `openrouter`, `groq`). Returns the whole assistant message as one dict: `content`, `reasoning` (kept separate from the answer), native `tool_calls` with parsed `arguments`, `finish_reason`, normalized `usage` (including provider-reported `cost`), and `model`. Messages and tools pass through verbatim.
+- `LLM.chat(stream=True)`: generator of typed events (`text_delta`, `reasoning_delta`, `tool_call_delta`, `done`) including tool-call deltas.
+- `LLM.chat(cancel=threading.Event())`: abort from another thread; the socket is shut down at once, including while waiting for the first byte. A stream ends with a `done` event whose `finish_reason` is `aborted`.
+- `ChatError` (exported) with `status`, `body`, and `retryable`. `chat` raises instead of printing, so hosts that use stdout as a protocol channel are safe.
+- Record and replay support for `chat`: `LLM.record` captures structured exchanges and `ReplayLLM.chat` serves them, replaying streams as events.
+- `MCP(url, headers=None, timeout=60)`: extra HTTP headers (for example `Authorization`) and a per-request timeout for HTTP servers. Stdio servers ignore both.
+- `parse_cron` accepts the aliases `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
+- `TemplateRenderError` (exported) raised when prompt template rendering fails or configured `required_vars` are missing.
+
+### Changed
+- `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
 ## [0.2.5] - 2026-07-17
 
 Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.

@@ -18,6 +18,7 @@ trace machinery is needed: the memory IS the recording.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.request
 import urllib.error
@@ -35,6 +36,21 @@ from thoughtflow.llm_cache import (
     apply_cache_markers,
     strip_cache_markers,
     format_anthropic_system,
+)
+from thoughtflow.llm_chat import (
+    CHAT_SERVICES,
+    ChatError,
+    build_chat_payload,
+    build_message,
+    chat_endpoint,
+    feed_stream_chunk,
+    finish_stream_state,
+    iter_stream_chunks,
+    message_to_events,
+    new_stream_state,
+    open_chat_request,
+    read_chat_response,
+    shutdown_connection,
 )
 
 
@@ -425,6 +441,169 @@ class LLM:
         if recording:
             self._record_exchange(key, request, choices)
         return choices
+
+    # ------------------------------------------------------------------
+    # Structured chat (see thoughtflow/llm_chat.py for the full contract)
+    # ------------------------------------------------------------------
+
+    def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
+        """
+        Structured chat completion: native tool calls, separate reasoning, usage.
+
+        ``call`` returns a list of strings. ``chat`` returns the whole assistant
+        message as one dict, which is what an agent loop needs. Messages are
+        OpenAI-format dicts passed through verbatim (assistant ``tool_calls`` and
+        ``tool`` results included), and ``tools`` is the OpenAI function-calling
+        list (``TOOL.to_schema()`` produces one entry).
+
+        Args:
+            messages (list[dict]): OpenAI-format messages.
+            tools (list[dict], optional): Tool declarations.
+            params (dict, optional): Per-call model and transport params, merged
+                over the constructor defaults exactly like ``call``.
+            stream (bool): If True, return a generator of event dicts that ends
+                with a ``done`` event carrying the final message.
+            cancel (threading.Event, optional): Set it from another thread to
+                abort. The socket is shut down at once. A stream ends with a
+                ``done`` event whose ``finish_reason`` is ``"aborted"``; a
+                non-streaming call returns an aborted message.
+
+        Returns:
+            dict or generator: The message dict (``stream=False``) or the event
+            generator (``stream=True``). See ``thoughtflow.llm_chat``.
+
+        Raises:
+            ValueError: Service not supported by ``chat``.
+            ChatError: Failed request. ``retryable`` says whether to try again.
+
+        Example:
+            >>> message = llm.chat([{"role": "user", "content": "Read a.py"}], tools=[tool.to_schema()])
+            >>> message["tool_calls"][0]["name"]
+            'read'
+        """
+        if self.service not in CHAT_SERVICES:
+            raise ValueError(
+                "LLM.chat supports the openai, openrouter and groq services, not '{}'.".format(self.service)
+            )
+        merged = merge_call_params(self.default_params, params or {})
+        self.last_params = dict(merged)
+        wire_params, transport = split_call_params(merged)
+
+        key = request = None
+        if self._record_memory is not None:
+            key, request = self._chat_signature(messages, tools, merged)
+
+        url, headers = chat_endpoint(self.service, self.api_key, transport)
+        payload = build_chat_payload(self.model, messages, tools, wire_params, stream)
+        body = json.dumps(payload).encode("utf-8")
+
+        if stream:
+            events = self._chat_stream(url, headers, body, cancel)
+            if key is not None:
+                return self._record_chat_stream(events, key, request)
+            return events
+        message = self._chat_once(url, headers, body, cancel)
+        if key is not None:
+            self._record_chat_message(key, request, message)
+        return message
+
+    def _chat_signature(self, messages, tools, merged):
+        """Canonical (key, request) pair for a structured chat exchange."""
+        clean_params = {k: v for k, v in merged.items() if k not in TRANSPORT_PARAM_KEYS}
+        request = {"chat": True, "messages": messages, "tools": tools, "params": clean_params}
+        return exchange_key(self.service, self.model, request), request
+
+    def _record_chat_message(self, key, request, message):
+        """Record one structured exchange; the response is ``[message]``."""
+        self._record_memory.add_exchange(
+            kind='chat', key=key, service=self.service, model=self.model,
+            request=request, response=[message],
+        )
+
+    def _record_chat_stream(self, events, key, request):
+        """Pass events through and record the final message when ``done`` arrives."""
+        for event in events:
+            if event["type"] == "done":
+                self._record_chat_message(key, request, event["message"])
+            yield event
+
+    def _note_chat_message(self, message):
+        """Update ``last_error``, ``last_usage`` and fire ``on_usage`` after a chat."""
+        self.last_error = None
+        self.last_usage = message.get("usage")
+        if self.on_usage and callable(self.on_usage) and self.last_usage:
+            self.on_usage(self.last_usage)
+
+    def _chat_once(self, url, headers, body, cancel):
+        """One non-streaming chat request. Returns the message dict."""
+        try:
+            connection, response, finished = open_chat_request(
+                url, headers, body, self.request_timeout, cancel)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            self.last_usage = None
+            if exc.status == "aborted":
+                return build_message(self.service, self.model, "", "", [], "aborted", None)
+            raise
+        try:
+            message = read_chat_response(self.service, self.model, response)
+        except (OSError, http.client.HTTPException) as exc:
+            if cancel is not None and cancel.is_set():
+                return build_message(self.service, self.model, "", "", [], "aborted", None)
+            self.last_error = str(exc)[:500]
+            raise ChatError("Network error: {}".format(exc), retryable=True)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            raise
+        finally:
+            finished.set()
+            shutdown_connection(connection)
+        self._note_chat_message(message)
+        return message
+
+    def _chat_stream(self, url, headers, body, cancel):
+        """Generator behind ``chat(stream=True)``. Yields events, ends with ``done``."""
+        state = new_stream_state()
+        try:
+            connection, response, finished = open_chat_request(
+                url, headers, body, self.request_timeout, cancel)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            if exc.status == "aborted":
+                yield {"type": "done", "message": finish_stream_state(self.service, self.model, state, aborted=True)}
+                return
+            raise
+        aborted = False
+        try:
+            for chunk in iter_stream_chunks(response):
+                for event in feed_stream_chunk(state, chunk):
+                    yield event
+                if cancel is not None and cancel.is_set():
+                    aborted = True
+                    break
+        except (OSError, http.client.HTTPException) as exc:
+            if cancel is not None and cancel.is_set():
+                aborted = True
+            else:
+                self.last_error = str(exc)[:500]
+                raise ChatError("Network error: {}".format(exc), retryable=True)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            raise
+        finally:
+            finished.set()
+            shutdown_connection(connection)
+        if cancel is not None and cancel.is_set():
+            aborted = True
+        empty = not state["content"] and not state["reasoning"] and not state["tool_calls"]
+        if empty and not aborted and state["finish_reason"] is None:
+            self.last_error = "Stream ended with no content"
+            raise ChatError("Stream ended with no content", retryable=True)
+        message = finish_stream_state(self.service, self.model, state, aborted=aborted)
+        if message["finish_reason"] is None:
+            message["finish_reason"] = "tool_calls" if message["tool_calls"] else "stop"
+        self._note_chat_message(message)
+        yield {"type": "done", "message": message}
 
     def _call_openai(self, msg_list, params, transport=None):
         url, headers, is_local = self._resolve_openai_transport(transport)
@@ -999,6 +1178,36 @@ class ReplayLLM(LLM):
                     yield text
             return _single_yield()
         return choices
+
+
+    def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
+        """
+        Serve a recorded structured chat exchange (see ``LLM.chat``).
+
+        Matches by content hash of (messages, tools, params). With ``stream=True``
+        the recorded message is replayed as the events a live stream produces,
+        so streaming consumers run unchanged against recordings.
+        """
+        merged = merge_call_params(self.default_params, params or {})
+        self.last_params = dict(merged)
+        key, _request = self._chat_signature(messages, tools, merged)
+        recorded = self._responses.get(key)
+        if recorded is None:
+            if self.on_miss == 'raise' or self.on_miss is None:
+                raise ReplayMissError(
+                    "No recorded chat response for this request (key={}). The flow "
+                    "has drifted from the recording. Re-record the session, or "
+                    "construct the ReplayLLM with on_miss=<live LLM> to fall "
+                    "back.".format(key)
+                )
+            return self.on_miss.chat(messages, tools=tools, params=params, stream=stream, cancel=cancel)
+        idx = min(self._cursor[key], len(recorded) - 1)
+        self._cursor[key] += 1
+        message = recorded[idx][0]
+        self._note_chat_message(message)
+        if stream:
+            return iter(message_to_events(message))
+        return message
 
 
 class OpenAICompatibleLLM(LLM):

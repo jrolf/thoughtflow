@@ -110,6 +110,35 @@ from thoughtflow import CerebrasLLM
 llm = CerebrasLLM("gpt-oss-120b", key=CEREBRAS_KEY, reasoning_effort="low")
 ```
 
+## Structured chat (`LLM.chat`)
+
+`call` returns strings. `chat` returns the whole assistant message, which is what an agent loop needs: native tool calls, reasoning kept apart from the answer, `finish_reason`, and usage.
+
+```python
+message = llm.chat(
+    [{"role": "user", "content": "Read a.py"}],
+    tools=[tool.to_schema()],
+)
+message["tool_calls"][0]["name"]       # "read"
+message["tool_calls"][0]["arguments"]  # {"path": "a.py"}, already parsed
+message["finish_reason"]               # "tool_calls"
+message["usage"]                       # normalized, includes provider "cost" when reported
+```
+
+Streaming and abort:
+
+```python
+import threading
+cancel = threading.Event()
+for event in llm.chat(messages, tools=tools, stream=True, cancel=cancel):
+    if event["type"] == "text_delta":
+        print(event["delta"], end="")
+    elif event["type"] == "done":
+        message = event["message"]   # finish_reason is "aborted" if cancel was set
+```
+
+A tool call whose arguments are not valid JSON keeps `arguments` as `{}`, preserves `raw_arguments`, and sets `arguments_error`; the caller decides what to do. Failures raise `ChatError` (`status`, `body`, `retryable`). Supported services: `openai` (any `base_url`), `openrouter`, `groq`. HTTP uses `http.client`, so environment proxy variables are not honored. See `src/thoughtflow/llm_chat.py` for the full contract.
+
 ## Relationship to Other Primitives
 
 LLM is consumed by THOUGHT, AGENT, and CHAT. EMBED mirrors the record/replay seam. See `docs/concepts/llm.md` for the concept guide.
