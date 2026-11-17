@@ -12,7 +12,7 @@ The design choice to return TOOL instances is deliberate. MCP tools are not a di
 
 MCP auto-detects transport from the server argument. URLs starting with `http://` or `https://` use HTTP transport: JSON-RPC requests are sent via POST to the base URL. Everything else is treated as a stdio command: the server is launched as a subprocess, and JSON-RPC flows over stdin/stdout. For stdio, the client sends an `initialize` handshake, then `notifications/initialized`, before any other calls.
 
-`list_tools()` sends `tools/list` and converts each returned tool into a TOOL. Each TOOL's `fn` is a closure that calls `call_tool(name, kwargs)` on this MCP instance. When the agent invokes the tool, the closure triggers a `tools/call` JSON-RPC request. The response is unwrapped: a single text content item returns the text string; otherwise the raw content list is returned.
+`list_tools(prefix=None)` sends `tools/list` and converts each returned tool into a TOOL (applying `prefix` when configured). Each TOOL's `fn` is a closure that calls `call_tool(raw_name, kwargs)` on this MCP instance. When the agent invokes the tool, the closure triggers a `tools/call` JSON-RPC request. If the server marks the result `"isError": true`, `call_tool` raises `RuntimeError` so agent loops see a real tool failure; otherwise a single text content item returns its text string and multi-item content returns the raw list.
 
 `list_resources()` and `read_resource(uri)` support the resources protocol. Context manager support (`with MCP(...) as mcp`) ensures the stdio subprocess is terminated on exit. The `env` parameter merges additional environment variables into the subprocess environment for stdio transport.
 
@@ -20,8 +20,11 @@ MCP auto-detects transport from the server argument. URLs starting with `http://
 
 | Parameter | Description |
 |-----------|-------------|
-| server | Shell command for stdio transport (e.g., `npx -y @modelcontextprotocol/server-filesystem /tmp`) or HTTP(S) URL for remote server. |
+| server | Shell command string or argv `list[str]` (`shell=False`) for stdio transport, or HTTP(S) URL for a remote server. |
 | env | Optional dict of environment variables to merge when launching stdio subprocess. |
+| headers | Optional extra HTTP headers sent on HTTP transport requests. |
+| timeout | Seconds to wait per HTTP request (default 60). |
+| prefix | Optional namespace prefix prepended to discovered `TOOL.name` values (e.g. `'metrics__'`) so multi-server tool names do not collide, while still calling the unprefixed name on the server. |
 
 ## Usage
 

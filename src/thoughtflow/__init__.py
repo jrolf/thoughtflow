@@ -51,7 +51,7 @@ from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
 from thoughtflow.thoughts import DECIDE, PLAN
 from thoughtflow.action import ACTION
-from thoughtflow.tool import TOOL
+from thoughtflow.tool import TOOL, ReplayTOOL
 from thoughtflow.mcp import MCP
 from thoughtflow.agent import AGENT
 from thoughtflow.agents import ReactAgent, ReflectAgent, PlanActAgent
@@ -130,6 +130,7 @@ __all__ = [
     "PLAN",
     "ACTION",
     "TOOL",
+    "ReplayTOOL",
     "MCP",
     "AGENT",
     "ReactAgent",
