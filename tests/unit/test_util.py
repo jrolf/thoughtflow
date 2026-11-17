@@ -48,6 +48,14 @@ def test_render_template_reports_malformed_brace():
         render_template("Plan for {goal", {"goal": "x"})
 
 
+def test_render_template_reports_type_error_and_exports_exception():
+    from thoughtflow import TemplateRenderError as PublicTemplateRenderError
+
+    assert PublicTemplateRenderError is TemplateRenderError
+    with pytest.raises(TemplateRenderError):
+        render_template("First: {items[0]}", {"items": 123})
+
+
 # ============================================================================
 # EventStamp Tests
 # ============================================================================

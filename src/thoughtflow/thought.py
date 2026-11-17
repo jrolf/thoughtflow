@@ -646,18 +646,31 @@ class THOUGHT:
         # Store original prompt to avoid mutation - work with a copy
         original_prompt = copy_module.deepcopy(self.prompt)
         working_prompt = copy_module.deepcopy(self.prompt)
+        # Keep repair text separate for string prompts so format-mode rendering
+        # never tries to .format() braces inside schema annotations on retry.
+        pending_repair = None
 
         while retries_left > 0:
             attempts_made += 1
             self._pending_schema_error = None
             response = None
             try:
-                # Stage 1: prompt + context — working_prompt may carry repair suffix
+                # Stage 1: prompt + context — working_prompt may carry repair suffix (dict prompts)
                 self.prompt = working_prompt
 
                 ctx = self.get_context(memory)
                 ctx.update(vars)
                 msgs = self.build_msgs(memory, ctx)
+                if pending_repair and isinstance(original_prompt, str):
+                    if isinstance(self.last_prompt, str) and self.last_prompt:
+                        self.last_prompt = self.last_prompt.rstrip() + pending_repair
+                    else:
+                        self.last_prompt = pending_repair
+                    if msgs and msgs[-1].get("role") == "user":
+                        msgs[-1]["content"] = msgs[-1]["content"].rstrip() + pending_repair
+                    else:
+                        msgs.append({"role": "user", "content": pending_repair})
+                    self.last_msgs = msgs
 
                 # Stage 2: LLM call
                 llm_kwargs = self.config.get("llm_params", {})
@@ -691,9 +704,12 @@ class THOUGHT:
                         ):
                             memory.add_msg("assistant", response, channel=channel)
                     repair_suffix = self._build_repair_suffix(last_error)
-                    working_prompt = self._append_repair_suffix(
-                        original_prompt, working_prompt, repair_suffix
-                    )
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
                     retries_left -= 1
                     if self.retry_delay:
                         time_module.sleep(self.retry_delay)
@@ -759,23 +775,43 @@ class THOUGHT:
                             "Thought '{}' validation failed: {}".format(self.name, why)
                         )
                     repair_suffix = self._build_repair_suffix(why)
-                    working_prompt = self._append_repair_suffix(
-                        original_prompt, working_prompt, repair_suffix
-                    )
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
                     # Failed attempt: record assistant msg unless hold_msg=True
                     if not self._hold_msg():
                         if hasattr(memory, "add_msg") and callable(
                             getattr(memory, "add_msg", None)
                         ):
                             memory.add_msg("assistant", response, channel=channel)
+            except TemplateRenderError as e:
+                # Deterministic template/variable errors cannot heal across retries;
+                # record once and exit before sleeping or calling the LLM.
+                last_error = str(e)
+                self.last_error = last_error
+                self._record_failure(
+                    memory,
+                    attempts_made,
+                    "template",
+                    last_error,
+                    raw_response=None,
+                )
+                if hasattr(memory, "add_log") and callable(
+                    getattr(memory, "add_log", None)
+                ):
+                    memory.add_log(
+                        "Thought '{}' error: {}".format(self.name, last_error)
+                    )
+                break
             except Exception as e:
                 last_error = str(e)
                 self.last_error = last_error
                 # Parse failures surface as ValueError with "Schema-based parsing failed"
                 failure_kind = (
-                    "template"
-                    if isinstance(e, TemplateRenderError)
-                    else "schema"
+                    "schema"
                     if "Schema-based parsing failed" in last_error
                     else "exception"
                 )
@@ -802,9 +838,12 @@ class THOUGHT:
                         "Thought '{}' error: {}".format(self.name, last_error)
                     )
                 repair_suffix = self._build_repair_suffix(last_error)
-                working_prompt = self._append_repair_suffix(
-                    original_prompt, working_prompt, repair_suffix
-                )
+                if isinstance(original_prompt, str):
+                    pending_repair = repair_suffix
+                else:
+                    working_prompt = self._append_repair_suffix(
+                        original_prompt, working_prompt, repair_suffix
+                    )
             retries_left -= 1
             if self.retry_delay:
                 time_module.sleep(self.retry_delay)
@@ -953,6 +992,17 @@ class THOUGHT:
             self.last_error = str(e)
             return None, str(e), 1
 
+    def _validate_required_vars(self, ctx):
+        """Raise TemplateRenderError if any configured required_vars are missing or None."""
+        missing = [
+            var for var in (self.required_vars or [])
+            if var not in ctx or ctx[var] is None
+        ]
+        if missing:
+            raise TemplateRenderError(
+                "Required prompt variables missing: {}".format(", ".join(missing))
+            )
+
     def build_prompt(self, memory, context_vars=None):
         """
         Build the prompt for the LLM from the configured template and context.
@@ -971,14 +1021,7 @@ class THOUGHT:
         ctx = self.get_context(memory)
         if context_vars:
             ctx.update(context_vars)
-        missing = [
-            var for var in self.required_vars
-            if var not in ctx or ctx[var] is None
-        ]
-        if missing:
-            raise TemplateRenderError(
-                "Required prompt variables missing: {}".format(", ".join(missing))
-            )
+        self._validate_required_vars(ctx)
         prompt = self._render_template_value(self.prompt, ctx)
         self.last_prompt = prompt
         return prompt
@@ -1003,6 +1046,8 @@ class THOUGHT:
         ctx = self.get_context(memory)
         if context_vars:
             ctx.update(context_vars)
+
+        self._validate_required_vars(ctx)
 
         sys_prompt = self._render_template_value(
             self.config.get("system_prompt", ""),
@@ -1060,7 +1105,8 @@ class THOUGHT:
                     val = getattr(memory, var, None)
                 if val is not None:
                     ctx[var] = val
-        # Optionally, add optional_vars if present in memory
+        # Optionally, add optional_vars if present in memory (default to empty
+        # string when unset so {opt} placeholders in format mode still render)
         if hasattr(self, "optional_vars") and self.optional_vars:
             for var in self.optional_vars:
                 if hasattr(memory, "get_var") and callable(
@@ -1069,8 +1115,7 @@ class THOUGHT:
                     val = memory.get_var(var)
                 else:
                     val = getattr(memory, var, None)
-                if val is not None:
-                    ctx[var] = val
+                ctx[var] = val if val is not None else ""
         # Add some common context keys if available (content_only=True for prompt templates)
         if hasattr(memory, "last_user_msg") and callable(
             getattr(memory, "last_user_msg", None)

@@ -34,7 +34,7 @@ Schema validation and callable validation are **not** parallel gates. A `validat
 
 Template rendering and history inclusion are separate concerns:
 
-- **`template_mode='format'`** (default): renders the configured prompt with `str.format(**ctx)` and keeps the legacy silent fallback when formatting fails.
+- **`template_mode='format'`** (default): renders the configured prompt with `str.format(**ctx)` and raises `TemplateRenderError` before calling the LLM if formatting fails (missing placeholders, malformed braces, or type/index errors). Use `template_mode='substitute'` (or `{{...}}`) when a prompt contains literal JSON braces.
 - **`template_mode='substitute'`**: replaces only explicit `{key}` placeholders for keys present in context. Literal JSON braces and unknown placeholders stay untouched; bare words such as `messages` are not replaced unless the template contains `{messages}`.
 - **`include_history=True`** (default): prior turns come from `MEMORY.get_llm_msgs()` and are forwarded without template substitution.
 - **`include_history=False`**: sends only the configured system prompt plus one rendered user prompt.

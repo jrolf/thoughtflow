@@ -92,6 +92,7 @@ from thoughtflow._util import (
     construct_msgs,
     valid_extract,
     ValidExtractError,
+    TemplateRenderError,
 )
 
 # Keep message types for potential utility
@@ -165,6 +166,7 @@ __all__ = [
     "construct_msgs",
     "valid_extract",
     "ValidExtractError",
+    "TemplateRenderError",
     # Types
     "Message",
     "MessageList",

@@ -12,10 +12,6 @@ from __future__ import annotations
 ### IMPORTS AND SETTINGS
 
 import time, pickle, json
-
-
-class TemplateRenderError(ValueError):
-    """A configured prompt template could not be rendered safely."""
 import re, ast
 from typing import Mapping, Any, Iterable, Optional, Tuple, Union
 
@@ -211,13 +207,18 @@ def substitute_placeholders(text, ctx):
     return pattern.sub(replacer, text)
 
 
+class TemplateRenderError(ValueError):
+    """Raised when a configured prompt template cannot be rendered safely."""
+
+
 def render_template(template, ctx, mode="format"):
     """
     Render a prompt template using the selected template mode.
 
-    ``format`` uses ``str.format(**ctx)`` with the legacy silent fallback that
-    returns the raw template when formatting fails. ``substitute`` replaces
-    only explicit ``{key}`` placeholders for keys present in ``ctx``.
+    ``format`` uses ``str.format(**ctx)`` and raises ``TemplateRenderError`` when
+    formatting fails (missing placeholders, malformed braces, or type/index
+    errors). ``substitute`` replaces only explicit ``{key}`` placeholders for
+    keys present in ``ctx``.
 
     Args:
         template (str): Prompt template string.
@@ -229,6 +230,7 @@ def render_template(template, ctx, mode="format"):
 
     Raises:
         ValueError: When ``mode`` is not ``format`` or ``substitute``.
+        TemplateRenderError: When ``mode`` is ``format`` and ``str.format`` fails.
     """
     if mode not in ("format", "substitute"):
         raise ValueError(
@@ -243,7 +245,7 @@ def render_template(template, ctx, mode="format"):
 
     try:
         return template.format(**ctx)
-    except (KeyError, IndexError, ValueError, AttributeError) as exc:
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
         raise TemplateRenderError(
             "Prompt template could not be rendered: {}".format(exc)
         ) from exc
