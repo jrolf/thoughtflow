@@ -6,7 +6,17 @@ A specialized THOUGHT subclass for constrained decision-making.
 
 from __future__ import annotations
 
+import re
+
 from thoughtflow.thought import THOUGHT
+
+_NEGATION_RE = re.compile(
+    r"(?:\b(?:do|does|did|would|could|should|can|will|is|are|was|were|must|may|might)?\s*"
+    r"(?:not|n't)|"
+    r"\b(?:never|no|cannot|can't|won't|don't|doesn't|didn't|shouldn't|wouldn't|couldn't|"
+    r"neither|nor|avoid|against|instead\s+of|rather\s+than))\s*$",
+    re.IGNORECASE,
+)
 
 
 class DECIDE(THOUGHT):
@@ -141,37 +151,89 @@ class DECIDE(THOUGHT):
     
     def parse_response(self, response):
         """
-        Extract the chosen option from LLM response.
-        
+        Extract an unambiguous chosen option from LLM response.
+
         Attempts matching in order:
-        1. Exact match (after normalization)
-        2. Choice found within response text
-        
+        1. Exact match after stripping surrounding whitespace, quotes,
+           markdown emphasis, and trailing punctuation.
+        2. Leading choice token at the very start of the response (e.g.
+           ``"approve - looks good"``), preferring longest match first.
+        3. Unambiguous embedded match: exactly one distinct non-overlapping
+           choice appears on word boundaries, and it is not immediately
+           preceded by a negation (e.g. ``"do not approve"`` or ``"not approve"``).
+
+        Ambiguous replies (mentioning multiple choices or negating a choice)
+        return the raw response text so validation rejects it and triggers a
+        choice-specific repair retry.
+
         Args:
             response: Raw LLM response string.
-        
+
         Returns:
-            str: The matched choice, or raw response if no match found.
+            str: The matched choice, or raw response if no unambiguous match is found.
         """
-        text = response.strip()
-        
+        text = str(response or "").strip()
+        if not text:
+            return text
+
         def normalize(s):
             return s.lower().strip() if not self.case_sensitive else s.strip()
-        
-        normalized_text = normalize(text)
-        
-        # Try exact match against choices
-        for choice in self._choices_list:
-            if normalize(choice) == normalized_text:
-                return choice
-        
-        # Try to find choice embedded in response (longest match first to avoid partial matches)
+
+        cleaned = text.strip(" \t\r\n\"'`*_.")
+        normalized_cleaned = normalize(cleaned)
         sorted_choices = sorted(self._choices_list, key=len, reverse=True)
+
+        # 1. Exact match (with or without light punctuation/quotes)
         for choice in sorted_choices:
-            if normalize(choice) in normalized_text:
+            if normalize(choice) == normalized_cleaned or normalize(choice) == normalize(text):
                 return choice
-        
-        # No match found - return raw for validation to catch
+
+        flags = 0 if self.case_sensitive else re.IGNORECASE
+
+        # 2. Leading choice token at the beginning of the response
+        leading = text.lstrip(" \t\r\n\"'`*_")
+        for choice in sorted_choices:
+            lead_pat = re.compile(
+                r"^" + re.escape(choice) + r"(?=$|[\s\.,:;!\?\)\]\}\"'`*_—\-])",
+                flags,
+            )
+            if lead_pat.match(leading):
+                return choice
+
+        # 3. Embedded match: must mention exactly ONE distinct non-overlapping choice,
+        #    on token boundaries, and never immediately negated.
+        occupied_spans = []
+        matched_choices = []
+
+        for choice in sorted_choices:
+            pat = re.compile(
+                r"(?<![A-Za-z0-9_])" + re.escape(choice) + r"(?![A-Za-z0-9_])",
+                flags,
+            )
+            choice_hits = []
+            negated = False
+            for m in pat.finditer(text):
+                start, end = m.span()
+                if any(not (end <= s or start >= e) for s, e in occupied_spans):
+                    continue
+                prefix = text[max(0, start - 32):start]
+                if _NEGATION_RE.search(prefix):
+                    negated = True
+                    occupied_spans.append((start, end))
+                    continue
+                choice_hits.append((start, end))
+                occupied_spans.append((start, end))
+
+            if negated:
+                # A negated choice makes embedded parsing unsafe — ask the model cleanly
+                return text
+            if choice_hits:
+                matched_choices.append(choice)
+
+        if len(matched_choices) == 1:
+            return matched_choices[0]
+
+        # Zero or multiple distinct choices mentioned — return raw for validation/repair
         return text
     
     def validate(self, parsed_result):

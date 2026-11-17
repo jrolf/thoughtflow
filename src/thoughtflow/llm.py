@@ -135,7 +135,7 @@ class LLM:
         self.last_error = None
         self.last_usage = None
         self.last_finish_reason = None
-        self.request_timeout = None
+        self.request_timeout = 120
         self.on_usage = None
         self.allow_reasoning_fallback = False
 
@@ -432,6 +432,20 @@ class LLM:
         allow_reasoning = merged.pop("allow_reasoning_fallback", self.allow_reasoning_fallback)
         wire_params, transport = split_call_params(merged)
         self.last_finish_reason = None
+
+        requested_n = wire_params.get("n")
+        if requested_n is not None:
+            if isinstance(requested_n, bool) or not isinstance(requested_n, int) or requested_n < 1:
+                raise ValueError("Parameter 'n' must be a positive integer, got {!r}.".format(requested_n))
+            if requested_n > 1:
+                if stream:
+                    raise ValueError("Streaming does not support params={'n': > 1}.")
+                if self.service in ("anthropic", "ollama", "groq"):
+                    raise ValueError(
+                        "Service '{}' does not support multiple completions (n={}).".format(
+                            self.service, requested_n
+                        )
+                    )
 
         # Compute the exchange signature up front (params are mutated by the
         # provider methods) so recording sees the canonical request.
@@ -1127,9 +1141,8 @@ class LLM:
                 return parsed
 
         except urllib.error.HTTPError as e:
-            error_msg = e.read().decode("utf-8")
-            print("HTTP Error:", error_msg)
-            self.last_error = error_msg[:500]
+            error_msg = e.read().decode("utf-8", errors="replace")
+            self.last_error = (error_msg or "HTTP {}".format(e.code))[:500]
             self.last_usage = None
             try:
                 return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}

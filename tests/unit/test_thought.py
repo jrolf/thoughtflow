@@ -931,6 +931,24 @@ class TestDecideResponseParsing:
         assert decide.parse_response("I would choose approve for this.") == "approve"
         assert decide.parse_response("My decision is: reject") == "reject"
 
+    def test_rejects_negated_or_ambiguous_choices_and_retries(self, mock_llm, memory):
+        """
+        Issue #21: negated or multi-choice replies must not match a choice prematurely.
+        """
+        decide = DECIDE(
+            name="verdict",
+            llm=mock_llm(responses=["I do not approve this. Revise.", "revise"]),
+            prompt="Review draft",
+            choices=["approve", "revise"],
+            max_retries=2,
+        )
+        assert decide.parse_response("I do not approve this.") == "I do not approve this."
+        assert decide.parse_response("Either approve or revise could work.") == "Either approve or revise could work."
+        assert decide.parse_response("approve - looks great") == "approve"
+
+        decide(memory)
+        assert memory.get_var("verdict_result") == "revise"
+
     def test_prefers_longer_matches(self, mock_llm):
         """
         DECIDE must prefer longer matches to avoid partial matches.

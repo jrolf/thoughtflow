@@ -342,3 +342,33 @@ class TestDelegateRepr:
         delegate = DELEGATE(agents=[MockAgent("a")], name="coord")
         r = repr(delegate)
         assert "coord" in r
+
+
+class TestDelegateMemoryCopyFidelity:
+    """Regression coverage for issue #18: DELEGATE._copy_memory variable fidelity."""
+
+    def test_dispatch_preserves_scalar_vars_descriptions_and_tombstones(self):
+        captured = {}
+
+        class ReadingAgent:
+            name = "specialist"
+
+            def __call__(self, mem):
+                captured["customer_id"] = mem.get_var("customer_id")
+                captured["desc"] = mem.get_var_desc("customer_id")
+                captured["deleted"] = mem.is_var_deleted("old_token")
+                mem.set_var("specialist_result", "handled {}".format(captured["customer_id"]))
+                return mem
+
+        memory = MEMORY()
+        memory.set_var("customer_id", "C-77", desc="Primary customer")
+        memory.set_var("old_token", "secret")
+        memory.del_var("old_token")
+
+        delegate = DELEGATE(agents=[ReadingAgent()])
+        memory = delegate.dispatch(memory, "specialist", "Check account")
+
+        assert captured["customer_id"] == "C-77"
+        assert captured["desc"] == "Primary customer"
+        assert captured["deleted"] is True
+        assert memory.get_var("specialist_dispatch_result") == "handled C-77"

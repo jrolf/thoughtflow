@@ -15,8 +15,8 @@ Each iteration follows the same loop as AGENT, but with different message buildi
 1. **Build messages** — System prompt plus ReAct instructions (format rules for Thought, Action, Action Input, Final Answer) plus tool descriptions as text. No tool schemas in params.
 2. **Call the LLM** — With empty params (no function-calling).
 3. **Parse response** — Look for "Action: &lt;tool_name&gt;" and "Action Input: &lt;json&gt;" lines. If "Final Answer:" appears, treat the rest as the answer and stop.
-4. **If Final Answer** — Extract the answer text, store in memory, set `{name}_result`, exit.
-5. **If Action** — Execute the tool, add the full assistant response and "Observation: &lt;result&gt;" as a user message, repeat.
+4. **If Final Answer** — Extract the full answer text (preserving multi-line content), store in memory, set `{name}_result`, exit.
+5. **If Action** — Execute the tool (or record `"Observation: Tool '<name>' was blocked by policy."` if `on_tool_call` returns `False`), add the full assistant response and Observation message, repeat.
 
 Observations are added as user messages with the "Observation: ..." prefix so the LLM sees them in context on the next turn. The full ReAct trace (Thought, Action, Observation) remains in memory for transparency.
 

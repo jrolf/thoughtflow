@@ -361,6 +361,50 @@ class TestReactAgent:
         system_msg = llm.calls[0]['msgs'][0]['content']
         assert "echo" in system_msg.lower()
 
+    def test_react_preserves_multiline_final_answer(self):
+        """Issue #25: ReactAgent must keep lines after the first in Final Answer."""
+        multiline = (
+            "Thought: Ready.\n"
+            "Final Answer: Line one\n"
+            "- bullet a\n"
+            "- bullet b"
+        )
+        llm = MockLLM(responses=[multiline])
+        agent = ReactAgent(llm=llm, name="react_ml")
+        memory = MEMORY()
+        memory.add_msg("user", "List two bullets")
+        memory = agent(memory)
+
+        expected = "Line one\n- bullet a\n- bullet b"
+        assert memory.get_var("react_ml_result") == expected
+        assert memory.last_asst_msg(content_only=True) == expected
+
+    def test_react_reports_vetoed_tool_observation_to_model(self):
+        """Issue #25: vetoed tool calls must append an Observation so the model adapts."""
+        step1 = (
+            "Thought: Try echo.\n"
+            "Action: echo\n"
+            'Action Input: {"text": "secret"}'
+        )
+        step2 = "Thought: Tool was blocked.\nFinal Answer: Cannot run echo."
+        llm = MockLLM(responses=[step1, step2])
+        agent = ReactAgent(
+            llm=llm,
+            tools=[make_echo_tool()],
+            name="react_veto",
+            on_tool_call=lambda name, args: False,
+        )
+        memory = MEMORY()
+        memory.add_msg("user", "Run echo")
+        memory = agent(memory)
+
+        assert memory.get_var("react_veto_result") == "Cannot run echo."
+        second_call_msgs = llm.calls[1]["msgs"]
+        assert any(
+            "blocked by policy" in m.get("content", "")
+            for m in second_call_msgs
+        )
+
 
 # ============================================================================
 # ReflectAgent Tests

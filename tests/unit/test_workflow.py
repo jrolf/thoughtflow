@@ -213,6 +213,28 @@ class TestWorkflowConditions:
 
         assert wf.execution_log[0]["status"] == "skipped"
 
+    def test_condition_exception_records_error_and_honors_on_error(self):
+        """Issue #27: buggy condition callables must fail the step, not skip as False."""
+        def broken_cond(m):
+            raise ZeroDivisionError("bad guard")
+
+        wf_stop = WORKFLOW(name="wf_stop", on_error="stop")
+        wf_stop.step(step_increment, name="guarded", condition=broken_cond)
+        wf_stop.step(step_set_flag, name="after")
+
+        mem1 = wf_stop(MEMORY())
+        assert wf_stop.execution_log[0]["status"] == "error"
+        assert "bad guard" in wf_stop.execution_log[0]["error"]
+        assert mem1.get_var("flag") is None
+
+        wf_skip = WORKFLOW(name="wf_skip", on_error="skip")
+        wf_skip.step(step_increment, name="guarded", condition=broken_cond)
+        wf_skip.step(step_set_flag, name="after")
+
+        mem2 = wf_skip(MEMORY())
+        assert wf_skip.execution_log[0]["status"] == "error"
+        assert mem2.get_var("flag") is True
+
 
 # ============================================================================
 # Branch Tests
