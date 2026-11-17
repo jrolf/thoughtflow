@@ -76,7 +76,17 @@ parsing_rules={
 
 ## Validation
 
-Validation is configured via the canonical `validation=` parameter (config alias `validator=`). Accepts built-in strings (`any`, `has_keys:k1,k2`, `list_min_len:N`, `summary_v1`) or a callable. Callable return shape is `(bool, why)`; bare `bool` is coerced automatically.
+Validation is configured via the canonical `validation=` parameter (config alias `validator=`). Accepts built-in strings (`any`, `has_keys:k1,k2`, `list_min_len:N`, `summary_v1`), a callable returning `(bool, why)` or bare `bool`, or a JSON-serializable list of declarative rule dicts (`in`, `non_empty`, `range`, `regex`, `has_keys`):
+
+```python
+validation=[
+    {"op": "in", "field": "decision", "allowed": ["approve", "deny", "escalate"]},
+    {"op": "range", "field": "confidence", "min": 1, "max": 100},
+    {"op": "non_empty", "field": "rationale"},
+]
+```
+
+Declarative rule lists survive `json.dumps(thought.to_dict())` and `THOUGHT.from_dict(...)` with no external function registry. Callable hooks and validators are stripped from `to_dict()["config"]` so JSON export always succeeds. Compressed large objects (`_obj_ref`) stored in `MEMORY` are resolved lazily only when referenced by the prompt or explicit var lists.
 
 `validation_mode='strict'` (default) — schema must pass before callable runs. `validation_mode='rescue'` — on schema miss, structurally parsed payload may be accepted by callable validator.
 

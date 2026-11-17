@@ -908,3 +908,16 @@ class TestVarDeleted:
         """
         assert '<DELETED>' in repr(VAR_DELETED)
         assert '<DELETED>' in str(VAR_DELETED)
+
+
+def test_humanize_schema_error_strips_runtime_heap_addresses():
+    """humanize_schema_error must scrub 'at 0x...' object addresses so repair prompts replay deterministically."""
+    from thoughtflow._util import humanize_schema_error
+
+    raw = "malformed node or string on line 1: <ast.Name object at 0x108300e50>"
+    cleaned = humanize_schema_error(raw, {"count": 0})
+
+    assert "0x108300e50" not in cleaned
+    assert "<ast.Name object>" in cleaned
+    assert "Expected schema: {count: int}" in cleaned
+

@@ -254,3 +254,26 @@ def test_run_handles_eof(monkeypatch, capsys):
 
     captured = capsys.readouterr().out
     assert "Goodbye!" in captured
+
+
+def test_turn_selects_latest_non_internal_assistant_message_in_multistep_flow():
+    """
+    When an agent adds an intermediate assistant message before the final reply
+    (or marks an assistant note internal), turn() must deterministically return
+    the final user-facing assistant message rather than set-hash order.
+    """
+    def two_step_agent(memory):
+        memory.add_msg("assistant", '{"router": "billing"}', channel="cli")
+        memory.add_msg("assistant", "Final user-facing answer.", channel="cli")
+        memory.add_msg(
+            "assistant",
+            "post-turn internal note",
+            channel="cli",
+            metadata={"internal": True},
+        )
+        return memory
+
+    for _ in range(30):
+        chat = CHAT(two_step_agent)
+        assert chat.turn("help") == "Final user-facing answer."
+
