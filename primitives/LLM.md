@@ -67,6 +67,9 @@ Anthropic: transforms to `cache_control: {type: ephemeral}`. OpenAI-compatible: 
 | `last_params` | Full merged default + per-call params |
 | `last_error` | str or None — API/transport failure |
 | `last_usage` | Normalized usage dict or None |
+| `last_finish_reason` | Canonical stop reason (`stop`, `length`, `tool_calls`, etc.) or None |
+
+By default, `LLM.call()` does not fall back to `message.reasoning` when `content` is empty so truncated reasoning traces do not pass as valid answers. Pass `allow_reasoning_fallback=True` when targeting a server that intentionally places final answers in `reasoning`.
 
 ### Native provider classes
 

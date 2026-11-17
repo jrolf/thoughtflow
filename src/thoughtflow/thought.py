@@ -24,6 +24,8 @@ from thoughtflow._util import (
     scan_none_exemplars,
     TemplateRenderError,
 )
+from thoughtflow.llm import ReplayMissError
+from thoughtflow.llm_chat import ChatError
 
 
 class THOUGHT:
@@ -257,6 +259,7 @@ class THOUGHT:
         # Internal state for tracking last result, errors, etc.
         self.last_result = None
         self.last_error = None
+        self.last_outcome = None
         self.last_prompt = None
         self.last_msgs = None
         self.last_response = None
@@ -266,10 +269,11 @@ class THOUGHT:
         self.post_hook = kwargs.get("post_hook", None)
         self.on_failure = kwargs.get("on_failure", None)
 
-        # Opt-in production-lane settings (defaults preserve backward compat)
+        # Opt-in production-lane settings (hold_msg defaults True so failed drafts
+        # do not pollute conversation history unless explicitly requested)
         self.validation_mode = kwargs.get("validation_mode", "strict")
         self.strict_schema = kwargs.get("strict_schema", False)
-        self.hold_msg = kwargs.get("hold_msg", False)
+        self.hold_msg = kwargs.get("hold_msg", True)
 
         template_mode = kwargs.get("template_mode", "format")
         if template_mode not in ("format", "substitute"):
@@ -438,6 +442,8 @@ class THOUGHT:
             event["raw_response_preview"] = preview
 
         self._failure_attempts.append(event)
+        if hasattr(self, "_validation_messages") and isinstance(self._validation_messages, list):
+            self._validation_messages.append(reason)
 
         if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
             memory.add_log(json.dumps(event))
@@ -464,16 +470,41 @@ class THOUGHT:
 
     def _format_repair_reason(self, why):
         """Build model-friendly repair text from an internal failure reason."""
+        text = str(why)
+        if text.startswith("Schema-based parsing failed:"):
+            text = text[len("Schema-based parsing failed:"):].strip()
         parsing_rules = self.config.get("parsing_rules")
         schema = None
         if parsing_rules:
             schema = parsing_rules.get("format")
-        friendly = humanize_schema_error(str(why), schema)
-        if schema is not None:
+        friendly = humanize_schema_error(text, schema)
+        if schema is not None and "Expected schema:" not in friendly:
             return "{} Expected format: {}".format(
                 friendly, format_schema_annotation(schema)
             )
         return friendly
+
+    def _build_outcome(
+        self,
+        ok,
+        attempts,
+        error_class=None,
+        error=None,
+        finish_reason=None,
+        usage=None,
+        validation_messages=None,
+    ):
+        """Construct the plain JSON-safe outcome dict stored at {name}_outcome."""
+        outcome = {
+            "ok": bool(ok),
+            "error_class": None if ok else error_class,
+            "error": None if ok else error,
+            "finish_reason": finish_reason,
+            "usage": dict(usage) if isinstance(usage, dict) else None,
+            "attempts": int(attempts),
+            "validation_messages": list(validation_messages or []),
+        }
+        return outcome
 
     def __call__(self, memory, vars={}, **kwargs):
         """
@@ -500,6 +531,10 @@ class THOUGHT:
 
         # Determine operation type
         operation = self.operation or 'llm_call'
+        self._failure_attempts = []
+        self._last_finish_reason = None
+        self._last_call_usage = None
+        self._validation_messages = []
         
         # Dispatch to appropriate handler based on operation type
         if operation == 'llm_call':
@@ -516,8 +551,24 @@ class THOUGHT:
         # Calculate execution duration
         duration_ms = (time_module.time() - start_time) * 1000
         
-        # Build execution event for logging
+        # Build execution event and structured outcome
         failed = result is None and last_error is not None
+        failure_kind = (
+            self._failure_attempts[-1]['failure_kind']
+            if (failed and self._failure_attempts)
+            else ('exception' if failed else None)
+        )
+        outcome = self._build_outcome(
+            ok=not failed,
+            attempts=attempts_made,
+            error_class=failure_kind,
+            error=last_error,
+            finish_reason=self._last_finish_reason,
+            usage=self._last_call_usage,
+            validation_messages=self._validation_messages,
+        )
+        self.last_outcome = outcome
+
         execution_event = {
             'thought_name': self.name,
             'thought_id': self.id,
@@ -529,21 +580,42 @@ class THOUGHT:
             'output_var': self.output_var
         }
 
-        # If failed after all retries
         if failed:
             execution_event['error'] = last_error
-            execution_event['failure_kind'] = (
-                self._failure_attempts[-1]['failure_kind']
-                if self._failure_attempts else 'unknown'
-            )
+            execution_event['failure_kind'] = failure_kind or 'unknown'
             if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                 memory.add_log("Thought execution failed: " + json.dumps(execution_event))
-            # Store None as result
             self.update_memory(memory, None)
         else:
             if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                 memory.add_log("Thought execution complete: " + json.dumps(execution_event))
             self.update_memory(memory, result)
+
+        # Record total attempts and structured outcome on MEMORY
+        if self.name and hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+            memory.set_var(
+                "{}_attempts".format(self.name),
+                attempts_made,
+                desc="Total attempts for thought: {}".format(self.name),
+            )
+            memory.set_var(
+                "{}_outcome".format(self.name),
+                dict(self.last_outcome),
+                desc="Structured outcome for thought: {}".format(self.name),
+            )
+        if hasattr(memory, "emit") and callable(getattr(memory, "emit", None)):
+            emit_kind = "thought_failed" if failed else "thought_completed"
+            emit_payload = {
+                "thought_name": self.name,
+                "thought_id": self.id,
+                "operation": operation,
+                "ok": bool(self.last_outcome.get("ok")),
+                "error_class": self.last_outcome.get("error_class"),
+                "finish_reason": self.last_outcome.get("finish_reason"),
+                "attempts": attempts_made,
+                "duration_ms": round(duration_ms, 2),
+            }
+            memory.emit(emit_kind, emit_payload)
         
         # Track execution history on the THOUGHT instance
         self.execution_history.append({
@@ -677,8 +749,111 @@ class THOUGHT:
                 llm_kwargs.update(kwargs)
                 response = self.run_llm(msgs, **llm_kwargs)
                 self.last_response = response
+                self._last_finish_reason = getattr(self.llm, "last_finish_reason", None)
+                llm_usage = getattr(self.llm, "last_usage", None)
+                if isinstance(llm_usage, dict):
+                    if self._last_call_usage is None:
+                        self._last_call_usage = dict(llm_usage)
+                    else:
+                        self._last_call_usage["prompt_tokens"] = (
+                            self._last_call_usage.get("prompt_tokens", 0)
+                            + llm_usage.get("prompt_tokens", 0)
+                        )
+                        self._last_call_usage["completion_tokens"] = (
+                            self._last_call_usage.get("completion_tokens", 0)
+                            + llm_usage.get("completion_tokens", 0)
+                        )
+                        if "cost" in llm_usage and llm_usage["cost"] is not None:
+                            self._last_call_usage["cost"] = (
+                                (self._last_call_usage.get("cost") or 0) + llm_usage["cost"]
+                            )
 
                 channel = self.config.get("channel", "api")
+
+                llm_err = getattr(self.llm, "last_error", None)
+                if llm_err and (response is None or response == ""):
+                    last_error = str(llm_err)
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "http",
+                        last_error,
+                        raw_response=response,
+                    )
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' HTTP/provider error: {}".format(self.name, last_error)
+                        )
+                    retries_left -= 1
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
+
+                if self._last_finish_reason == "length":
+                    why_len = "Model output truncated at max_tokens (finish_reason='length')"
+                    last_error = why_len
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "length",
+                        why_len,
+                        raw_response=response,
+                    )
+                    if not self._hold_msg() and response is not None:
+                        if hasattr(memory, "add_msg") and callable(
+                            getattr(memory, "add_msg", None)
+                        ):
+                            memory.add_msg("assistant", response, channel=channel)
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' truncated: {}".format(self.name, why_len)
+                        )
+                    repair_suffix = self._build_repair_suffix(why_len)
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
+                    retries_left -= 1
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
+
+                if response is None or (isinstance(response, str) and response.strip() == ""):
+                    why_empty = "Model returned an empty response"
+                    last_error = why_empty
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "empty",
+                        why_empty,
+                        raw_response=response,
+                    )
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' empty response".format(self.name)
+                        )
+                    repair_suffix = self._build_repair_suffix(why_empty)
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
+                    retries_left -= 1
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
 
                 # Stage 3: parse — schema validation lives here (valid_extract).
                 # Rescue mode may set _pending_schema_error and return raw object.
@@ -732,24 +907,17 @@ class THOUGHT:
                                 k for k in first_failed_keys if k not in prepared
                             ]
                         memory.add_log(json.dumps(recovery))
-                    # Success path: write assistant turn unless hold_msg withheld earlier failures
+                    # Success path: write assistant turn
                     if hasattr(memory, "add_msg") and callable(
                         getattr(memory, "add_msg", None)
                     ):
                         memory.add_msg("assistant", response, channel=channel)
-                    # Logging
-                    if hasattr(memory, "add_log") and callable(
-                        getattr(memory, "add_log", None)
-                    ):
-                        memory.add_log(
-                            "Thought '{}' completed successfully".format(self.name)
-                        )
-                    # Add reflection for reasoning trace (if configured)
-                    if self.config.get("add_reflection", True):
+                    # Add reflection only when explicitly requested (default False
+                    # to avoid duplicating the assistant reply on every turn, #17)
+                    if self.config.get("add_reflection", False):
                         if hasattr(memory, "add_ref") and callable(
                             getattr(memory, "add_ref", None)
                         ):
-                            # Truncate response for reflection if too long
                             response_preview = str(response)[:300]
                             if len(str(response)) > 300:
                                 response_preview += "..."
@@ -806,15 +974,33 @@ class THOUGHT:
                         "Thought '{}' error: {}".format(self.name, last_error)
                     )
                 break
+            except ReplayMissError as e:
+                last_error = str(e)
+                self.last_error = last_error
+                self._record_failure(
+                    memory,
+                    attempts_made,
+                    "replay_miss",
+                    last_error,
+                    raw_response=None,
+                )
+                if hasattr(memory, "add_log") and callable(
+                    getattr(memory, "add_log", None)
+                ):
+                    memory.add_log(
+                        "Thought '{}' replay miss: {}".format(self.name, last_error)
+                    )
+                break
             except Exception as e:
                 last_error = str(e)
                 self.last_error = last_error
                 # Parse failures surface as ValueError with "Schema-based parsing failed"
-                failure_kind = (
-                    "schema"
-                    if "Schema-based parsing failed" in last_error
-                    else "exception"
-                )
+                if isinstance(e, ChatError):
+                    failure_kind = "http"
+                elif "Schema-based parsing failed" in last_error:
+                    failure_kind = "schema"
+                else:
+                    failure_kind = "exception"
                 if failure_kind == "schema":
                     had_schema_rejection = True
                 self._record_failure(

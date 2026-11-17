@@ -654,7 +654,7 @@ def humanize_schema_error(message: str, schema: Any = None) -> str:
     text = re.sub(r"^([^:]+): expected null, got dict", r"Field '\1' must be null but received an object. If the field is optional, use a '?' suffix on the key (e.g. '\1?') or omit it from the format dict. A bare None exemplar means the value must be null, not that the field is optional.", text)
     text = re.sub(r"^([^:]+): expected null, got (\w+)", r"Field '\1' must be null but got \2", text)
 
-    if "missing required key" in text:
+    if "missing required key" in text and "Mark optional keys" not in text:
         key_match = re.search(r"missing required key '([^']+)'", text)
         if key_match:
             key = key_match.group(1)
@@ -663,7 +663,7 @@ def humanize_schema_error(message: str, schema: Any = None) -> str:
                 "(e.g. '{}?'). {}".format(key, key, text)
             )
 
-    if schema is not None:
+    if schema is not None and "Expected schema:" not in text:
         text = "{}. Expected schema: {}".format(text, format_schema_annotation(schema))
 
     return text

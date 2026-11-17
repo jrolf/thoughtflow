@@ -103,6 +103,90 @@ def test_schema_retry_succeeds_in_format_mode(mock_llm, memory):
     assert "Expected schema:" in llm.calls[1]["msgs"][-1]["content"]
 
 
+class TestThoughtOutcomesAndLifecycle:
+    """Regression coverage for #20, #29, #26, and #17."""
+
+    def test_outcome_records_attempts_usage_and_finish_reason_on_retry_success(self, memory):
+        class TrackedLLM:
+            def __init__(self):
+                self.calls = 0
+                self.last_error = None
+                self.last_usage = None
+                self.last_finish_reason = None
+
+            def call(self, msgs, params=None):
+                self.calls += 1
+                self.last_usage = {"prompt_tokens": 10, "completion_tokens": 5}
+                self.last_finish_reason = "stop"
+                if self.calls == 1:
+                    return ["not json"]
+                return ['{"answer": "ok"}']
+
+        llm = TrackedLLM()
+        thought = THOUGHT(
+            name="solve",
+            llm=llm,
+            prompt="Solve it",
+            parsing_rules={"kind": "json", "format": {"answer": ""}},
+            max_retries=2,
+        )
+        memory.add_msg("user", "Go", channel="api")
+        thought(memory)
+
+        assert memory.get_var("solve_result") == {"answer": "ok"}
+        # #26: attempts reflects total attempts (2), and failed draft was held out of history
+        assert memory.get_var("solve_attempts") == 2
+        asst_msgs = [m for m in memory.get_msgs() if m["role"] == "assistant"]
+        assert len(asst_msgs) == 1
+        assert asst_msgs[0]["content"] == '{"answer": "ok"}'
+
+        # #17: no duplicate reflection or prose success log by default; typed emit recorded
+        assert memory.get_refs() == []
+        emits = memory.get_emits(kind="thought_completed")
+        assert len(emits) == 1
+        assert emits[0]["payload"]["attempts"] == 2
+
+        # #29: uniform outcome dict
+        outcome = memory.get_var("solve_outcome")
+        assert outcome["ok"] is True
+        assert outcome["error_class"] is None
+        assert outcome["finish_reason"] == "stop"
+        assert outcome["attempts"] == 2
+        assert outcome["usage"]["prompt_tokens"] == 20
+        assert len(outcome["validation_messages"]) == 1
+
+    def test_truncation_and_empty_replies_fail_with_structured_outcome(self, memory):
+        class TruncatedLLM:
+            last_error = None
+            last_usage = {"prompt_tokens": 20, "completion_tokens": 50}
+            last_finish_reason = "length"
+
+            def call(self, msgs, params=None):
+                return ["partial cut off"]
+
+        thought = THOUGHT(name="trunc", llm=TruncatedLLM(), prompt="Write", max_retries=2)
+        thought(memory)
+
+        assert memory.get_var("trunc_result") is None
+        outcome = memory.get_var("trunc_outcome")
+        assert outcome["ok"] is False
+        assert outcome["error_class"] == "length"
+        assert outcome["finish_reason"] == "length"
+        assert outcome["attempts"] == 2
+
+    def test_replay_miss_records_replay_miss_outcome_without_retrying(self, memory):
+        from thoughtflow import LLM
+
+        empty_replay = LLM.replay(MEMORY())
+        thought = THOUGHT(name="replayed", llm=empty_replay, prompt="Hello", max_retries=3)
+        thought(memory)
+
+        outcome = memory.get_var("replayed_outcome")
+        assert outcome["ok"] is False
+        assert outcome["error_class"] == "replay_miss"
+        assert outcome["attempts"] == 1
+
+
 # ============================================================================
 # Initialization Tests
 # ============================================================================
