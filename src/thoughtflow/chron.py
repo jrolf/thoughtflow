@@ -26,6 +26,7 @@ import json
 import os
 import time as time_module
 import threading
+import warnings
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -65,7 +66,7 @@ class CHRON:
         >>> chron.stop()
     """
 
-    def __init__(self, name="chron", state_file=None, timezone=None):
+    def __init__(self, name="chron", state_file=None, timezone=None, on_state_error="warn"):
         """
         Initialize a CHRON scheduler.
 
@@ -75,11 +76,18 @@ class CHRON:
                 across restarts. If None, state lives in memory only.
             timezone: Default timezone for cron evaluation, as a string
                 like "America/New_York". Defaults to UTC.
+            on_state_error: Behavior when loading or saving ``state_file`` fails:
+                ``"warn"`` (default — emit ``RuntimeWarning``, record ``last_state_error``,
+                and keep running) or ``"raise"`` (re-raise the exception).
         """
+        if on_state_error not in ("warn", "raise"):
+            raise ValueError("on_state_error must be 'warn' or 'raise', got {!r}".format(on_state_error))
         self.name = name
         self.id = event_stamp()
         self._tz = ZoneInfo(timezone) if timezone else ZoneInfo("UTC")
         self._state_file = state_file
+        self._on_state_error = on_state_error
+        self.last_state_error = None
 
         self._jobs = {}     # name -> job config dict
         self._state = {}    # name -> runtime state dict
@@ -522,12 +530,14 @@ class CHRON:
         previous_next_run_str = state.get("next_run")
 
         # Prepare memory for this execution
+        using_shared_memory = False
         memory = override_memory
         if memory is None:
             if job["memory_factory"]:
                 memory = job["memory_factory"]()
-            elif job["memory"]:
+            elif job["memory"] is not None:
                 memory = job["memory"]
+                using_shared_memory = True
             else:
                 from thoughtflow.memory import MEMORY
                 memory = MEMORY()
@@ -535,7 +545,11 @@ class CHRON:
         start = time_module.time()
 
         try:
-            job["action"](memory)
+            returned = job["action"](memory)
+            if returned is not None:
+                memory = returned
+                if using_shared_memory:
+                    job["memory"] = memory
             elapsed_ms = (time_module.time() - start) * 1000
 
             state["last_run"] = now.isoformat()
@@ -552,6 +566,7 @@ class CHRON:
                 "status": "ok",
                 "duration_ms": round(elapsed_ms, 2),
                 "error": None,
+                "memory": memory,
             }
 
         except Exception as e:
@@ -571,6 +586,7 @@ class CHRON:
                 "status": "error",
                 "duration_ms": round(elapsed_ms, 2),
                 "error": str(e),
+                "memory": memory,
             }
 
     def _compute_next_run_after_execution(self, name, now, previous_next_run_str):
@@ -641,7 +657,7 @@ class CHRON:
     # ================================================================
 
     def _save_state(self):
-        """Save job state to the state file if configured. Best-effort."""
+        """Save job state to the state file if configured (atomic temp + replace)."""
         if not self._state_file:
             return
 
@@ -649,21 +665,50 @@ class CHRON:
             parent = os.path.dirname(self._state_file)
             if parent and not os.path.exists(parent):
                 os.makedirs(parent, exist_ok=True)
-            with open(self._state_file, "w") as f:
+            tmp_path = "{}.tmp".format(self._state_file)
+            with open(tmp_path, "w") as f:
                 json.dump(self._state, f, indent=2)
-        except Exception:
-            pass
+            os.replace(tmp_path, self._state_file)
+            self.last_state_error = None
+        except Exception as exc:
+            self.last_state_error = str(exc)
+            if self._on_state_error == "raise":
+                raise
+            warnings.warn(
+                "CHRON '{}' failed to save state file '{}': {}".format(
+                    self.name, self._state_file, exc
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _load_state(self):
         """Load job state from the state file."""
         if not self._state_file or not os.path.exists(self._state_file):
             return
+        if os.path.getsize(self._state_file) == 0:
+            self._state = {}
+            return
 
         try:
             with open(self._state_file, "r") as f:
-                self._state = json.load(f)
-        except Exception:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("state file root must be a JSON object")
+            self._state = loaded
+            self.last_state_error = None
+        except Exception as exc:
             self._state = {}
+            self.last_state_error = str(exc)
+            if self._on_state_error == "raise":
+                raise
+            warnings.warn(
+                "CHRON '{}' failed to load state file '{}'; resetting in-memory state: {}".format(
+                    self.name, self._state_file, exc
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # ================================================================
     # Serialization

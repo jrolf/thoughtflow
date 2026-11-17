@@ -65,6 +65,7 @@ When no `state_file` is provided, state lives in memory only.
 | name | No | "chron" | Identifier for this scheduler instance. |
 | state_file | No | None | Path to JSON file for persisting job state across restarts. |
 | timezone | No | "UTC" | Default timezone for cron evaluation (e.g. "America/New_York"). |
+| on_state_error | No | "warn" | `"warn"` (emit `RuntimeWarning` and set `last_state_error`) or `"raise"` on corrupt/unwritable state file. |
 
 ### add() Parameters
 

@@ -137,6 +137,8 @@ def build_gemini_generation_config(wire_params):
         generation_config["temperature"] = wire_params.pop("temperature")
     if "top_p" in wire_params:
         generation_config["topP"] = wire_params.pop("top_p")
+    if "n" in wire_params:
+        generation_config["candidateCount"] = wire_params.pop("n")
     return generation_config
 
 

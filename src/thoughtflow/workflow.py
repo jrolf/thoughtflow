@@ -169,24 +169,20 @@ class WORKFLOW:
             step_name = step_config["name"]
             condition = step_config["condition"]
 
-            # Check condition
-            if condition is not None:
-                try:
-                    should_run = condition(memory)
-                except Exception:
-                    should_run = False
-
-                if not should_run:
-                    self.execution_log.append({
-                        "step": step_name,
-                        "status": "skipped",
-                        "reason": "condition_false",
-                    })
-                    continue
-
-            # Execute the step
+            # Execute the step (including condition evaluation so condition
+            # exceptions are treated as step errors rather than silent False)
             start_time = time_module.time()
             try:
+                if condition is not None:
+                    should_run = condition(memory)
+                    if not should_run:
+                        self.execution_log.append({
+                            "step": step_name,
+                            "status": "skipped",
+                            "reason": "condition_false",
+                        })
+                        continue
+
                 result = fn(memory)
                 # If the step returns memory, use it; otherwise keep the original
                 if result is not None:
@@ -215,8 +211,15 @@ class WORKFLOW:
                         ))
                     break
                 elif self.on_error == "retry":
-                    # One retry attempt
+                    # One retry attempt (re-evaluates condition too if present)
                     try:
+                        if condition is not None and not condition(memory):
+                            self.execution_log.append({
+                                "step": step_name,
+                                "status": "skipped",
+                                "reason": "condition_false",
+                            })
+                            continue
                         result = fn(memory)
                         if result is not None:
                             memory = result

@@ -244,8 +244,9 @@ class DELEGATE:
         """
         Create a working copy of memory for delegation.
 
-        Uses memory's copy() method if available; otherwise creates a new
-        MEMORY and transfers messages and variables.
+        Uses memory's copy() method if available so variable values, history,
+        descriptions, tombstones, and channels survive faithfully; otherwise
+        creates a new MEMORY and transfers messages and current variable values.
 
         Args:
             memory: The MEMORY instance to copy.
@@ -253,6 +254,9 @@ class DELEGATE:
         Returns:
             A new MEMORY instance with the same state.
         """
+        if hasattr(memory, "copy") and callable(getattr(memory, "copy", None)):
+            return memory.copy()
+
         from thoughtflow.memory import MEMORY
         new_memory = MEMORY()
 
@@ -260,12 +264,21 @@ class DELEGATE:
             for msg in memory.get_msgs():
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                new_memory.add_msg(role, content)
+                channel = msg.get("channel", "unknown")
+                new_memory.add_msg(role, content, channel=channel)
 
-        # Copy variables
-        if hasattr(memory, "vars") and isinstance(memory.vars, dict):
+        if hasattr(memory, "get_all_vars") and callable(getattr(memory, "get_all_vars", None)):
+            for key, value in memory.get_all_vars().items():
+                desc = memory.get_var_desc(key) if hasattr(memory, "get_var_desc") else None
+                new_memory.set_var(key, value, desc=desc)
+        elif hasattr(memory, "vars") and isinstance(memory.vars, dict):
             for key, value in memory.vars.items():
-                new_memory.set_var(key, value)
+                if hasattr(memory, "get_var") and callable(getattr(memory, "get_var", None)):
+                    current = memory.get_var(key)
+                    if current is not None:
+                        new_memory.set_var(key, current)
+                else:
+                    new_memory.set_var(key, value)
 
         return new_memory
 
