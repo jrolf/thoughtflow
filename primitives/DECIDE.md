@@ -12,7 +12,7 @@ Within the ThoughtFlow ecosystem, DECIDE sits between raw THOUGHT (unconstrained
 
 ## How It Works
 
-DECIDE builds a prompt by appending a formatted list of choices to the base prompt, then instructs the LLM to respond with only its choice. When the LLM responds, `parse_response` attempts to extract the selection: first by exact match (after normalization), then by substring search using longest-match-first to avoid partial overlaps. Matching is case-insensitive by default.
+DECIDE builds a prompt by appending a formatted list of choices to the base prompt, then instructs the LLM to respond with only its choice. When the LLM responds, `parse_response` extracts an unambiguous selection: first by exact match (after normalization), then by a leading choice token at the start of the reply, and finally by checking whether exactly one distinct choice appears on word boundaries without negation (so `"I do not approve this. Revise."` will not match `"approve"`). Matching is case-insensitive by default.
 
 If the parsed result fails validation (not in the allowed set), DECIDE appends a repair suffix to the prompt and retries. The repair prompt explicitly lists the valid choices. After `max_retries` attempts (default 5), if no valid choice is obtained and a `default` was configured, that value is stored. Otherwise the last parsed value (or None) is stored.
 

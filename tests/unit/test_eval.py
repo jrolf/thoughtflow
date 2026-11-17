@@ -142,6 +142,48 @@ class TestHarness:
         assert results.total_count == 1
         assert results.results[0].test_case.name == "fast"
 
+    def test_surfaces_absorbed_errors_strict_mode_and_partial_memory(self):
+        """Issue #30: Harness tracks absorbed THOUGHT failures, strict mode, and partial memory."""
+        from thoughtflow import LLM, THOUGHT
+
+        empty_replay = LLM.replay(MEMORY())
+        dead_step = THOUGHT(name="dead", llm=empty_replay, prompt="Hello")
+
+        def partially_dead_flow(mem):
+            mem = dead_step(mem)
+            mem.add_msg("assistant", "Fallback reply")
+            return mem
+
+        case = TestCase(
+            name="masked_failure",
+            setup=lambda m: m.add_msg("user", "Hi"),
+            check=lambda m: (m.last_asst_msg(content_only=True) == "Fallback reply", "unexpected reply"),
+        )
+
+        # Non-strict: case passes check, but absorbed_errors surfaces the dead THOUGHT
+        permissive = Harness([case]).run(partially_dead_flow, strict=False)
+        assert permissive.passed_count == 1
+        assert len(permissive.results[0].absorbed_errors) == 1
+        assert permissive.results[0].absorbed_errors[0]["error_class"] == "replay_miss"
+        assert permissive.summary()["cases_with_absorbed_errors"] == ["masked_failure"]
+
+        # Strict: absorbed error fails the case with an explicit reason
+        strict_res = Harness([case]).run(partially_dead_flow, strict=True)
+        assert strict_res.failed_count == 1
+        assert "strict mode" in strict_res.failures[0].reason
+
+        # Exception after mutating memory preserves partial memory on TestResult
+        def crash_midway(mem):
+            mem.set_var("progress", "step_1_done")
+            mem.add_msg("assistant", "Partial output")
+            raise ValueError("midway crash")
+
+        crash_res = Harness([TestCase(name="crash")]).run(crash_midway)
+        assert crash_res.failed_count == 1
+        assert crash_res.failures[0].memory is not None
+        assert crash_res.failures[0].memory.get_var("progress") == "step_1_done"
+        assert crash_res.failures[0].response == "Partial output"
+
     def test_result_includes_memory_for_inspection(self):
         """TestResult must carry the result MEMORY for post-hoc inspection."""
         harness = Harness([

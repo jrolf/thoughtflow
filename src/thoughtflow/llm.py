@@ -134,8 +134,10 @@ class LLM:
         self.default_params = {}
         self.last_error = None
         self.last_usage = None
-        self.request_timeout = None
+        self.last_finish_reason = None
+        self.request_timeout = 120
         self.on_usage = None
+        self.allow_reasoning_fallback = False
 
         # Reserved client keys — never stored in default_params or sent on wire
         self._record_memory = kwargs.pop('record', None)
@@ -143,6 +145,8 @@ class LLM:
             self.request_timeout = kwargs.pop('request_timeout')
         if 'on_usage' in kwargs:
             self.on_usage = kwargs.pop('on_usage')
+        if 'allow_reasoning_fallback' in kwargs:
+            self.allow_reasoning_fallback = bool(kwargs.pop('allow_reasoning_fallback'))
 
         # Model + transport kwargs (transport split out at call time via split_call_params)
         for k, v in kwargs.items():
@@ -327,14 +331,17 @@ class LLM:
         mapped = self._prepare_messages(msg_list)
         return apply_cache_markers(mapped, self.service)
 
-    @staticmethod
-    def _extract_message_text(message):
+    def _extract_message_text(self, message, allow_reasoning=None):
         """
-        Prefer message content; fall back to reasoning when content is empty.
+        Extract user-visible assistant content from a provider message dict.
 
-        Several OpenAI-compatible hosts (Cerebras gpt-oss, etc.) place the
-        user-visible answer in message.reasoning when max_tokens is tight.
+        By default, chain-of-thought ``reasoning`` / ``reasoning_content`` is NOT
+        returned when ``content`` is empty so truncated replies do not masquerade
+        as valid answers. Set ``allow_reasoning_fallback=True`` on the LLM (or
+        per call) when targeting hosts that place final answers in ``reasoning``.
         """
+        if allow_reasoning is None:
+            allow_reasoning = self.allow_reasoning_fallback
         if not isinstance(message, dict):
             return str(message or "").strip()
         content = message.get("content")
@@ -345,8 +352,25 @@ class LLM:
                     return text
             else:
                 return str(content).strip()
-        reasoning = str(message.get("reasoning") or "").strip()
-        return reasoning
+        if allow_reasoning:
+            reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+            return str(reasoning).strip()
+        return ""
+
+    @staticmethod
+    def _normalize_finish_reason(raw_reason):
+        """Map provider-specific stop reasons onto canonical strings."""
+        if not raw_reason:
+            return None
+        r = str(raw_reason)
+        low = r.lower()
+        if low in ("end_turn", "stop_sequence", "stop"):
+            return "stop"
+        if low in ("max_tokens", "max_output_tokens", "length"):
+            return "length"
+        if low in ("tool_use", "tool_calls", "function_call"):
+            return "tool_calls"
+        return low
 
     def _resolve_openai_transport(self, transport):
         """
@@ -413,7 +437,23 @@ class LLM:
         """
         merged = merge_call_params(self.default_params, params)
         self.last_params = dict(merged)
+        allow_reasoning = merged.pop("allow_reasoning_fallback", self.allow_reasoning_fallback)
         wire_params, transport = split_call_params(merged)
+        self.last_finish_reason = None
+
+        requested_n = wire_params.get("n")
+        if requested_n is not None:
+            if isinstance(requested_n, bool) or not isinstance(requested_n, int) or requested_n < 1:
+                raise ValueError("Parameter 'n' must be a positive integer, got {!r}.".format(requested_n))
+            if requested_n > 1:
+                if stream:
+                    raise ValueError("Streaming does not support params={'n': > 1}.")
+                if self.service in ("anthropic", "ollama", "groq"):
+                    raise ValueError(
+                        "Service '{}' does not support multiple completions (n={}).".format(
+                            self.service, requested_n
+                        )
+                    )
 
         # Compute the exchange signature up front (params are mutated by the
         # provider methods) so recording sees the canonical request.
@@ -428,6 +468,7 @@ class LLM:
             return gen
 
         call_params = dict(wire_params)
+        call_params["_allow_reasoning_fallback"] = bool(allow_reasoning)
         if output_schema:
             call_params['_output_schema'] = output_schema
 
@@ -536,9 +577,10 @@ class LLM:
             yield event
 
     def _note_chat_message(self, message):
-        """Update ``last_error``, ``last_usage`` and fire ``on_usage`` after a chat."""
+        """Update ``last_error``, ``last_usage``, ``last_finish_reason`` and fire ``on_usage`` after a chat."""
         self.last_error = None
         self.last_usage = message.get("usage")
+        self.last_finish_reason = message.get("finish_reason")
         if self.on_usage and callable(self.on_usage) and self.last_usage:
             self.on_usage(self.last_usage)
 
@@ -616,6 +658,7 @@ class LLM:
     def _call_openai(self, msg_list, params, transport=None):
         url, headers, is_local = self._resolve_openai_transport(transport)
         output_schema = params.pop('_output_schema', None)
+        allow_reasoning = params.pop('_allow_reasoning_fallback', self.allow_reasoning_fallback)
 
         messages = self._prepare_messages_for_provider(msg_list)
         if output_schema and is_local:
@@ -638,9 +681,14 @@ class LLM:
 
         data = json.dumps(payload).encode("utf-8")
         res = self._send_request(url, data, headers)
+        raw_choices = res.get("choices", [])
+        if raw_choices:
+            self.last_finish_reason = self._normalize_finish_reason(
+                raw_choices[0].get("finish_reason")
+            )
         choices = [
-            self._extract_message_text(a.get("message", {}))
-            for a in res.get("choices", [])
+            self._extract_message_text(a.get("message", {}), allow_reasoning=allow_reasoning)
+            for a in raw_choices
         ]
         return choices
 
@@ -648,6 +696,7 @@ class LLM:
         url = "https://api.groq.com/openai/v1/chat/completions"
 
         output_schema = params.pop('_output_schema', None)
+        allow_reasoning = params.pop('_allow_reasoning_fallback', self.allow_reasoning_fallback)
         payload = {
             "model": self.model,
             "messages": self._prepare_messages_for_provider(msg_list),
@@ -670,9 +719,14 @@ class LLM:
             "User-Agent": "Groq/Python 0.9.0",
         }
         res = self._send_request(url, data, headers)
+        raw_choices = res.get("choices", [])
+        if raw_choices:
+            self.last_finish_reason = self._normalize_finish_reason(
+                raw_choices[0].get("finish_reason")
+            )
         choices = [
-            self._extract_message_text(a.get("message", {}))
-            for a in res.get("choices", [])
+            self._extract_message_text(a.get("message", {}), allow_reasoning=allow_reasoning)
+            for a in raw_choices
         ]
         return choices
 
@@ -698,6 +752,7 @@ class LLM:
         url = "https://api.anthropic.com/v1/messages"
 
         output_schema = params.pop('_output_schema', None)
+        params.pop('_allow_reasoning_fallback', None)
         system_parts, system_messages, messages = self._split_system_messages(msg_list)
         messages = apply_cache_markers(messages, "anthropic")
 
@@ -734,6 +789,7 @@ class LLM:
             "Content-Type": "application/json",
         }
         res = self._send_request(url, data, headers)
+        self.last_finish_reason = self._normalize_finish_reason(res.get("stop_reason"))
 
         # When structured output is used, the response is in tool_use blocks
         if output_schema:
@@ -755,6 +811,7 @@ class LLM:
         """
         call_params = dict(params)
         call_params.pop('_output_schema', None)
+        call_params.pop('_allow_reasoning_fallback', None)
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
         gemini_msgs = []
         for m in self._prepare_messages_for_provider(msg_list):
@@ -771,8 +828,13 @@ class LLM:
             "Content-Type": "application/json",
         }
         res = self._send_request(url, data, headers)
+        candidates = res.get("candidates", [])
+        if candidates:
+            self.last_finish_reason = self._normalize_finish_reason(
+                candidates[0].get("finishReason")
+            )
         choices = []
-        for cand in res.get("candidates", []):
+        for cand in candidates:
             parts = cand.get("content", {}).get("parts", [])
             text = "".join([p.get("text", "") for p in parts])
             choices.append(text)
@@ -786,6 +848,7 @@ class LLM:
         """
         transport = transport or {}
         output_schema = params.pop('_output_schema', None)
+        allow_reasoning = params.pop('_allow_reasoning_fallback', self.allow_reasoning_fallback)
         url = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": self.model,
@@ -809,9 +872,14 @@ class LLM:
             "X-Title": transport.get("title", "ThoughtFlow"),
         }
         res = self._send_request(url, data, headers)
+        raw_choices = res.get("choices", [])
+        if raw_choices:
+            self.last_finish_reason = self._normalize_finish_reason(
+                raw_choices[0].get("finish_reason")
+            )
         choices = [
-            self._extract_message_text(a.get("message", {}))
-            for a in res.get("choices", [])
+            self._extract_message_text(a.get("message", {}), allow_reasoning=allow_reasoning)
+            for a in raw_choices
         ]
         return choices
 
@@ -821,6 +889,7 @@ class LLM:
         Expects no authentication. Ollama messages format is like OpenAI's.
         """
         output_schema = params.pop('_output_schema', None)
+        params.pop('_allow_reasoning_fallback', None)
         base_url = params.get("ollama_url", "http://localhost:11434")
         url = base_url.rstrip('/') + "/api/chat"
         payload = {
@@ -864,6 +933,7 @@ class LLM:
             choices = [_message_to_choice(a["message"]) for a in res.get("choices", [])]
         elif "message" in res:
             # single result
+            self.last_finish_reason = self._normalize_finish_reason(res.get("done_reason") or ("stop" if res.get("done") else None))
             choices = [_message_to_choice(res["message"])]
         elif "response" in res:
             # streaming/fallback
@@ -991,6 +1061,9 @@ class LLM:
                     if content:
                         yield content
                     if chunk.get("done"):
+                        self.last_finish_reason = self._normalize_finish_reason(
+                            chunk.get("done_reason") or "stop"
+                        )
                         break
             else:
                 # OpenAI-compatible SSE format
@@ -1005,7 +1078,12 @@ class LLM:
                         chunk = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    choice0 = chunk.get("choices", [{}])[0] if chunk.get("choices") else {}
+                    if choice0.get("finish_reason"):
+                        self.last_finish_reason = self._normalize_finish_reason(
+                            choice0.get("finish_reason")
+                        )
+                    delta = choice0.get("delta", {})
                     content = delta.get("content", "")
                     if content:
                         yield content
@@ -1071,9 +1149,8 @@ class LLM:
                 return parsed
 
         except urllib.error.HTTPError as e:
-            error_msg = e.read().decode("utf-8")
-            print("HTTP Error:", error_msg)
-            self.last_error = error_msg[:500]
+            error_msg = e.read().decode("utf-8", errors="replace")
+            self.last_error = (error_msg or "HTTP {}".format(e.code))[:500]
             self.last_usage = None
             try:
                 return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}
@@ -1179,6 +1256,8 @@ class ReplayLLM(LLM):
         idx = min(self._cursor[key], len(recorded) - 1)
         self._cursor[key] += 1
         choices = list(recorded[idx])
+        self.last_error = None
+        self.last_finish_reason = "stop"
 
         if stream:
             def _single_yield():

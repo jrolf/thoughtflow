@@ -25,7 +25,7 @@ Record/replay exchange keys use messages with cache markers stripped — semanti
 | `model_id` | `service:model` format |
 | `key` | API key |
 | `secret` | Optional API secret |
-| `request_timeout` | Opt-in socket timeout in seconds (default None = blocking) |
+| `request_timeout` | Socket timeout in seconds (default 120; pass `None` for no timeout) |
 | `on_usage` | Optional callback `fn(record)` after successful calls with usage |
 | `record` | Optional MEMORY to record exchanges into |
 | `**kwargs` | Default model + transport params (see buckets below) |
@@ -67,6 +67,9 @@ Anthropic: transforms to `cache_control: {type: ephemeral}`. OpenAI-compatible: 
 | `last_params` | Full merged default + per-call params |
 | `last_error` | str or None — API/transport failure |
 | `last_usage` | Normalized usage dict or None |
+| `last_finish_reason` | Canonical stop reason (`stop`, `length`, `tool_calls`, etc.) or None |
+
+By default, `LLM.call()` does not fall back to `message.reasoning` when `content` is empty so truncated reasoning traces do not pass as valid answers. Pass `allow_reasoning_fallback=True` when targeting a server that intentionally places final answers in `reasoning`.
 
 ### Native provider classes
 
