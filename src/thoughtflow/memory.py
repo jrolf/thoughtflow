@@ -187,6 +187,7 @@ class MEMORY:
         self.idx_vars = []          # Variable-change [timestamp, stamp] pairs
         self.idx_all  = []          # Master index (all [timestamp, seq, stamp] triples)
         self._index_seq = 0         # Insertion tie-breaker when dt_utc collides
+        self._event_seq = 0         # Monotonic per-event causal counter persisted on event dicts
         
         # VARIABLE LAYER: Full history with timestamps
         # vars[key] = [[stamp1, value1], [stamp2, value2], ...]
@@ -261,6 +262,12 @@ class MEMORY:
         """
         stamp = obj["stamp"]
         timestamp = obj["dt_utc"]
+
+        # Persist a monotonic causal sequence number inside the event dict so
+        # unordered rehydration via from_events() preserves sub-millisecond
+        # write order and variable deletion tombstones across sync/merge.
+        self._event_seq += 1
+        obj.setdefault("_seq", self._event_seq)
 
         # Store in data layer
         self.events[stamp] = obj
@@ -782,7 +789,16 @@ class MEMORY:
             out['name'] = event['name']
         return out
 
-    def get_llm_msgs(self, merge_augments=False, include=None, exclude=None, format='raw'):
+    def get_llm_msgs(
+        self,
+        merge_augments=False,
+        include=None,
+        exclude=None,
+        format='raw',
+        channel=None,
+        metadata_filter=None,
+        exclude_metadata=None,
+    ):
         """
         Build LLM-ready message dicts from stored events.
 
@@ -818,8 +834,17 @@ class MEMORY:
         if format == 'openai' and effective_include is None:
             effective_include = list(self.OPENAI_LLM_ROLES)
 
-        events = self.get_msgs(include=effective_include, exclude=exclude)
+        events = self.get_msgs(
+            include=effective_include,
+            exclude=exclude,
+            channel=channel,
+            metadata_filter=metadata_filter,
+            exclude_metadata=exclude_metadata,
+        )
+        return self._fold_llm_events(events, merge_augments=merge_augments, format=format)
 
+    def _fold_llm_events(self, events, merge_augments=False, format='raw'):
+        """Project filtered message events into LLM dicts with optional augment folding."""
         if not merge_augments:
             return [self._event_to_llm_msg(event, format=format) for event in events]
 
@@ -1481,9 +1506,59 @@ class MEMORY:
         self.idx_vars = mem.idx_vars
         self.idx_all = mem.idx_all
         self._index_seq = mem._index_seq
+        self._event_seq = mem._event_seq
         self.vars = mem.vars
         self.var_desc_history = mem.var_desc_history
         self.objects = mem.objects
+
+    def scope(
+        self,
+        actor,
+        read_rooms=None,
+        write_room=None,
+        public_keys=(),
+        export_keys=(),
+    ):
+        """
+        Return a zero-copy scoped perspective over this MEMORY.
+
+        A scope lets multiple actors, parallel branches, or debate rooms share
+        a single event-sourced MEMORY without copying events, leaking private
+        room messages into another actor's prompt, colliding on scratchpad
+        variables such as ``{name}_result``, or decompressing unrelated large
+        objects stored on the parent memory.
+
+        Args:
+            actor (str): Non-empty identifier for this actor/branch. Scoped
+                variable writes land under ``{actor}__{key}`` unless the key is
+                listed in ``export_keys``.
+            read_rooms (iterable[str], optional): Room or channel names this
+                scope may read. When provided, ``get_msgs``, ``get_llm_msgs``,
+                ``last_user_msg``, and ``last_asst_msg`` see only messages
+                whose ``metadata['room']`` or ``channel`` is in ``read_rooms``.
+                When ``None``, all messages on the parent memory are visible.
+            write_room (str, optional): Room/channel name applied to messages
+                added through this scope. Automatically registered in
+                ``self.valid_channels`` so domain rooms (e.g. ``'public_room'``,
+                ``'alpha_board'``) work alongside built-in channels.
+            public_keys (iterable[str], optional): Shared parent variable names
+                readable (read-only unless also in ``export_keys``) through
+                this scope.
+            export_keys (iterable[str], optional): Shared parent variable names
+                that are both readable and writable directly on the parent
+                memory without actor prefixing.
+
+        Returns:
+            _MemoryScope: A MEMORY-compatible view backed directly by ``self``.
+        """
+        return _MemoryScope(
+            base=self,
+            actor=actor,
+            read_rooms=read_rooms,
+            write_room=write_room,
+            public_keys=public_keys,
+            export_keys=export_keys,
+        )
 
     def copy(self):
         """Return a deep copy of the MEMORY instance."""
@@ -1604,6 +1679,12 @@ class MEMORY:
         mem.idx_vars = data.get('idx_vars', [])
         mem.idx_all = data.get('idx_all', [])
         mem._index_seq = len(mem.idx_all)
+        seq_values = [
+            ev.get('_seq', 0)
+            for ev in mem.events.values()
+            if isinstance(ev.get('_seq'), int)
+        ]
+        mem._event_seq = max(seq_values) if seq_values else len(mem.events)
 
         return mem
 
@@ -1629,14 +1710,30 @@ class MEMORY:
         if objects:
             mem.objects = dict(objects)
         
-        # Sort events by timestamp (dt_utc) for chronological order
-        sorted_events = sorted(event_list, key=lambda e: e.get('dt_utc', ''))
+        # Sort events chronologically by dt_utc, breaking sub-millisecond ties
+        # via the persisted _seq counter (or input order for legacy events
+        # created before _seq existed) so unordered batches never invert writes
+        # or resurrect deleted variable tombstones.
+        indexed_events = list(enumerate(event_list))
+        indexed_events.sort(
+            key=lambda pair: (
+                pair[1].get('dt_utc', ''),
+                0 if isinstance(pair[1].get('_seq'), int) else 1,
+                pair[1].get('_seq', pair[0]),
+            )
+        )
+        sorted_events = [pair[1] for pair in indexed_events]
+        max_seq = 0
+        seen_stamps = set()
         
         for ev in sorted_events:
             stamp = ev.get('stamp')
             timestamp = ev.get('dt_utc', '')
-            if not stamp:
+            if not stamp or stamp in seen_stamps:
                 continue
+            seen_stamps.add(stamp)
+            if isinstance(ev.get('_seq'), int) and ev['_seq'] > max_seq:
+                max_seq = ev['_seq']
             
             event_type = ev.get('type', 'msg')
             
@@ -1683,7 +1780,9 @@ class MEMORY:
                             desc_hist.append([stamp, var_desc])
             
             mem.idx_all.append(ts_pair)
-        
+
+        mem._index_seq = len(mem.idx_all)
+        mem._event_seq = max(max_seq, len(mem.events))
         return mem
 
     def render(
@@ -2186,6 +2285,290 @@ True
 For more details, see the MEMORY class docstring and method documentation.
 ------------------------------------------------------------
 """
+
+
+class _MemoryScope:
+    """
+    Zero-copy scoped perspective over a shared ``MEMORY`` instance.
+
+    Created via ``memory.scope(actor, ...)``. Implements the ``MEMORY`` surface
+    consumed by ``THOUGHT``, ``DECIDE``, ``PLAN``, ``ACTION``, ``CHAT``, and
+    ``WORKFLOW`` while isolating message visibility (by room/channel) and
+    variable namespaces (``{actor}__{key}`` vs shared ``public_keys`` /
+    ``export_keys``) on a single underlying event log.
+    """
+
+    def __init__(
+        self,
+        base,
+        actor,
+        read_rooms=None,
+        write_room=None,
+        public_keys=(),
+        export_keys=(),
+    ):
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("scope actor must be a non-empty string")
+        self.base = base
+        self.actor = actor.strip()
+        self.ns = self.actor + "__"
+        self.read_rooms = set(read_rooms) if read_rooms is not None else None
+        self.write_room = write_room
+        self.public_keys = set(public_keys or ()) | set(export_keys or ())
+        self.export_keys = set(export_keys or ())
+
+        if self.write_room:
+            self.base.valid_channels.add(self.write_room)
+        if self.read_rooms:
+            for room in self.read_rooms:
+                self.base.valid_channels.add(room)
+
+    @property
+    def id(self):
+        return "{}:{}".format(self.base.id, self.actor)
+
+    @property
+    def events(self):
+        return self.base.events
+
+    @property
+    def objects(self):
+        return self.base.objects
+
+    @property
+    def valid_roles(self):
+        return self.base.valid_roles
+
+    @property
+    def valid_modes(self):
+        return self.base.valid_modes
+
+    @property
+    def valid_channels(self):
+        return self.base.valid_channels
+
+    @property
+    def vars(self):
+        """
+        Expose only visible logical variable names mapped to their raw history
+        lists so ``THOUGHT.get_context`` never touches or decompresses foreign
+        actor variables or unrelated large objects on ``self.base``.
+        """
+        visible = {}
+        for key in self.public_keys:
+            if key in self.base.vars and not self.base.is_var_deleted(key):
+                visible[key] = self.base.vars[key]
+        for raw_key, history in self.base.vars.items():
+            if raw_key.startswith(self.ns) and not self.base.is_var_deleted(raw_key):
+                logical = raw_key[len(self.ns):]
+                visible[logical] = history
+        return visible
+
+    def _resolve_read_key(self, key):
+        scoped = self.ns + key
+        if scoped in self.base.vars and not self.base.is_var_deleted(scoped):
+            return scoped
+        if key in self.public_keys and key in self.base.vars and not self.base.is_var_deleted(key):
+            return key
+        return None
+
+    def _resolve_write_key(self, key):
+        return key if key in self.export_keys else (self.ns + key)
+
+    def get_var(self, key, resolve_refs=True):
+        real = self._resolve_read_key(key)
+        if real is None:
+            return None
+        return self.base.get_var(real, resolve_refs=resolve_refs)
+
+    def get_all_vars(self, resolve_refs=True):
+        return {
+            key: self.get_var(key, resolve_refs=resolve_refs)
+            for key in self.vars
+        }
+
+    def set_var(self, key, value, desc=''):
+        target = self._resolve_write_key(key)
+        return self.base.set_var(target, value, desc=desc)
+
+    def del_var(self, key):
+        target = self._resolve_write_key(key)
+        if target not in self.base.vars:
+            return None
+        return self.base.del_var(target)
+
+    def is_var_deleted(self, key):
+        scoped = self.ns + key
+        if scoped in self.base.vars:
+            return self.base.is_var_deleted(scoped)
+        if key in self.public_keys:
+            return self.base.is_var_deleted(key)
+        return False
+
+    def _msg_in_read_rooms(self, event):
+        if self.read_rooms is None:
+            return True
+        meta = event.get('metadata') or {}
+        if meta.get('room') in self.read_rooms:
+            return True
+        return event.get('channel') in self.read_rooms
+
+    def add_msg(
+        self,
+        role,
+        content="",
+        mode='text',
+        channel=None,
+        metadata=None,
+        tool_calls=None,
+        tool_call_id=None,
+        name=None,
+    ):
+        meta = dict(metadata or {})
+        meta.setdefault('actor', self.actor)
+        if self.write_room:
+            meta.setdefault('room', self.write_room)
+        eff_channel = channel or self.write_room or 'unknown'
+        self.base.valid_channels.add(eff_channel)
+        return self.base.add_msg(
+            role,
+            content,
+            mode=mode,
+            channel=eff_channel,
+            metadata=meta,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            name=name,
+        )
+
+    def add_augment(
+        self,
+        content,
+        target='last_user',
+        role='system',
+        mode='text',
+        channel=None,
+        metadata=None,
+    ):
+        meta = dict(metadata or {})
+        meta['augments'] = target
+        return self.add_msg(role, content, mode=mode, channel=channel, metadata=meta)
+
+    def get_msgs(
+        self,
+        limit=-1,
+        include=None,
+        exclude=None,
+        repr='list',
+        channel=None,
+        metadata_filter=None,
+        exclude_metadata=None,
+    ):
+        events = self.base.get_msgs(
+            limit=-1,
+            include=include,
+            exclude=exclude,
+            repr='list',
+            channel=channel,
+            metadata_filter=metadata_filter,
+            exclude_metadata=exclude_metadata,
+        )
+        if self.read_rooms is not None:
+            events = [e for e in events if self._msg_in_read_rooms(e)]
+        if limit > 0:
+            events = events[-limit:]
+        if repr == 'list':
+            return events
+        if repr == 'str':
+            return '\n'.join(["{}: {}".format(e['role'], e['content']) for e in events])
+        if repr == 'pprint1':
+            return pprint.pformat(events, indent=1)
+        raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
+
+    def get_llm_msgs(
+        self,
+        merge_augments=False,
+        include=None,
+        exclude=None,
+        format='raw',
+        channel=None,
+        metadata_filter=None,
+        exclude_metadata=None,
+    ):
+        if format not in ('raw', 'openai'):
+            raise ValueError("Invalid format '{}'. Choose 'raw' or 'openai'.".format(format))
+        effective_include = include
+        if format == 'openai' and effective_include is None:
+            effective_include = list(MEMORY.OPENAI_LLM_ROLES)
+        events = self.get_msgs(
+            include=effective_include,
+            exclude=exclude,
+            channel=channel,
+            metadata_filter=metadata_filter,
+            exclude_metadata=exclude_metadata,
+        )
+        return self.base._fold_llm_events(events, merge_augments=merge_augments, format=format)
+
+    def last_user_msg(self, content_only=False):
+        msgs = self.get_msgs(include=['user'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_asst_msg(self, content_only=False):
+        msgs = self.get_msgs(include=['assistant'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_sys_msg(self, content_only=False):
+        msgs = self.get_msgs(include=['system'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def add_log(self, message):
+        return self.base.add_log("[{}] {}".format(self.actor, message))
+
+    def add_ref(self, content):
+        return self.base.add_ref("[{}] {}".format(self.actor, content))
+
+    def emit(self, kind, payload, schema_version=1):
+        tagged = dict(payload) if isinstance(payload, dict) else payload
+        if isinstance(tagged, dict):
+            tagged.setdefault('actor', self.actor)
+        return self.base.emit(kind, tagged, schema_version=schema_version)
+
+    def get_emits(self, kind=None, limit=-1):
+        emits = self.base.get_emits(kind=kind, limit=-1)
+        scoped = [e for e in emits if (e.get('payload') or {}).get('actor') == self.actor]
+        return scoped[-limit:] if limit > 0 else scoped
+
+    def set_obj(self, data, name=None, desc='', content_type='auto'):
+        mapped_name = self._resolve_write_key(name) if name else None
+        return self.base.set_obj(data, name=mapped_name, desc=desc, content_type=content_type)
+
+    def get_obj(self, stamp):
+        return self.base.get_obj(stamp)
+
+    def get_obj_info(self, stamp):
+        return self.base.get_obj_info(stamp)
+
+    def add_exchange(self, kind, key, service, model, request, response):
+        return self.base.add_exchange(kind, key, service, model, request, response)
+
+    def get_exchanges(self, kind=None):
+        return self.base.get_exchanges(kind=kind)
+
+    def copy(self):
+        return _MemoryScope(
+            base=self.base.copy(),
+            actor=self.actor,
+            read_rooms=self.read_rooms,
+            write_room=self.write_room,
+            public_keys=self.public_keys,
+            export_keys=self.export_keys,
+        )
 
 
 __all__ = [

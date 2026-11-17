@@ -1570,3 +1570,104 @@ class TestEmitOperations:
         emits = memory.get_emits()
         assert len(emits) == 2
         assert all(event["type"] == "emit" for event in emits)
+
+
+# ============================================================================
+# Causal Event Ordering & Scoped Views
+# ============================================================================
+
+
+class TestCausalOrderingAndScopes:
+    """Tests for sub-millisecond from_events ordering, get_llm_msgs filters, and memory.scope()."""
+
+    def test_from_events_unordered_preserves_submillisecond_writes_and_tombstones(self, memory):
+        """
+        from_events() documents that input order does not matter; reversed tight
+        sub-millisecond writes and deletions must still replay in causal order.
+        """
+        memory.set_var("phase", "step_1")
+        memory.set_var("phase", "step_2")
+        memory.set_var("phase", "step_3")
+        memory.set_var("temp_secret", "ephemeral")
+        memory.del_var("temp_secret")
+
+        snap = memory.snapshot()
+        shuffled = list(reversed(list(snap["events"].values())))
+        restored = MEMORY.from_events(shuffled, memory_id=memory.id, objects=snap["objects"])
+
+        assert restored.get_var("phase") == "step_3"
+        assert restored.is_var_deleted("temp_secret") is True
+        assert restored.get_var("temp_secret") is None
+
+        # Duplicate ancestor events (e.g. from branch event-list union) are deduplicated cleanly.
+        merged_union = MEMORY.from_events(shuffled + list(snap["events"].values()), memory_id=memory.id)
+        assert len(merged_union.events) == len(memory.events)
+        assert len(merged_union.idx_all) == len(memory.idx_all)
+        assert merged_union.get_var("phase") == "step_3"
+
+    def test_get_llm_msgs_supports_channel_and_metadata_filters(self, memory):
+        """get_llm_msgs() must forward channel, metadata_filter, and exclude_metadata."""
+        memory.add_msg("user", "Public brief", channel="webapp", metadata={"room": "public"})
+        memory.add_msg("assistant", "Private counsel note", channel="api", metadata={"room": "private", "internal": True})
+
+        public_only = memory.get_llm_msgs(metadata_filter={"room": "public"})
+        non_internal = memory.get_llm_msgs(exclude_metadata={"internal": True})
+        webapp_only = memory.get_llm_msgs(channel="webapp")
+
+        assert public_only == [{"role": "user", "content": "Public brief"}]
+        assert non_internal == [{"role": "user", "content": "Public brief"}]
+        assert webapp_only == [{"role": "user", "content": "Public brief"}]
+
+    def test_scope_isolates_rooms_and_scratchpad_variables_with_thought(self, memory, mock_llm):
+        """
+        memory.scope() must isolate private room messages and actor scratchpad
+        variables ({name}_result) while sharing public_keys and export_keys.
+        """
+        from thoughtflow import THOUGHT
+
+        memory.set_var("deal_target", "CloudPulse")
+        alpha = memory.scope(
+            "alpha",
+            read_rooms={"public_room", "alpha_board"},
+            write_room="alpha_board",
+            public_keys={"deal_target"},
+            export_keys={"shared_verdict"},
+        )
+        beta = memory.scope(
+            "beta",
+            read_rooms={"public_room", "beta_board"},
+            write_room="beta_board",
+            public_keys={"deal_target"},
+        )
+
+        alpha.set_var("ceiling", 78)
+        beta.set_var("ceiling", 92)
+        alpha.add_msg("user", "ALPHA-SECRET: cap is 78")
+        beta.add_msg("user", "BETA-SECRET: cap is 92")
+
+        llm_b = mock_llm(responses=["Bid 90"])
+        step = THOUGHT(
+            name="bid",
+            llm=llm_b,
+            prompt="Target={deal_target} ceiling={ceiling} note={last_user_msg}",
+        )
+        step(beta)
+        alpha.set_var("shared_verdict", "ready")
+
+        sent_blob = str(step.last_msgs)
+        assert "CloudPulse" in sent_blob
+        assert "92" in sent_blob
+        assert "ALPHA-SECRET" not in sent_blob
+        assert "78" not in sent_blob
+        assert beta.get_var("bid_result") == "Bid 90"
+        assert "beta__bid_result" in memory.vars
+        assert "bid_result" not in memory.vars
+        assert memory.get_var("shared_verdict") == "ready"
+        assert beta.get_var("ceiling") == 92
+        assert alpha.get_var("ceiling") == 78
+
+    def test_scope_rejects_blank_actor(self, memory):
+        """scope() must reject empty or whitespace-only actor identifiers."""
+        with pytest.raises(ValueError, match="actor"):
+            memory.scope("   ")
+
