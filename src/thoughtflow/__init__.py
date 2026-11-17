@@ -43,6 +43,7 @@ from __future__ import annotations
 
 # Core primitives
 from thoughtflow.llm import LLM, OpenAICompatibleLLM, ReplayLLM, ReplayMissError
+from thoughtflow.llm_chat import ChatError
 from thoughtflow.llm_cache import cached_system, cached_message
 from thoughtflow.providers import GroqLLM, CerebrasLLM, OpenRouterLLM
 from thoughtflow.embed import EMBED, ReplayEMBED
@@ -113,6 +114,7 @@ __all__ = [
     "LLM",
     "OpenAICompatibleLLM",
     "ReplayLLM",
+    "ChatError",
     "ReplayMissError",
     "GroqLLM",
     "CerebrasLLM",

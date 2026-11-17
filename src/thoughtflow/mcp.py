@@ -58,7 +58,7 @@ class MCP:
         ...     tools = mcp.list_tools()
     """
 
-    def __init__(self, server, env=None):
+    def __init__(self, server, env=None, headers=None, timeout=60):
         """
         Initialize an MCP client and connect to the server.
 
@@ -67,11 +67,18 @@ class MCP:
                 (stdio transport) or an HTTP(S) URL for a remote server.
             env (dict, optional): Additional environment variables to set when
                 launching a stdio subprocess. Merged with the current env.
+            headers (dict, optional): Extra HTTP headers sent with every request
+                to an HTTP server (for example an Authorization header). Ignored
+                for stdio servers.
+            timeout (float, optional): Seconds to wait for each HTTP request
+                (default 60). Ignored for stdio servers.
         """
         self.server = server
         self.tools = []
         self._request_id = 0
         self._env = env
+        self._headers = dict(headers or {})
+        self._timeout = timeout
 
         # Auto-detect transport
         if server.startswith("http://") or server.startswith("https://"):
@@ -247,10 +254,11 @@ class MCP:
 
         data = json.dumps(msg).encode("utf-8")
         headers = {"Content-Type": "application/json"}
+        headers.update(self._headers)
 
         req = urllib.request.Request(self._base_url, data=data, headers=headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode("utf-8")
                 response = json.loads(body)
         except urllib.error.HTTPError as e:
