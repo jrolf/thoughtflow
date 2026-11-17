@@ -18,6 +18,91 @@ import pytest
 from thoughtflow import THOUGHT, DECIDE, PLAN, MEMORY
 
 
+def test_missing_required_prompt_variable_fails_before_llm_call(mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(
+        name="plan",
+        llm=llm,
+        prompt="Plan for {goal}",
+        required_vars=["goal"],
+    )
+    thought(memory)
+    assert llm.call_count == 0
+    assert memory.get_var("plan_last_error")["failure_kind"] == "template"
+    assert "goal" in memory.get_var("plan_last_error")["reason"]
+
+
+def test_malformed_prompt_fails_before_llm_call(mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(name="plan", llm=llm, prompt="Plan for {goal")
+    thought(memory)
+    assert llm.call_count == 0
+    assert memory.get_var("plan_last_error")["failure_kind"] == "template"
+
+
+def test_template_error_fails_fast_without_burning_retries(mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(
+        name="fast_fail",
+        llm=llm,
+        prompt="Plan for {missing}",
+        max_retries=4,
+    )
+    thought(memory)
+    assert llm.call_count == 0
+    assert memory.get_var("fast_fail_attempts") == 1
+    assert memory.get_var("fast_fail_last_error")["failure_kind"] == "template"
+
+
+def test_missing_required_var_checked_before_system_prompt(mock_llm, memory):
+    llm = mock_llm()
+    thought = THOUGHT(
+        name="sys_req",
+        llm=llm,
+        prompt="Proceed",
+        system_prompt="Help with {goal}",
+        required_vars=["goal"],
+    )
+    thought(memory)
+    assert llm.call_count == 0
+    err = memory.get_var("sys_req_last_error")
+    assert err["failure_kind"] == "template"
+    assert "Required prompt variables missing: goal" in err["reason"]
+
+
+def test_unset_optional_var_renders_cleanly_in_format_mode(mock_llm, memory):
+    llm = mock_llm(responses=["Hello Alice"])
+    memory.set_var("user_name", "Alice")
+    thought = THOUGHT(
+        name="greet",
+        llm=llm,
+        prompt="Greet {user_name}. Notes: {preferences}",
+        required_vars=["user_name"],
+        optional_vars=["preferences"],
+    )
+    thought(memory)
+    assert llm.call_count == 1
+    assert memory.get_var("greet_result") == "Hello Alice"
+
+
+def test_schema_retry_succeeds_in_format_mode(mock_llm, memory):
+    # Attempt 1 fails schema validation and attaches a {name: str, age: int} repair
+    # suffix; attempt 2 must still reach the LLM without tripping TemplateRenderError.
+    llm = mock_llm(responses=["not valid python", "{'name': 'Ada', 'age': 30}"])
+    memory.set_var("topic", "Ada")
+    thought = THOUGHT(
+        name="extract",
+        llm=llm,
+        prompt="Extract profile for {topic}",
+        parsing_rules={"kind": "python", "format": {"name": "", "age": 0}},
+        max_retries=2,
+    )
+    thought(memory)
+    assert llm.call_count == 2
+    assert memory.get_var("extract_result") == {"name": "Ada", "age": 30}
+    assert "Expected schema:" in llm.calls[1]["msgs"][-1]["content"]
+
+
 # ============================================================================
 # Initialization Tests
 # ============================================================================

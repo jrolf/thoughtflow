@@ -33,7 +33,27 @@ from thoughtflow._util import (
     estimate_size,
     is_obj_ref,
     truncate_content,
+    TemplateRenderError,
+    render_template,
 )
+
+
+def test_render_template_reports_missing_placeholder():
+    with pytest.raises(TemplateRenderError, match="'goal'"):
+        render_template("Plan for {goal}", {})
+
+
+def test_render_template_reports_malformed_brace():
+    with pytest.raises(TemplateRenderError):
+        render_template("Plan for {goal", {"goal": "x"})
+
+
+def test_render_template_reports_type_error_and_exports_exception():
+    from thoughtflow import TemplateRenderError as PublicTemplateRenderError
+
+    assert PublicTemplateRenderError is TemplateRenderError
+    with pytest.raises(TemplateRenderError):
+        render_template("First: {items[0]}", {"items": 123})
 
 
 # ============================================================================

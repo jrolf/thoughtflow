@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Record and replay support for `chat`: `LLM.record` captures structured exchanges and `ReplayLLM.chat` serves them, replaying streams as events.
 - `MCP(url, headers=None, timeout=60)`: extra HTTP headers (for example `Authorization`) and a per-request timeout for HTTP servers. Stdio servers ignore both.
 - `parse_cron` accepts the aliases `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
+- `TemplateRenderError` (exported) raised when prompt template rendering fails or configured `required_vars` are missing.
 
+### Changed
+- `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
 ## [0.2.5] - 2026-07-17
 
 Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.
