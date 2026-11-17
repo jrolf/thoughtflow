@@ -211,6 +211,7 @@ class MEMORY:
             'system',
             'user',
             'assistant',
+            'tool',
             'reflection',
             'action',
             'query',
@@ -377,17 +378,76 @@ class MEMORY:
                 )
             )
 
-    def add_msg(self, role, content, mode='text', channel='unknown', metadata=None):
+    @staticmethod
+    def _normalize_stored_tool_calls(tool_calls):
+        """Validate and deep-copy assistant tool_calls for storage in MEMORY."""
+        if not isinstance(tool_calls, list):
+            raise ValueError("tool_calls must be a list of dicts or None")
+        normalized = []
+        for idx, tc in enumerate(tool_calls):
+            if not isinstance(tc, dict):
+                raise ValueError("Each tool_call entry must be a dict")
+            item = copy.deepcopy(tc)
+            if not item.get("id"):
+                item["id"] = "call_{}".format(idx)
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _wire_tool_call(tc, idx=0):
+        """Convert a stored tool_call dict into OpenAI wire format."""
+        if "function" in tc and isinstance(tc["function"], dict):
+            fn = dict(tc["function"])
+            args = fn.get("arguments", "")
+            if not isinstance(args, str):
+                fn["arguments"] = json.dumps(args)
+            return {
+                "id": tc.get("id") or "call_{}".format(idx),
+                "type": tc.get("type") or "function",
+                "function": fn,
+            }
+        raw_args = tc.get("raw_arguments")
+        if raw_args is not None and isinstance(raw_args, str):
+            args_str = raw_args
+        else:
+            args_val = tc.get("arguments", {})
+            args_str = args_val if isinstance(args_val, str) else json.dumps(args_val)
+        return {
+            "id": tc.get("id") or "call_{}".format(idx),
+            "type": "function",
+            "function": {
+                "name": tc.get("name", ""),
+                "arguments": args_str,
+            },
+        }
+
+    def add_msg(
+        self,
+        role,
+        content="",
+        mode='text',
+        channel='unknown',
+        metadata=None,
+        tool_calls=None,
+        tool_call_id=None,
+        name=None,
+    ):
         """
-        Add a message event with channel tracking.
-        
+        Add a message event with channel tracking and optional structured tool fields.
+
         Args:
-            role: Message role (user, assistant, system, etc.)
-            content: Message content
+            role: Message role (user, assistant, system, tool, etc.)
+            content: Message content (defaults to ``""``; ``None`` coerced to ``""``)
             mode: Communication mode (text, audio, voice)
             channel: Communication channel (webapp, ios, telegram, etc.)
             metadata: Optional dict of extension metadata (e.g. {'internal': True}
                 for UI-hidden RAG context). Omitted from the stored event when empty.
+            tool_calls: Optional list of tool-call dicts on an ``assistant`` message
+                (either ``LLM.chat()``'s ``{"id", "name", "arguments"}`` shape or
+                OpenAI wire ``{"id", "type", "function": {...}}`` shape).
+            tool_call_id: Optional string ID linking a ``tool`` role message to its
+                preceding assistant tool call. Required when ``role == 'tool'``.
+            name: Optional sender or tool name stored on the message event.
         """
         if role not in self.valid_roles:
             raise ValueError("Invalid role '{}'. Must be one of: {}".format(role, sorted(self.valid_roles)))
@@ -397,8 +457,30 @@ class MEMORY:
             raise ValueError("Invalid channel '{}'. Must be one of: {}".format(channel, sorted(self.valid_channels)))
         if metadata is not None and not isinstance(metadata, dict):
             raise ValueError("metadata must be a dict or None")
-        
-        stamp = event_stamp({'role': role, 'content': content})
+        if tool_calls is not None and role != 'assistant':
+            raise ValueError("tool_calls is only valid on 'assistant' messages, not '{}'".format(role))
+        if role == 'tool':
+            if not tool_call_id or not isinstance(tool_call_id, str):
+                raise ValueError("role='tool' messages require a non-empty string tool_call_id")
+        elif tool_call_id is not None and not isinstance(tool_call_id, str):
+            raise ValueError("tool_call_id must be a string or None")
+
+        if content is None:
+            content = ""
+
+        stored_tool_calls = (
+            self._normalize_stored_tool_calls(tool_calls)
+            if tool_calls is not None
+            else None
+        )
+
+        stamp_seed = {'role': role, 'content': content}
+        if stored_tool_calls is not None:
+            stamp_seed['tool_calls'] = stored_tool_calls
+        if tool_call_id is not None:
+            stamp_seed['tool_call_id'] = tool_call_id
+
+        stamp = event_stamp(stamp_seed)
         msg = {
             'stamp'   : stamp,
             'type'    : 'msg',
@@ -409,6 +491,12 @@ class MEMORY:
             'dt_bog'  : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'  : str(dtt.datetime.now(tz_utc))[:23],
         }
+        if stored_tool_calls is not None:
+            msg['tool_calls'] = stored_tool_calls
+        if tool_call_id is not None:
+            msg['tool_call_id'] = tool_call_id
+        if name is not None:
+            msg['name'] = str(name)
         if metadata:
             msg['metadata'] = metadata
         self._store_event('msg', msg)
@@ -673,12 +761,40 @@ class MEMORY:
         else:
             raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
 
-    def get_llm_msgs(self, merge_augments=False, include=None, exclude=None):
+    OPENAI_LLM_ROLES = ('system', 'user', 'assistant', 'tool')
+
+    def _event_to_llm_msg(self, event, format='raw'):
+        """Project one stored message event into an LLM message dict."""
+        role = event.get('role', 'user')
+        content = event.get('content', '')
+        out = {'role': role, 'content': content}
+        if event.get('tool_calls'):
+            if format == 'openai':
+                out['tool_calls'] = [
+                    self._wire_tool_call(tc, idx=i)
+                    for i, tc in enumerate(event['tool_calls'])
+                ]
+            else:
+                out['tool_calls'] = copy.deepcopy(event['tool_calls'])
+        if event.get('tool_call_id'):
+            out['tool_call_id'] = event['tool_call_id']
+        if event.get('name'):
+            out['name'] = event['name']
+        return out
+
+    def get_llm_msgs(self, merge_augments=False, include=None, exclude=None, format='raw'):
         """
         Build LLM-ready message dicts from stored events.
 
-        Default (``merge_augments=False``): one ``{'role', 'content'}`` dict per
-        stored message — the same forwarding semantics AGENT uses today.
+        Default (``format='raw'``, ``merge_augments=False``): one dict per stored
+        message preserving ``role``, ``content``, and any structured ``tool_calls``,
+        ``tool_call_id``, or ``name`` fields.
+
+        When ``format='openai'``, internal non-OpenAI roles (``reflection``,
+        ``logger``, ``query``, ``action``, ``result``) are filtered out unless
+        ``include`` was explicitly passed, and assistant ``tool_calls`` are
+        emitted in OpenAI wire shape (``{"id", "type": "function", "function":
+        {"name", "arguments": "<json>"}}``) ready to pass directly to ``LLM.chat()``.
 
         When ``merge_augments=True``, events tagged ``metadata['augments'] ==
         'last_user'`` are prepended into the most recent preceding user message
@@ -690,17 +806,22 @@ class MEMORY:
                 LLM view only (default False).
             include: Optional list of roles to include (passed to ``get_msgs``).
             exclude: Optional list of roles to exclude (passed to ``get_msgs``).
+            format: ``'raw'`` (default) or ``'openai'`` (provider-valid history).
 
         Returns:
-            list[dict]: Messages with ``role`` and ``content`` keys.
+            list[dict]: Messages ready for ``LLM.call()`` or ``LLM.chat()``.
         """
-        events = self.get_msgs(include=include, exclude=exclude)
+        if format not in ('raw', 'openai'):
+            raise ValueError("Invalid format '{}'. Choose 'raw' or 'openai'.".format(format))
+
+        effective_include = include
+        if format == 'openai' and effective_include is None:
+            effective_include = list(self.OPENAI_LLM_ROLES)
+
+        events = self.get_msgs(include=effective_include, exclude=exclude)
 
         if not merge_augments:
-            return [
-                {'role': event.get('role', 'user'), 'content': event.get('content', '')}
-                for event in events
-            ]
+            return [self._event_to_llm_msg(event, format=format) for event in events]
 
         result = []
         for event in events:
@@ -710,17 +831,13 @@ class MEMORY:
                 for i in range(len(result) - 1, -1, -1):
                     if result[i].get('role') == 'user':
                         merged = augment_content + '\n\n' + result[i]['content']
-                        result[i] = {
-                            'role': result[i]['role'],
-                            'content': merged,
-                        }
+                        updated = dict(result[i])
+                        updated['content'] = merged
+                        result[i] = updated
                         break
                 continue
 
-            result.append({
-                'role': event.get('role', 'user'),
-                'content': event.get('content', ''),
-            })
+            result.append(self._event_to_llm_msg(event, format=format))
 
         return result
 
@@ -954,8 +1071,17 @@ class MEMORY:
                 )
             
             if format == 'openai':
-                # OpenAI expects 'user', 'assistant', 'system' roles
-                result.append({'role': role, 'content': content})
+                out_msg = {'role': role, 'content': content}
+                if msg.get('tool_calls'):
+                    out_msg['tool_calls'] = [
+                        self._wire_tool_call(tc, idx=j)
+                        for j, tc in enumerate(msg['tool_calls'])
+                    ]
+                if msg.get('tool_call_id'):
+                    out_msg['tool_call_id'] = msg['tool_call_id']
+                if msg.get('name'):
+                    out_msg['name'] = msg['name']
+                result.append(out_msg)
             else:
                 # List format includes more metadata
                 result.append({

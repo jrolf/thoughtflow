@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `THOUGHT` / `DECIDE` / `PLAN` structured `{name}_outcome` variable (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`) and `thought_completed` / `thought_failed` lifecycle emits on `MEMORY`.
 - `LLM.last_finish_reason` normalized across providers and `allow_reasoning_fallback=False` default so truncated chain-of-thought replies do not pass as valid completions.
 - `Harness.run(..., strict=False)` absorbed-error tracking (`TestResult.absorbed_errors`, `reason`, `observed`, preserved partial `memory`, and `summary()['cases_with_absorbed_errors']`).
+- `MEMORY` native tool-turn support: `'tool'` role, structured `tool_calls` on assistant messages, `tool_call_id` and `name` on tool messages, and `MEMORY.get_llm_msgs(format='openai')` for provider-valid `LLM.chat()` message histories (`Message.assistant(tool_calls=...)` and `Message.tool(...)` updated to match).
 
 ### Changed
 - `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
