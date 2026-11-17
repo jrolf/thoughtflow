@@ -16,10 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MCP(url, headers=None, timeout=60)`: extra HTTP headers (for example `Authorization`) and a per-request timeout for HTTP servers. Stdio servers ignore both.
 - `parse_cron` accepts the aliases `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
 - `TemplateRenderError` (exported) raised when prompt template rendering fails or configured `required_vars` are missing.
+- `THOUGHT` / `DECIDE` / `PLAN` structured `{name}_outcome` variable (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`) and `thought_completed` / `thought_failed` lifecycle emits on `MEMORY`.
+- `LLM.last_finish_reason` normalized across providers and `allow_reasoning_fallback=False` default so truncated chain-of-thought replies do not pass as valid completions.
+- `Harness.run(..., strict=False)` absorbed-error tracking (`TestResult.absorbed_errors`, `reason`, `observed`, preserved partial `memory`, and `summary()['cases_with_absorbed_errors']`).
 
 ### Changed
 - `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
 - `LLM` now defaults `request_timeout` to `120` seconds (pass `request_timeout=None` for blocking), rejects unsupported `n > 1` on providers/streaming that cannot honor it, and stops printing HTTP errors to stdout in `call()`.
+- `THOUGHT` now defaults `hold_msg=True` (keeping failed retry drafts out of chat history), defaults `add_reflection=False` (avoiding duplicate answer events), sets `{name}_attempts` to total attempts on both success and failure, and treats `finish_reason='length'`, empty replies, HTTP errors, and `ReplayMissError` as explicit failed attempts.
 
 ### Fixed
 - `DELEGATE._copy_memory` now uses `memory.copy()` so delegated agents receive actual variable values, descriptions, and tombstones instead of nested `[stamp, value]` history lists.

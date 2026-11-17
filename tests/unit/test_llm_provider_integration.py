@@ -181,16 +181,37 @@ class TestLastErrorAndUsage:
 
 
 class TestReasoningFieldFallback:
-    """WP-P02: content / reasoning fallback."""
+    """Issue #20: reasoning fallback is opt-in; finish_reason is tracked."""
 
     @patch("urllib.request.urlopen")
-    def test_openai_compat_uses_reasoning_when_content_empty(self, mock_urlopen):
+    def test_openai_compat_does_not_leak_reasoning_by_default(self, mock_urlopen):
         mock_urlopen.return_value = MockHTTPResponse({
-            "choices": [{"message": {"content": "", "reasoning": "the answer"}}]
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning": "internal chain of thought"},
+            }]
         })
         llm = OpenAICompatibleLLM(model="gpt-oss-120b", base_url="https://api.cerebras.ai/v1")
         choices = llm.call([{"role": "user", "content": "hi"}])
+        assert choices == [""]
+        assert llm.last_finish_reason == "length"
+
+    @patch("urllib.request.urlopen")
+    def test_openai_compat_uses_reasoning_when_opted_in(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "", "reasoning": "the answer"},
+            }]
+        })
+        llm = OpenAICompatibleLLM(
+            model="gpt-oss-120b",
+            base_url="https://api.cerebras.ai/v1",
+            allow_reasoning_fallback=True,
+        )
+        choices = llm.call([{"role": "user", "content": "hi"}])
         assert choices == ["the answer"]
+        assert llm.last_finish_reason == "stop"
 
 
 class TestPromptCaching:

@@ -21,6 +21,7 @@ LLM_RESERVED_KEYS = frozenset({
     "record",
     "request_timeout",
     "on_usage",
+    "allow_reasoning_fallback",
 })
 
 # OpenAI-compatible services pass wire params through unchanged.

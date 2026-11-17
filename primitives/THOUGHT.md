@@ -80,9 +80,13 @@ Validation is configured via the canonical `validation=` parameter (config alias
 
 `validation_mode='strict'` (default) — schema must pass before callable runs. `validation_mode='rescue'` — on schema miss, structurally parsed payload may be accepted by callable validator.
 
-## Failure visibility
+## Outcomes & Failure Visibility
 
-Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`). Vars `{name}_last_error` and `{name}_attempts` are set on failure. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` values: `template`, `schema`, `validation`, `contract`, `exception`. Prompt rendering errors fail before the LLM call; missing `required_vars` are reported instead of sending a raw template.
+Every `THOUGHT` (as well as `DECIDE` and `PLAN`) writes a uniform, JSON-safe `{name}_outcome` dict to `MEMORY` on both success and failure (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`), emits `thought_completed` / `thought_failed` via `MEMORY.emit()`, and sets `{name}_attempts` to the total number of attempts executed.
+
+Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`) and update `{name}_last_error`. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` / `error_class` values: `template`, `length`, `empty`, `http`, `replay_miss`, `schema`, `validation`, `contract`, `exception`. Prompt rendering errors and `ReplayMissError` fail fast before burning retries.
+
+`hold_msg` defaults to `True` so failed or rejected LLM drafts do not pollute conversation history (pass `hold_msg=False` to record failed assistant messages), and `add_reflection` defaults to `False` so successful runs do not write a duplicate truncated copy of the assistant reply into `MEMORY` reflections.
 
 After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY without raising. Execution events include `failed: true` when retries were exhausted with an error.
 
@@ -102,7 +106,7 @@ After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY wit
 | strict_schema | Opt-in: raise at construction if format uses bare None exemplars |
 | validator | Config-style alias for `validation`; behaves identically |
 | on_failure | Hook: fn(thought, attempt, failure_kind, reason, raw_response=None) |
-| hold_msg | Opt-in: hold assistant messages until successful parse+validate |
+| hold_msg | Hold failed assistant messages out of history until success (default: True) |
 | repair_target | For dict prompts, which section key receives repair suffix text |
 | template_mode | Opt-in prompt rendering: `format` (default, str.format) or `substitute` ({key} only) |
 | include_history | Opt-in history control: True (default) forwards MEMORY turns via get_llm_msgs; False sends system + user only |
@@ -114,7 +118,7 @@ After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY wit
 | pre_hook, post_hook | Callables for custom processing |
 | on_token | Callable receiving each streamed text chunk: fn(chunk) |
 | channel | Channel for message tracking |
-| add_reflection | Whether to add reflection on success |
+| add_reflection | Whether to add reflection on success (default: False) |
 
 ## Usage
 
