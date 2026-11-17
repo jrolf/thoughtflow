@@ -64,9 +64,9 @@ class ReplayMissError(KeyError):
 PROVIDER_ROLE_MAP = {
     "openai":     {"action": "tool",      "result": "tool"},
     "groq":       {"action": "tool",      "result": "tool"},
-    "anthropic":  {"action": "assistant", "result": "assistant"},
+    "anthropic":  {"action": "assistant", "result": "assistant", "tool": "user"},
     "ollama":     {"action": "tool",      "result": "tool"},
-    "gemini":     {"action": "model",     "result": "model",
+    "gemini":     {"action": "model",     "result": "model",     "tool": "user",
                    "assistant": "model",  "system": "user"},
     "openrouter": {"action": "tool",      "result": "tool"},
 }
@@ -258,7 +258,15 @@ class LLM:
             if isinstance(m, dict):
                 role = m.get("role", "user")
                 content = m.get("content", "")
+                if content is None:
+                    content = ""
                 entry = {"role": role, "content": content}
+                if m.get("tool_calls"):
+                    entry["tool_calls"] = list(m["tool_calls"])
+                if m.get("tool_call_id"):
+                    entry["tool_call_id"] = m["tool_call_id"]
+                if m.get("name"):
+                    entry["name"] = m["name"]
                 if m.get("cache"):
                     entry["cache"] = True
                 norm.append(entry)

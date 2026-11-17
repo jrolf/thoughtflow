@@ -474,6 +474,51 @@ class TestLlmViewAugments:
 
         assert contents == ['Visible question']
 
+    def test_tool_role_and_structured_tool_fields_roundtrip_and_openai_projection(self, memory):
+        """Issue #35: MEMORY stores native assistant tool_calls + tool results and projects OpenAI format."""
+        memory.add_msg('user', 'Read a.py', channel='api')
+        memory.add_msg(
+            'assistant',
+            '',
+            channel='api',
+            tool_calls=[{'id': 'call_1', 'name': 'read', 'arguments': {'path': 'a.py'}}],
+        )
+        memory.add_msg('tool', '{"text": "print(1)"}', channel='api', tool_call_id='call_1', name='read')
+        memory.add_msg('query', 'internal scratch query', channel='api')
+        memory.add_msg('assistant', 'File prints 1.', channel='api')
+
+        # Raw projection preserves structured fields
+        raw = memory.get_llm_msgs()
+        assert raw[1]['tool_calls'][0]['name'] == 'read'
+        assert raw[2]['role'] == 'tool'
+        assert raw[2]['tool_call_id'] == 'call_1'
+
+        # OpenAI projection drops non-OpenAI roles ('query') and formats wire tool_calls
+        openai_msgs = memory.get_llm_msgs(format='openai')
+        assert [m['role'] for m in openai_msgs] == ['user', 'assistant', 'tool', 'assistant']
+        assert openai_msgs[1]['tool_calls'] == [{
+            'id': 'call_1',
+            'type': 'function',
+            'function': {'name': 'read', 'arguments': '{"path": "a.py"}'},
+        }]
+        assert openai_msgs[2] == {
+            'role': 'tool',
+            'content': '{"text": "print(1)"}',
+            'tool_call_id': 'call_1',
+            'name': 'read',
+        }
+
+        # JSON serialization round-trip preserves structured tool fields
+        restored = MEMORY.from_json(memory.to_json())
+        assert restored.get_llm_msgs(format='openai') == openai_msgs
+
+    def test_tool_message_validation_guards(self, memory):
+        """Issue #35: tool role requires tool_call_id; tool_calls requires assistant role."""
+        with pytest.raises(ValueError, match="tool_call_id"):
+            memory.add_msg('tool', 'output without id')
+        with pytest.raises(ValueError, match="only valid on 'assistant'"):
+            memory.add_msg('user', 'hi', tool_calls=[{'id': 'c1', 'name': 'x', 'arguments': {}}])
+
 
 # ============================================================================
 # Log Operation Tests

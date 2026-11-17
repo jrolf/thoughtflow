@@ -119,3 +119,17 @@ class TestNormalizeMessages:
 
         assert len(result) == 3
         assert all(isinstance(m, dict) for m in result)
+
+    def test_assistant_tool_calls_and_tool_factory(self) -> None:
+        """Issue #35: Message supports assistant tool_calls and Message.tool()."""
+        asst = Message.assistant(tool_calls=[{"id": "c1", "name": "ls", "arguments": {}}])
+        tool_reply = Message.tool('["a.py"]', tool_call_id="c1", name="ls")
+
+        assert asst.to_dict()["tool_calls"][0]["id"] == "c1"
+        assert Message.from_dict(asst.to_dict()).tool_calls == asst.tool_calls
+        assert tool_reply.to_dict() == {
+            "role": "tool",
+            "content": '["a.py"]',
+            "name": "ls",
+            "tool_call_id": "c1",
+        }

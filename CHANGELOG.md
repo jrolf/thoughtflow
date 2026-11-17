@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MCP(url, headers=None, timeout=60)`: extra HTTP headers (for example `Authorization`) and a per-request timeout for HTTP servers. Stdio servers ignore both.
 - `parse_cron` accepts the aliases `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
 - `TemplateRenderError` (exported) raised when prompt template rendering fails or configured `required_vars` are missing.
+- `MEMORY` native tool-turn support: `'tool'` role, structured `tool_calls` on assistant messages, `tool_call_id` and `name` on tool messages, and `MEMORY.get_llm_msgs(format='openai')` for provider-valid `LLM.chat()` message histories (`Message.assistant(tool_calls=...)` and `Message.tool(...)` updated to match).
 
 ### Changed
 - `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
