@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LLM.chat(cancel=threading.Event())`: abort from another thread; the socket is shut down at once, including while waiting for the first byte. A stream ends with a `done` event whose `finish_reason` is `aborted`.
 - `ChatError` (exported) with `status`, `body`, and `retryable`. `chat` raises instead of printing, so hosts that use stdout as a protocol channel are safe.
 - Record and replay support for `chat`: `LLM.record` captures structured exchanges and `ReplayLLM.chat` serves them, replaying streams as events.
+- `MCP(url, headers=None, timeout=60)`: extra HTTP headers (for example `Authorization`) and a per-request timeout for HTTP servers. Stdio servers ignore both.
+- `parse_cron` accepts the aliases `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
 
 ## [0.2.5] - 2026-07-17
 
