@@ -93,7 +93,7 @@ supply-chain anxiety. The core library uses only Python's standard library —
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.2.5
+pip install thoughtflow==0.3.0
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -2368,7 +2368,7 @@ memory = persistent_mem.load(session_id="abc123")
 
 | Version | Python | Status | Notes |
 |---------|--------|--------|-------|
-| **0.2.x** | 3.9 - 3.13 | 🟢 Active | Current development |
+| **0.3.x** | 3.9 - 3.13 | 🟢 Active | Current development |
 
 **Compatibility Policy:**
 - We test against Python 3.9 through 3.13 on every push (see CI)

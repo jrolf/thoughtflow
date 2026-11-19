@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-19
+
+Major feature, governance, decision-model, and reliability release: adds System-One decision models (`DM` + 4-mode `DECIDE`), structured native tool completions (`LLM.chat`), governed write-ahead `AGENT` & `WORKFLOW` suspend/resume, zero-copy `MEMORY` scopes & token budgets, hermetic `TOOL` record/replay, structured `{name}_outcome` telemetry, and multi-level package documentation.
+
 ### Added
 - `LLM.chat()`: structured chat completion for OpenAI-compatible services (`openai` with any `base_url`, `openrouter`, `groq`). Returns the whole assistant message as one dict: `content`, `reasoning` (kept separate from the answer), native `tool_calls` with parsed `arguments`, `finish_reason`, normalized `usage` (including provider-reported `cost`), and `model`. Messages and tools pass through verbatim.
 - `LLM.chat(stream=True)`: generator of typed events (`text_delta`, `reasoning_delta`, `tool_call_delta`, `done`) including tool-call deltas.
@@ -270,7 +274,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jrolf/thoughtflow/compare/v0.2.2...v0.2.3

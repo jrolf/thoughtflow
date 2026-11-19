@@ -124,10 +124,15 @@ class MCP:
         )
 
         # Send the initialize handshake
+        try:
+            from importlib.metadata import version as _pkg_version
+            tf_version = _pkg_version("thoughtflow")
+        except Exception:
+            tf_version = "0.3.0"
         self._jsonrpc_call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "thoughtflow", "version": "0.1.2"},
+            "clientInfo": {"name": "thoughtflow", "version": tf_version},
         })
 
         # Send initialized notification (no response expected)
