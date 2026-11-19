@@ -6,7 +6,7 @@ This guide explains how to run mypy and fix type errors in ThoughtFlow.
 
 ## Overview
 
-ThoughtFlow uses [mypy](https://mypy.readthedocs.io/) for static type checking. All public APIs must have type hints.
+> **Important policy note (v0.1.0+):** ThoughtFlow prioritizes classic, readable Python signatures (`def call(self, msg_list, params={}):`) and **does not require or enforce static type annotations or `mypy` in CI** (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)). Keep function headers clean and untyped by default; the reference notes below apply only to optional typed helper modules such as `message.py` and `eval/harness.py`.
 
 ---
 

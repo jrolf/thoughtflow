@@ -59,8 +59,8 @@ Constructor kwargs become defaults applied to every call. Per-call `params` over
 | Bucket | Examples | Sent on wire? | In replay key? |
 |--------|----------|---------------|----------------|
 | **Model** | `temperature`, `max_tokens`, `reasoning_effort`, `prompt_cache_key` | Yes | Yes |
-| **Transport** | `base_url`, `extra_headers`, `referer`, `title`, `ollama_url` | No (headers/URL only) | No |
-| **Reserved** | `request_timeout`, `on_usage`, `record` | No | No |
+| **Transport** | `base_url`, `extra_headers`, `referer`, `title`, `ollama_url`, `account_id` | No (headers/URL only) | No |
+| **Reserved** | `request_timeout`, `on_usage`, `record`, `allow_reasoning_fallback` | No | No |
 
 ```python
 llm = LLM(
@@ -68,7 +68,7 @@ llm = LLM(
     key="sk-...",
     temperature=0.7,
     max_tokens=1024,
-    request_timeout=90,  # opt-in socket timeout (seconds)
+    request_timeout=90,  # default is 120s; pass None for blocking
 )
 
 response = llm.call(messages)
@@ -126,7 +126,29 @@ else:
     print("usage:", llm.last_usage)
 ```
 
-`last_usage` normalizes token counts plus cache fields (`cached_tokens`, `cache_read_input_tokens`, `reasoning_tokens`) across providers.
+`last_usage` normalizes token counts plus cache and cost fields (`cached_tokens`, `cache_read_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `cost`) across providers, and `last_finish_reason` normalizes stop reasons (`stop`, `length`, `tool_calls`).
+
+By default, `LLM.call()` never prints HTTP errors to stdout and never falls back to `message.reasoning` when `content` is empty (preventing `max_tokens`-truncated reasoning traces from masquerading as answers; pass `allow_reasoning_fallback=True` when targeting hosts that place final answers in `reasoning`).
+
+---
+
+## Structured Chat (`LLM.chat`)
+
+While `llm.call()` returns `list[str]` for text thoughts, `llm.chat()` is its structured twin for OpenAI-compatible services (`openai` with any `base_url`, `openrouter`, `groq`). It returns the complete assistant message dict (`content`, separate `reasoning`, native `tool_calls` with parsed `arguments`, `finish_reason`, `usage`, `model`), streams typed delta events (`text_delta`, `reasoning_delta`, `tool_call_delta`, `done`), and supports immediate cross-thread socket abort via `cancel=threading.Event()`:
+
+```python
+import threading
+
+msg = llm.chat([{"role": "user", "content": "Read a.py"}], tools=[read_tool.to_schema()])
+# msg["tool_calls"][0] -> {"id": "call_1", "name": "read", "arguments": {"path": "a.py"}, ...}
+
+cancel = threading.Event()
+for ev in llm.chat(messages, tools=tools, stream=True, cancel=cancel):
+    if ev["type"] == "text_delta":
+        print(ev["delta"], end="")
+```
+
+Failures raise `ChatError` (`status`, `body`, `retryable`), and `LLM.record()` / `ReplayLLM.chat()` record and replay both non-streaming and streaming calls identically.
 
 Optional metering hook:
 

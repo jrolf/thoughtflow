@@ -38,6 +38,7 @@ class GroqLLM(LLM):
     """
 
     def __init__(self, model, key, strip_think_blocks=False, **kwargs):
+        """Initialize a GroqLLM with Qwen ``reasoning_format='hidden'`` defaults."""
         if _is_qwen_model(model):
             kwargs.setdefault("reasoning_format", "hidden")
         self.strip_think_blocks = strip_think_blocks

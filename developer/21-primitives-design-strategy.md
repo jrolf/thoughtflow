@@ -1,10 +1,12 @@
 # ThoughtFlow: Primitives Design Strategy
 
 > **Historical design document.** This strategy guided the build-out of the
-> higher-level primitives (TOOL, MCP, AGENT, DELEGATE, WORKFLOW, CHRON,
-> SEARCH, SCRAPE, and the action verbs), all of which are now implemented.
-> It is preserved here because the conceptual boundaries it draws between
-> primitives remain the canonical rationale for the library's shape.
+> higher-level primitives (EMBED, TOOL, MCP, AGENT, DELEGATE, WORKFLOW, CHRON,
+> SEARCH, SCRAPE, and the action verbs), all of which are now implemented —
+> followed later by `DM` (System-One decision models, [`primitives/DM.md`](../primitives/DM.md)),
+> `LLM.chat()` (structured native tool completions), and governed write-ahead
+> `AGENT` / `WORKFLOW` suspend-and-resume. It is preserved here because the
+> conceptual boundaries it draws remain the canonical rationale for the library's shape.
 
 This document defines the next wave of primitives for ThoughtFlow. Its purpose is to establish precise conceptual boundaries between each new primitive, explain how each one relates to the existing foundation (LLM, MEMORY, THOUGHT, ACTION, CHAT), and lay out the implementation sequence so that each primitive can build on the ones before it.
 

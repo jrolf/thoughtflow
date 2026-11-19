@@ -88,6 +88,7 @@ class DecisionError(Exception):
     """
 
     def __init__(self, message, status=None, body="", retryable=False):
+        """Initialize a DecisionError with optional HTTP status, body preview, and retryable flag."""
         super().__init__(message)
         self.status = status
         self.body = body

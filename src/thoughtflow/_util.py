@@ -256,6 +256,21 @@ def construct_prompt(
     order = [],
     header = '',
     ):
+    """
+    Assemble a multi-section dict prompt into a stamped XML-like prompt string.
+
+    Each section key in ``prompt_obj`` is wrapped with a unique per-call random
+    stamp (``<start section_name a12bc> ... </end section_name a12bc>``) so
+    untrusted content inside a section cannot spoof closing delimiters.
+
+    Args:
+        prompt_obj (dict): Mapping of section names to text blocks.
+        order (list, optional): Explicit ordering of section keys.
+        header (str, optional): Optional preamble text (or ``'default'``).
+
+    Returns:
+        str: Assembled prompt string with stamped section boundaries.
+    """
     if order: sections = list(order) 
     else: sections = [a for a in prompt_obj]
     rnum = str(randint(1,9))
@@ -285,6 +300,23 @@ def construct_msgs(
     sys_prompt = '',
     msgs       = [],
     ):
+    """
+    Build an LLM-ready message list from optional system prompt, history, and user prompt.
+
+    Prepends ``sys_prompt`` as ``role='system'``, preserves middle ``msgs``
+    (converting dict prompts via ``construct_prompt``), appends ``usr_prompt``
+    as ``role='user'``, and applies literal key replacements from ``vars`` on a
+    shallow copy of each message dict so caller lists are not mutated in place.
+
+    Args:
+        usr_prompt (str | dict): Final user prompt text or section dict.
+        vars (dict): Optional literal placeholder replacements (e.g. ``{'{k}': 'v'}``).
+        sys_prompt (str | dict): Optional system prompt text or section dict.
+        msgs (list[dict]): Prior conversation messages.
+
+    Returns:
+        list[dict]: Ordered list of ``{'role', 'content', ...}`` message dicts.
+    """
     if sys_prompt:
         if type(sys_prompt)==dict:
             sys_prompt = construct_prompt(sys_prompt) 
@@ -295,14 +327,6 @@ def construct_msgs(
             usr_prompt = construct_prompt(usr_prompt) 
         m = {'role':'user','content':usr_prompt} 
         msgs.append(m) 
-    #msgs2 = [] 
-    #for m in msgs:
-    #    m_copy = m.copy()
-    #    if isinstance(m_copy, dict) and 'content' in m_copy and isinstance(m_copy['content'], str):
-    #        for k, v in vars.items():
-    #            m_copy['content'] = m_copy['content'].replace(k, str(v))
-    #    msgs2.append(m_copy) 
-    #return msgs2
     msgs2 = []
     for m in msgs:
         m_copy = dict(m)

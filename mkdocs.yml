@@ -51,6 +51,7 @@ nav:
     - Quick Start: quickstart.md
   - Concepts:
     - LLM: concepts/llm.md
+    - Decision Models (DM & DECIDE): concepts/decisions.md
     - Memory: concepts/memory.md
     - Thought: concepts/thought.md
     - Agent: concepts/agent.md

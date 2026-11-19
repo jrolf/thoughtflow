@@ -22,10 +22,14 @@ AI systems don't need to be complicated. The complexity lives in the problems yo
 
 | Primitive | What It Does | The Pattern |
 |-----------|--------------|-------------|
-| **LLM** | Unified interface to call any language model | `response = llm.call(messages)` |
-| **MEMORY** | Event-sourced state container for everything | `memory.add_msg("user", "Hello!")` |
-| **THOUGHT** | Atomic unit of cognition with retry/parsing | `memory = thought(memory)` |
-| **ACTION** | External operations with consistent logging | `memory = action(memory, **kwargs)` |
+| **LLM** | Unified interface to call any language model (`call` + structured `chat`) | `response = llm.call(messages)` |
+| **DM** | Multi-provider System-One decision models (`choice`, `noul`, `score`, `box`) | `res = dm.call(state, questions)` |
+| **EMBED** | Multi-provider vector embeddings | `vec = embed.call("text")` |
+| **MEMORY** | Event-sourced state container (scopes, budgets, compaction, suspend/resume) | `memory.add_msg("user", "Hello!")` |
+| **THOUGHT** | Atomic unit of cognition (`DECIDE`, `PLAN`, outcomes, retries) | `memory = thought(memory)` |
+| **ACTION** | Imperative external operations (+ 14 stdlib verbs) | `memory = action(memory, **kwargs)` |
+| **AGENT** | Governed, write-ahead autonomous tool loop (+ `tool_loop`) | `memory = agent(memory)` |
+| **WORKFLOW** | Step orchestration with `ok=` checks, `while_`, and suspend/resume | `memory = workflow(memory)` |
 
 ---
 

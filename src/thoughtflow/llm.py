@@ -122,7 +122,20 @@ class LLM:
             Helper function to send HTTP requests to the specified URL with data and headers.
     """
     def __init__(self, model_id='', key='API_KEY', secret='API_SECRET', **kwargs):
-        # Parse model ID and initialize service and model name
+        """
+        Initialize an LLM client with a ``service:model`` identifier, credentials, and defaults.
+
+        Args:
+            model_id (str): Provider and model slug (e.g. ``'openai:gpt-4o'``,
+                ``'anthropic:claude-3-5-sonnet-20241022'``, ``'ollama:llama3.2'``).
+            key (str): Provider API key (not required for local ``ollama``).
+            secret (str): Optional secondary credential.
+            **kwargs: Reserved client options (``request_timeout=120``, ``on_usage``,
+                ``record``, ``allow_reasoning_fallback=False``), transport options
+                (``base_url``, ``extra_headers``, ``referer``, ``title``, ``ollama_url``),
+                and default wire model parameters (``temperature``, ``max_tokens``, etc.).
+        """
+        # Parse model ID on the first colon so local tags like "ollama:mistral:7b" survive intact
         if ':' not in model_id: model_id = 'openai:gpt-4-turbo'
         
         service, model = model_id.split(':', 1)
@@ -1316,6 +1329,7 @@ class OpenAICompatibleLLM(LLM):
     """
 
     def __init__(self, model, base_url, key="dummy", **kwargs):
+        """Initialize an OpenAI-compatible client pointed at ``base_url``."""
         super().__init__(
             model_id="openai:{}".format(model),
             key=key,

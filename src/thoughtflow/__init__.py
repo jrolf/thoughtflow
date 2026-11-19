@@ -8,12 +8,17 @@ Core Philosophy:
     - Deterministic testing: Record/replay workflows, stable sessions
 
 Core Primitives:
-    - LLM: Multi-provider interface for language model calls
-    - MEMORY: Event-sourced state container (messages, logs, reflections, variables)
-    - THOUGHT: Unit of cognition (Prompt + Context + LLM + Parsing + Validation)
-    - DECIDE: Constrained decisions from finite choices (subclass of THOUGHT)
+    - LLM: Multi-provider interface for generative text (`call`) and structured tool chat (`chat`)
+    - DM: Multi-provider System-One decision models (`choice`, `noul`, `score`, `box`)
+    - EMBED: Multi-provider vector embeddings
+    - MEMORY: Event-sourced state container (messages, scopes, budgets, compaction, suspend/resume)
+    - THOUGHT: Unit of cognition (Prompt + Context + LLM + Parsing + Validation + Outcome)
+    - DECIDE: Constrained decisions over `LLM` or `DM` (`choice`, `noul`, `score`, `multi`)
     - PLAN: Structured multi-step execution plans (subclass of THOUGHT)
-    - ACTION: External operation wrapper with consistent logging
+    - ACTION: Imperative external operation wrapper (+ 14 stdlib verbs)
+    - TOOL / MCP: Declarative model-selectable tools, Model Context Protocol client, and `ReplayTOOL`
+    - AGENT / tool_loop: Governed, write-ahead autonomous tool loop (`ReactAgent`, `ReflectAgent`, `PlanActAgent`)
+    - DELEGATE / CHAT / WORKFLOW / CHRON: Coordination and orchestration primitives
 
 Action Primitives (elemental agent verbs):
     - Communication: SAY, ASK, NOTIFY

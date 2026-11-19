@@ -29,7 +29,9 @@ This is what makes ThoughtFlow systems debuggable and replayable: the memory *is
 
 ## Messages
 
-`add_msg(role, content, mode='text', channel='unknown', metadata=None)` appends a message event. Roles are open-ended — `user`, `assistant`, `system`, plus ThoughtFlow-internal roles like `action` and `result` (tool interactions from the agent loop).
+`add_msg(role, content="", mode='text', channel='unknown', metadata=None, tool_calls=None, tool_call_id=None, name=None)` appends a message event. Roles include `user`, `assistant`, `system`, and `tool` (for native OpenAI/OpenRouter/Groq tool loops), plus ThoughtFlow-internal roles like `action`, `result`, `query`, `reflection`, and `logger`.
+
+Assistant messages may attach structured `tool_calls`, and `tool` messages attach `tool_call_id` (plus optional `name`). Calling `memory.get_llm_msgs(format="openai")` projects a provider-valid OpenAI history while automatically filtering out internal non-OpenAI roles.
 
 `get_msgs()` retrieves with flexible filtering:
 
@@ -119,22 +121,28 @@ Callers must keep emit payloads JSON-safe, redact secrets, and bound size. MEMOR
 
 ---
 
-## THOUGHT failure variables
+## Context Budgets, Compaction, Scopes, and Suspend/Resume
 
-When an `llm_call` THOUGHT exhausts retries, it stores `None` in `{name}_result` and returns MEMORY without raising. Inspect these vars and log events to distinguish misconfiguration from model failure:
+- **Token-budgeted LLM views (`get_llm_msgs(budget_tokens=...)`):** Drops the oldest unpinned turns for the LLM payload only (pinning `system` messages and the latest `user` message by default, and keeping `assistant(tool_calls)` / `tool` pairs intact). Pass `summarizer=fn(dropped)` to inject a digest system message.
+- **Non-destructive compaction (`memory.compact(keep=6)`):** Appends a `system` summary event tagged `metadata={'summary': True, 'internal': True, 'summary_of': [...]}` and emits `memory_compacted`; original events remain in the log while `get_llm_msgs` substitutes the summary.
+- **Zero-copy multi-party scopes (`memory.scope(actor, ...)`):** Isolates `read_rooms` / `write_room` message visibility and `{actor}__{key}` variable namespaces (with nested `scope.scope(...)` unwrapping to the root `MEMORY`) so parallel branches or multi-agent debates share one event log without copying events or colliding on `{name}_result`.
+- **Idempotent suspend & resume (`suspend` / `resolve_suspension`):** Stores a JSON-safe `_suspension` marker and emits `run_suspended` / `run_resumed`; resolving a second time returns `'already_resolved'` without overwriting the decision.
+
+---
+
+## THOUGHT Outcomes & Failure Variables
+
+Every `THOUGHT` (as well as `DECIDE` and `PLAN`) writes a uniform JSON-safe `{name}_outcome` dict on both success and failure (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`), alongside `{name}_attempts` (total attempts executed) and `{name}_last_error` on failures:
 
 ```python
 memory = thought(memory)
 
-err = memory.get_var("locator_last_error")
-# {"reason": "...", "failure_kind": "schema", "attempts": [...]}
-
-attempts = memory.get_var("locator_attempts")  # integer count for this run
+outcome = memory.get_var("locator_outcome")
+# {"ok": False, "error_class": "schema", "error": "...", "finish_reason": "stop",
+#  "usage": {...}, "attempts": 2, "validation_messages": [...]}
 ```
 
-Structured JSON log events use `event: thought_failure` with `failure_kind` one of `schema`, `validation`, `contract`, or `exception`. Execution completion logs include `failed: true` when retries were exhausted with an error. Legitimate `None` results (e.g. memory_query miss) are not marked failed.
-
-Set `hold_msg=True` on the THOUGHT to avoid writing assistant messages from failed attempts into the message log. See [Thought](thought.md) for the full parse-validate pipeline and production-lane knobs.
+`hold_msg` defaults to `True` on `THOUGHT` so failed drafts are withheld from conversation history unless `hold_msg=False` is explicitly requested. See [Thought](thought.md) for the full parse-validate pipeline.
 
 ---
 
