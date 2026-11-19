@@ -93,7 +93,7 @@ supply-chain anxiety. The core library uses only Python's standard library —
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.3.0
+pip install thoughtflow==0.3.1
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -1403,8 +1403,8 @@ planner = PLAN(
 # Step = List of Tasks (can execute in parallel)
 # Task = {"action": "...", "params": {...}, "reason": "..."}
 
-# Tasks can reference previous step results:
-# {"action": "analyze", "params": {"content": "{step_0_result}"}, "reason": "..."}
+# Tasks can reference previous step results using $step_N_result (or $step_N.field):
+# {"action": "analyze", "params": {"content": "$step_0_result"}, "reason": "..."}
 ```
 
 **Key features:**
@@ -1412,7 +1412,7 @@ planner = PLAN(
 - **Explainable** — Each task requires a `reason` field (1-3 sentences)
 - **Flexible actions** — Simple descriptions or full parameter schemas
 - **Parameter validation** — Required vs optional params with `?` suffix
-- **Step references** — Tasks can reference `{step_N_result}` from previous steps
+- **Step references & execution** — Tasks reference `$step_N_result` / `$step_N.field` (avoiding template brace collisions), and `run_plan(plan, memory, actions, parallel_inner=True)` executes plans and records receipts
 - **Configurable limits** — `max_steps` and `max_parallel` constraints
 - **Inherits from THOUGHT** — Full retry, serialization, and hook support
 
@@ -1659,9 +1659,18 @@ memory = delegate.dispatch(memory, "researcher", "Find info on quantum computing
 # Handoff: pass to writer, fire-and-forget
 delegate.handoff(memory, "writer", "Write a summary of the findings")
 
-# Broadcast: ask all agents the same question
-results = delegate.broadcast(memory, "Summarize your findings")
+# Broadcast: ask all agents the same question (optionally in parallel)
+memory = delegate.broadcast(memory, "Summarize your findings", parallel=True)
+
+# Supervisor fan-out: assign distinct tasks in parallel and inspect structured outcomes
+reports = delegate.dispatch_many(
+    memory,
+    [{"agent": "researcher", "task": "Gather citations"}, {"agent": "writer", "task": "Draft outline"}],
+    parallel=True,
+)
 ```
+
+For parallel voting or mapping a single `THOUGHT` / `DECIDE` across items or `n` samples without mutating the base `MEMORY`, use `map_thought(thought, memory, n=5, parallel=True)` or `map_thought(thought, memory, items=docs, parallel=True)`.
 
 ---
 

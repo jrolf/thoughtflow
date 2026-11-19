@@ -41,8 +41,13 @@ memory.add_msg("user", "I was billed twice for my subscription this month.")
 memory = router(memory)
 
 print(memory.get_var("route_result"))    # "billing"
-print(memory.get_var("route_outcome"))   # probabilities, confidence, margin, source
+print(memory.get_var("route_source"))    # "model" ("default", "abstain", or "low_confidence")
+print(memory.get_var("route_outcome"))   # probabilities, confidence, margin, source, abstained
 ```
+
+### Explicit Abstention (`abstain=True`) & Decision Provenance (`{name}_source`)
+
+Pass `abstain=True` (reserves `"none"`) or `abstain="unsure"` on categorical `DECIDE` routers so out-of-scope inputs can explicitly abstain rather than forcing a mis-route. Every `DECIDE` run also writes `{name}_source` (`"model"`, `"default"`, `"abstain"`, `"low_confidence"`, `"refusal"`, or `"error"`) alongside `{name}_outcome["abstained"]`, making model choices unambiguously distinguishable from fallback defaults in controller loops.
 
 ### Automatic Prompt-Injection Isolation (`state="auto"`)
 

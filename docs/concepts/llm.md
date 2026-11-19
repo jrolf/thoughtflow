@@ -126,7 +126,7 @@ else:
     print("usage:", llm.last_usage)
 ```
 
-`last_usage` normalizes token counts plus cache and cost fields (`cached_tokens`, `cache_read_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `cost`) across providers, and `last_finish_reason` normalizes stop reasons (`stop`, `length`, `tool_calls`).
+`last_usage` normalizes token counts plus cache and cost fields (`cached_tokens`, `cache_read_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `cost`) across providers, `llm.usage` maintains a thread-safe cumulative ledger across calls (reset via `llm.reset_usage()`), and `last_finish_reason` normalizes stop reasons (`stop`, `length`, `tool_calls`). When recording into a `MEMORY` (or inside `THOUGHT` / `AGENT`), each call also emits a `'usage'` event onto `MEMORY`.
 
 By default, `LLM.call()` never prints HTTP errors to stdout and never falls back to `message.reasoning` when `content` is empty (preventing `max_tokens`-truncated reasoning traces from masquerading as answers; pass `allow_reasoning_fallback=True` when targeting hosts that place final answers in `reasoning`).
 

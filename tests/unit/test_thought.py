@@ -2584,3 +2584,220 @@ class TestReviewFeedbackThought:
         backup = _ScriptedLLM([("x", "stop")])
         thought = THOUGHT(name="cp", llm=None, prompt="Go", retry={"fallback_llm": backup})
         assert thought.copy().retry["fallback_llm"] is backup
+
+
+class TestStructuredOutputReasoningTemplatesAndRun:
+    """Tests for #38 (output_schema + reasoning), #40 (templates + {messages}), and #51b (thought.run)."""
+
+    def test_output_schema_and_reasoning_forwarded_to_llm_and_serialized(self):
+        import json
+        from thoughtflow.llm_params import normalize_reasoning_params
+
+        recorded_calls = []
+
+        class SchemaAwareLLM:
+            last_error = None
+            last_finish_reason = "stop"
+            last_usage = {"prompt_tokens": 12, "completion_tokens": 6, "cost": 0.001}
+
+            def call(self, msgs, params=None, output_schema=None):
+                recorded_calls.append({
+                    "msgs": msgs,
+                    "params": dict(params or {}),
+                    "output_schema": output_schema,
+                })
+                return ['{"answer": "Paris", "confidence": 95}']
+
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}, "confidence": {"type": "integer"}},
+            "required": ["answer", "confidence"],
+        }
+        thought = THOUGHT(
+            name="capital",
+            llm=SchemaAwareLLM(),
+            prompt="Capital of {country}?",
+            output_schema=schema,
+            reasoning={"effort": "low"},
+            include_history=False,
+        )
+
+        mem = MEMORY()
+        out = thought.run({"country": "France"}, memory=mem)
+        assert out == {"answer": "Paris", "confidence": 95}
+        assert recorded_calls[0]["output_schema"] == schema
+        assert recorded_calls[0]["params"]["reasoning"] == {"effort": "low"}
+
+        # Usage emit landed on MEMORY (#42 / #38 integration)
+        usage_emits = mem.get_emits("usage")
+        assert len(usage_emits) == 1
+        assert usage_emits[0]["payload"]["thought"] == "capital"
+        assert usage_emits[0]["payload"]["prompt_tokens"] == 12
+
+        # Provider normalization maps reasoning cleanly across services
+        assert normalize_reasoning_params({"reasoning": {"effort": "low"}}, "openrouter") == {
+            "reasoning": {"effort": "low"}
+        }
+        assert normalize_reasoning_params({"reasoning": {"effort": "low"}}, "openai") == {
+            "reasoning_effort": "low"
+        }
+        assert normalize_reasoning_params({"reasoning": {"effort": "low"}}, "anthropic") == {}
+
+        # Round-trip serialization preserves output_schema and reasoning
+        reloaded = THOUGHT.from_dict(json.loads(json.dumps(thought.to_dict())), llm=SchemaAwareLLM())
+        assert reloaded.output_schema == schema
+        assert reloaded.reasoning == {"effort": "low"}
+
+    def test_output_schema_degrades_to_prompt_and_repair_when_provider_rejects_schema(self):
+        class RejectingSchemaLLM:
+            def __init__(self):
+                self.calls = []
+                self.last_error = None
+                self.last_finish_reason = "stop"
+                self.last_usage = None
+
+            def call(self, msgs, params=None, output_schema=None):
+                self.calls.append({"msgs": msgs, "output_schema": output_schema})
+                if output_schema is not None:
+                    self.last_error = "HTTP 400: response_format json_schema is not supported by this model"
+                    return []
+                # First fallback call omits required 'age'; second (repair) call succeeds
+                fallback_count = sum(1 for c in self.calls if c["output_schema"] is None)
+                if fallback_count == 1:
+                    return ['{"name": "Ada"}']
+                return ['{"name": "Ada", "age": 36}']
+
+        llm = RejectingSchemaLLM()
+        thought = THOUGHT(
+            name="person",
+            llm=llm,
+            prompt="Extract person: {bio}",
+            output_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                "required": ["name", "age"],
+            },
+            max_retries=2,
+            include_history=False,
+        )
+
+        result = thought.run({"bio": "Ada is 36."})
+        assert result == {"name": "Ada", "age": 36}
+        # Call 1 tried native output_schema; Call 2 fell back immediately; Call 3 repaired missing 'age'
+        assert llm.calls[0]["output_schema"] is not None
+        assert llm.calls[1]["output_schema"] is None
+        assert "JSON Schema" in llm.calls[1]["msgs"][-1]["content"]
+        assert llm.calls[2]["output_schema"] is None
+
+    def test_builtin_template_vars_and_readable_messages_transcript(self, mock_llm):
+        assert THOUGHT.BUILTIN_TEMPLATE_VARS == ("last_user_msg", "last_asst_msg", "messages")
+
+        mem = MEMORY()
+        mem.add_msg("user", "First question", channel="api")
+        mem.add_msg("assistant", "First answer", channel="api")
+        mem.add_log("internal log entry that should not pollute messages")
+
+        llm = mock_llm(responses=["Summary done"])
+        thought = THOUGHT(
+            name="sum",
+            llm=llm,
+            prompt="Transcript:\n{messages}",
+            include_history=False,
+        )
+        thought(mem)
+
+        rendered = thought.last_prompt
+        assert "user: First question" in rendered
+        assert "assistant: First answer" in rendered
+        assert "'stamp':" not in rendered
+
+    def test_system_prompt_and_prompt_share_single_atomic_render_decision(self, mock_llm):
+        mem = MEMORY()
+        mem.set_var("known", "ok")
+        thought = THOUGHT(
+            name="atomic_render",
+            llm=mock_llm(responses=["unused"]),
+            system_prompt="Role: {missing_sys}",
+            prompt="Task: {known}",
+        )
+        thought(mem)
+
+        assert thought.last_prompt is None
+        outcome = mem.get_var("atomic_render_outcome")
+        assert outcome["ok"] is False
+        assert outcome["error_class"] == "template"
+        assert "system_prompt:" in outcome["error"]
+
+
+class TestRunPlanExecutor:
+    """Tests for #48: run_plan executor and $step_N_result / $step_N.field syntax."""
+
+    def test_run_plan_resolves_dollar_and_legacy_refs_and_parallel_inner(self, mock_llm):
+        from thoughtflow import PLAN, run_plan, TOOL
+
+        planner = PLAN(
+            name="research_plan",
+            llm=mock_llm(),
+            prompt="Plan for {topic}",
+            actions={"search": "Find URL", "fetch_a": "Fetch A", "fetch_b": "Fetch B", "combine": "Combine"},
+        )
+        assert "$step_0_result" in planner._format_instructions()
+
+        plan_data = [
+            [{"action": "search", "params": {"q": "mars"}, "reason": "Locate primary endpoints."}],
+            [
+                {"action": "fetch_a", "params": {"url": "$step_0.primary"}, "reason": "Fetch primary."},
+                {"action": "fetch_b", "params": {"url": "$step_0.secondary"}, "reason": "Fetch secondary."},
+            ],
+            [{"action": "combine", "params": {"parts": "$step_1_result", "legacy": "got {step_0_result}"}, "reason": "Merge both."}],
+        ]
+
+        actions = {
+            "search": TOOL(
+                name="search",
+                description="Search",
+                parameters={"q": {"type": "string"}},
+                fn=lambda q: {"primary": "https://a.example/" + q, "secondary": "https://b.example/" + q},
+            ),
+            "fetch_a": lambda url: "A(" + url + ")",
+            "fetch_b": lambda url: "B(" + url + ")",
+            "combine": lambda memory, parts, legacy: {"merged": "|".join(parts), "note": legacy},
+        }
+
+        mem = MEMORY()
+        receipts = run_plan(plan_data, mem, actions, parallel_inner=True)
+
+        assert len(receipts) == 4
+        assert all(r["ok"] for r in receipts)
+        assert mem.get_var("step_1_result") == [
+            "A(https://a.example/mars)",
+            "B(https://b.example/mars)",
+        ]
+        assert mem.get_var("step_2_result")["merged"] == "A(https://a.example/mars)|B(https://b.example/mars)"
+        assert "https://a.example/mars" in mem.get_var("step_2_result")["note"]
+        assert len(mem.get_var("plan_receipts")) == 4
+
+    def test_run_plan_on_error_stop_continue_and_raise(self):
+        from thoughtflow import run_plan
+
+        plan_data = [
+            [{"action": "boom", "params": {}, "reason": "Fails first."}],
+            [{"action": "after", "params": {}, "reason": "Runs only on continue."}],
+        ]
+        actions = {
+            "boom": lambda: (_ for _ in ()).throw(RuntimeError("kaboom")),
+            "after": lambda: "recovered",
+        }
+
+        mem_stop = MEMORY()
+        rec_stop = run_plan(plan_data, mem_stop, actions, on_error="stop")
+        assert len(rec_stop) == 1 and rec_stop[0]["ok"] is False
+
+        mem_cont = MEMORY()
+        rec_cont = run_plan(plan_data, mem_cont, actions, on_error="continue")
+        assert len(rec_cont) == 2 and rec_cont[0]["ok"] is False and rec_cont[1]["result"] == "recovered"
+
+        with pytest.raises(RuntimeError, match="kaboom"):
+            run_plan(plan_data, MEMORY(), actions, on_error="raise")
+
+

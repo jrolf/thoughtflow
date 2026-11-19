@@ -202,3 +202,76 @@ class TestHarness:
         harness.add_many([TestCase(name="b"), TestCase(name="c")])
 
         assert len(harness.test_cases) == 3
+
+    def test_multi_trial_pass_rates_usage_save_load_and_compare(self, tmp_path):
+        """Issue #31: Harness supports trials=N pass rates, usage/cost aggregation, save/load, and noise-aware compare."""
+        counters = {"flaky": 0}
+
+        def stochastic_flow(mem):
+            name = mem.last_user_msg(content_only=True)
+            mem.emit("usage", {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001})
+            if name == "flaky":
+                counters["flaky"] += 1
+                # Passes 3 out of 5 trials
+                reply = "ok" if counters["flaky"] <= 3 else "miss"
+            else:
+                reply = "ok"
+            mem.add_msg("assistant", reply)
+            return mem
+
+        cases = [
+            TestCase(name="solid", messages=[{"role": "user", "content": "solid"}], expected="ok"),
+            TestCase(name="flaky", messages=[{"role": "user", "content": "flaky"}], expected="ok"),
+        ]
+        results = Harness(cases).run(stochastic_flow, trials=5)
+
+        assert results.results[0].trials == 5
+        assert results.results[0].passes == 5
+        assert results.results[0].pass_rate == 1.0
+        assert results.results[1].passes == 3
+        assert results.results[1].pass_rate == 0.6
+        # Suite pass_rate averages per-case pass rates: (1.0 + 0.6) / 2 = 0.8
+        assert results.pass_rate == 0.8
+        assert results.usage["calls"] == 10
+        assert results.usage["total_tokens"] == 150
+        assert results.total_cost == 0.01
+
+        # Save to JSON baseline and reload via Harness.load()
+        baseline_file = tmp_path / "baseline.json"
+        results.save(baseline_file)
+        loaded = Harness.load(baseline_file)
+        assert loaded.pass_rate == 0.8
+        assert loaded.usage["total_tokens"] == 150
+
+        # Small 1-case wobble on a 15-case single-trial suite does NOT exceed noise
+        suite_15 = [TestCase(name="c{}".format(i), expected="ok") for i in range(15)]
+        base_15 = Harness(suite_15).run(
+            lambda m: (m.add_msg("assistant", "ok" if len(m.events) >= 0 else "no"), m)[1]
+        )
+        # Flip exactly 1 of 15 cases in baseline (12/15 vs 13/15 -> delta ~ 0.067)
+        base_dict = base_15.to_dict()
+        for idx_r in range(3):
+            base_dict["results"][idx_r]["passed"] = False
+            base_dict["results"][idx_r]["passes"] = 0
+            base_dict["results"][idx_r]["pass_rate"] = 0.0
+        cand_dict = base_15.to_dict()
+        for idx_r in range(2):
+            cand_dict["results"][idx_r]["passed"] = False
+            cand_dict["results"][idx_r]["passes"] = 0
+            cand_dict["results"][idx_r]["pass_rate"] = 0.0
+
+        cand_15 = Harness.load( __import__("json").dumps(cand_dict) )
+        wobble_cmp = cand_15.compare(base_dict)
+        assert 0.06 < wobble_cmp["delta"] < 0.07
+        assert wobble_cmp["exceeds_noise"] is False
+        assert wobble_cmp["improvements"] == ["c2"]
+
+        # Genuine jump (e.g. 0.40 -> 1.00 across 15 cases) clearly exceeds noise
+        for idx_r in range(9):
+            base_dict["results"][idx_r]["passed"] = False
+            base_dict["results"][idx_r]["passes"] = 0
+            base_dict["results"][idx_r]["pass_rate"] = 0.0
+        signal_cmp = base_15.compare(base_dict)
+        assert signal_cmp["delta"] == 0.6
+        assert signal_cmp["exceeds_noise"] is True
+        assert signal_cmp["direction"] == "improved"

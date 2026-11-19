@@ -128,7 +128,7 @@ class MCP:
             from importlib.metadata import version as _pkg_version
             tf_version = _pkg_version("thoughtflow")
         except Exception:
-            tf_version = "0.3.0"
+            tf_version = "0.3.1"
         self._jsonrpc_call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},

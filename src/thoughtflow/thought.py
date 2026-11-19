@@ -24,6 +24,7 @@ from thoughtflow._util import (
     scan_none_exemplars,
     TemplateRenderError,
     is_obj_ref,
+    validate_json_schema_basic,
 )
 from thoughtflow.llm import ReplayMissError
 from thoughtflow.llm_chat import ChatError
@@ -187,6 +188,10 @@ class THOUGHT:
 
     """
 
+    # Discoverable list of built-in template variables populated automatically
+    # from MEMORY in get_context() alongside user variables.
+    BUILTIN_TEMPLATE_VARS = ("last_user_msg", "last_asst_msg", "messages")
+
     def __init__(self, name=None, llm=None, prompt=None, operation=None, **kwargs):
         """
         Initialize a THOUGHT instance.
@@ -258,6 +263,23 @@ class THOUGHT:
         self.parse_fn = kwargs.get("parse_fn", None)
         self.max_retries = kwargs.get("max_retries", 1)
         self.retry_delay = kwargs.get("retry_delay", 0)
+
+        # Native structured output JSON Schema and per-call reasoning effort (#38)
+        output_schema = kwargs.get("output_schema", None)
+        if output_schema is not None and not isinstance(output_schema, dict):
+            raise ValueError(
+                "output_schema must be a JSON Schema dict or None, got: {}".format(
+                    type(output_schema).__name__
+                )
+            )
+        self.output_schema = output_schema
+
+        raw_reasoning = kwargs.get("reasoning", None)
+        raw_effort = kwargs.get("reasoning_effort", None)
+        if raw_reasoning is None and raw_effort is not None:
+            raw_reasoning = {"effort": raw_effort}
+        self.reasoning = raw_reasoning
+        self._schema_fallback_active = False
 
         # Optionally, store default context variables or requirements
         self.required_vars = kwargs.get("required_vars", [])
@@ -564,6 +586,44 @@ class THOUGHT:
             outcome["used_fallback_llm"] = True
         return outcome
 
+    def _write_extra_outcome_vars(self, memory):
+        """Hook for subclasses (e.g. DECIDE) to write extra outcome vars before emits/hooks."""
+        return None
+
+    def run(self, vars=None, memory=None, **kwargs):
+        """
+        Execute this thought on a fresh (or supplied) ``MEMORY`` and return the parsed result.
+
+        Replaces repetitive ``mem = MEMORY(); mem.set_var(...); mem = thought(mem);
+        mem.get_var(...)`` boilerplate for standalone extraction, classification,
+        and planning calls.
+
+        Args:
+            vars (dict, optional): Variables seeded onto ``memory`` via ``set_var``
+                before execution.
+            memory (MEMORY, optional): Existing ``MEMORY`` instance to update.
+                When omitted, a fresh ``MEMORY()`` is created.
+            **kwargs: Forwarded to ``self(memory, **kwargs)``.
+
+        Returns:
+            object: Parsed result stored in ``self.output_var`` (or ``self.last_result``
+            when ``self.output_var`` is ``None``).
+
+        Example:
+            >>> result = thought.run({"question": "What is 2+2?", "facts": "2+2=4"})
+        """
+        from thoughtflow.memory import MEMORY
+
+        mem = memory if memory is not None else MEMORY()
+        if isinstance(vars, dict):
+            for key, val in vars.items():
+                if hasattr(mem, "set_var") and callable(getattr(mem, "set_var", None)):
+                    mem.set_var(key, val)
+        mem = self(mem, vars=vars, **kwargs)
+        if self.output_var and hasattr(mem, "get_var") and callable(getattr(mem, "get_var", None)):
+            return mem.get_var(self.output_var)
+        return self.last_result
+
     def __call__(self, memory, vars={}, **kwargs):
         """
         Execute the thought on the given MEMORY object.
@@ -662,6 +722,7 @@ class THOUGHT:
                 dict(self.last_outcome),
                 desc="Structured outcome for thought: {}".format(self.name),
             )
+            self._write_extra_outcome_vars(memory)
         if hasattr(memory, "emit") and callable(getattr(memory, "emit", None)):
             emit_kind = "thought_failed" if failed else "thought_completed"
             emit_payload = {
@@ -771,6 +832,7 @@ class THOUGHT:
         attempts_made = 0
         self._pending_schema_error = None
         self._failure_attempts = []
+        self._schema_fallback_active = False
         had_schema_rejection = False
         first_failed_keys = None
 
@@ -830,6 +892,7 @@ class THOUGHT:
                 self._last_finish_reason = getattr(self.llm, "last_finish_reason", None)
                 llm_usage = getattr(self.llm, "last_usage", None)
                 if isinstance(llm_usage, dict):
+                    self._emit_usage_event(memory, llm_usage, client=self.llm)
                     if self._last_call_usage is None:
                         self._last_call_usage = dict(llm_usage)
                     else:
@@ -1316,6 +1379,47 @@ class THOUGHT:
         self.last_prompt = prompt
         return prompt
 
+    def _emit_usage_event(self, memory, usage, client=None):
+        """Emit a normalized ``'usage'`` event onto ``memory`` without double-counting ``record`` memory."""
+        if not isinstance(usage, dict) or not usage:
+            return
+        if not (hasattr(memory, "emit") and callable(getattr(memory, "emit", None))):
+            return
+        model_client = client if client is not None else self.llm
+        rec_mem = getattr(model_client, "_record_memory", None)
+        mem_root = getattr(memory, "base", memory)
+        rec_root = getattr(rec_mem, "base", rec_mem) if rec_mem is not None else None
+        if rec_root is not None and mem_root is rec_root:
+            return
+        payload = dict(usage)
+        if self.name:
+            payload.setdefault("thought", self.name)
+        memory.emit("usage", payload)
+
+    def _render_prompts(self, memory, ctx):
+        """
+        Render ``system_prompt`` and ``prompt`` together under a single render decision.
+
+        Neither ``self.last_prompt`` nor ``self.last_msgs`` is mutated until both
+        surfaces succeed, so a missing placeholder in one surface never leaves
+        the thought in a half-rendered state.
+        """
+        raw_sys = self.config.get("system_prompt", "")
+        if raw_sys:
+            try:
+                sys_prompt = self._render_template_value(raw_sys, ctx)
+            except TemplateRenderError as exc:
+                raise TemplateRenderError("system_prompt: {}".format(exc)) from exc
+        else:
+            sys_prompt = ""
+
+        try:
+            usr_prompt = self.build_prompt(memory, _PrebuiltContext(ctx))
+        except TemplateRenderError as exc:
+            raise TemplateRenderError("prompt: {}".format(exc)) from exc
+
+        return sys_prompt, usr_prompt
+
     def build_msgs(self, memory, context_vars=None):
         """
         Build the messages list for the LLM.
@@ -1338,12 +1442,7 @@ class THOUGHT:
             ctx.update(context_vars)
 
         self._validate_required_vars(ctx)
-
-        sys_prompt = self._render_template_value(
-            self.config.get("system_prompt", ""),
-            ctx,
-        )
-        usr_prompt = self.build_prompt(memory, _PrebuiltContext(ctx))
+        sys_prompt, usr_prompt = self._render_prompts(memory, ctx)
 
         msgs = []
         if self._include_history():
@@ -1478,7 +1577,13 @@ class THOUGHT:
         ):
             ctx["last_asst_msg"] = memory.last_asst_msg(content_only=True)
         if hasattr(memory, "get_msgs") and callable(getattr(memory, "get_msgs", None)):
-            ctx["messages"] = memory.get_msgs(repr="list")
+            try:
+                ctx["messages"] = memory.get_msgs(
+                    include=["system", "user", "assistant", "tool"],
+                    repr="str",
+                )
+            except TypeError:
+                ctx["messages"] = memory.get_msgs(repr="str")
         if hasattr(memory, "vars"):
             for var_name in memory.vars:
                 if var_name in ctx:
@@ -1499,10 +1604,44 @@ class THOUGHT:
                     ctx[var_name] = val
         return ctx
 
+    @staticmethod
+    def _msgs_with_schema_prompt(msgs, schema):
+        """Return a copy of ``msgs`` with a JSON Schema system instruction appended."""
+        schema_msg = {
+            "role": "system",
+            "content": (
+                "You must respond with ONLY valid JSON (no markdown, no explanation) "
+                "conforming to this JSON Schema:\n"
+                + json.dumps(schema, separators=(",", ":"))
+            ),
+        }
+        return [dict(m) for m in msgs] + [schema_msg]
+
+    @staticmethod
+    def _is_schema_rejection_error(err_text):
+        """Return ``True`` when a provider HTTP error indicates structured output rejection."""
+        if not err_text:
+            return False
+        low = str(err_text).lower()
+        cues = (
+            "response_format",
+            "json_schema",
+            "structured_output",
+            "structured output",
+        )
+        return any(cue in low for cue in cues)
+
     def run_llm(self, msgs, **llm_kwargs):
         """
         Execute the LLM call with the given messages.
         !!! USE THE EXISTING LLM CLASS !!!
+
+        When ``self.output_schema`` is configured, forwards ``output_schema`` to
+        ``LLM.call()`` so providers enforce structured JSON natively, degrading
+        transparently to prompt-guided JSON + ``THOUGHT`` parse-and-repair when
+        a mock or model endpoint does not support native structured output.
+        When ``self.reasoning`` is configured, injects ``reasoning`` into
+        ``llm_kwargs`` unless overridden per-call.
 
         When an ``on_token`` callable is set in the thought's config, the LLM
         response is streamed: the hook is invoked with each text chunk as it
@@ -1520,38 +1659,82 @@ class THOUGHT:
         if self.llm is None:
             raise ValueError("No LLM instance provided to this THOUGHT.")
 
+        if (
+            self.reasoning is not None
+            and "reasoning" not in llm_kwargs
+            and "reasoning_effort" not in llm_kwargs
+        ):
+            llm_kwargs["reasoning"] = (
+                dict(self.reasoning) if isinstance(self.reasoning, dict) else self.reasoning
+            )
+
+        active_schema = self.output_schema if not self._schema_fallback_active else None
+        effective_msgs = (
+            self._msgs_with_schema_prompt(msgs, self.output_schema)
+            if (self.output_schema and self._schema_fallback_active)
+            else msgs
+        )
+
         # Streaming path: when on_token is configured and the LLM supports
         # streaming, feed chunks to the hook and join the full text.
         on_token = self.config.get("on_token", None)
         if on_token and callable(on_token) and hasattr(self.llm, "call"):
             try:
                 chunks = []
-                for chunk in self.llm.call(msgs, llm_kwargs, stream=True):
+                stream_kwargs = {"stream": True}
+                if active_schema is not None:
+                    stream_kwargs["output_schema"] = active_schema
+                for chunk in self.llm.call(effective_msgs, llm_kwargs, **stream_kwargs):
                     chunks.append(chunk)
                     on_token(chunk)
                 return "".join(chunks)
             except TypeError:
-                # LLM.call() does not accept stream= — fall through to a
-                # standard non-streaming call below.
+                # LLM.call() does not accept stream= or output_schema= — fall through
+                # to the standard non-streaming call below.
                 pass
 
         # The LLM class is expected to be callable: llm(msgs, **kwargs)
         # If LLM is a class with .call, use that (standard interface)
         if hasattr(self.llm, "call") and callable(getattr(self.llm, "call", None)):
-            response = self.llm.call(msgs, llm_kwargs)
+            if active_schema is not None:
+                try:
+                    response = self.llm.call(
+                        effective_msgs, llm_kwargs, output_schema=active_schema
+                    )
+                except TypeError:
+                    self._schema_fallback_active = True
+                    fallback_msgs = self._msgs_with_schema_prompt(msgs, self.output_schema)
+                    response = self.llm.call(fallback_msgs, llm_kwargs)
+                else:
+                    empty_reply = (
+                        response is None
+                        or response == ""
+                        or (isinstance(response, list) and (not response or not response[0]))
+                    )
+                    err_text = getattr(self.llm, "last_error", None)
+                    if empty_reply and self._is_schema_rejection_error(err_text):
+                        try:
+                            self.llm.last_error = None
+                        except Exception:
+                            pass
+                        self._schema_fallback_active = True
+                        fallback_msgs = self._msgs_with_schema_prompt(msgs, self.output_schema)
+                        response = self.llm.call(fallback_msgs, llm_kwargs)
+            else:
+                response = self.llm.call(effective_msgs, llm_kwargs)
         elif hasattr(self.llm, "chat") and callable(getattr(self.llm, "chat", None)):
-            response = self.llm.chat(msgs, **llm_kwargs)
+            response = self.llm.chat(effective_msgs, **llm_kwargs)
         else:
-            response = self.llm(msgs, **llm_kwargs)
-        
+            response = self.llm(effective_msgs, **llm_kwargs)
+
         # Handle list response from LLM.call() - it returns a list of choices
         if isinstance(response, list):
             response = response[0] if response else ""
-        
+
         # If response is a dict with 'content', extract it
         if isinstance(response, dict) and "content" in response:
             return response["content"]
-        
+
         return response
 
     def parse_response(self, response):
@@ -1561,8 +1744,10 @@ class THOUGHT:
         Resolution order:
           1. Custom ``parse_fn`` if provided
           2. ``parsing_rules`` via ``valid_extract`` (schema validation happens here)
-          3. Built-in ``parser``: ``text``, ``json`` (balanced extraction), ``list``
-          4. Default: return raw string
+          3. ``output_schema`` JSON extraction + JSON Schema check (when no explicit
+             ``parser`` or ``parsing_rules`` override is set)
+          4. Built-in ``parser``: ``text``, ``json`` (balanced extraction), ``list``
+          5. Default: return raw string
 
         When ``parsing_rules`` are set, callable ``validation=`` does **not** run for
         payloads that fail schema unless ``validation_mode='rescue'``. In rescue mode,
@@ -1600,6 +1785,32 @@ class THOUGHT:
         
         # Use built-in parser based on config
         parser = self.config.get("parser", None)
+        if parser is None and self.output_schema is not None:
+            if isinstance(response, (dict, list)):
+                parsed_json = response
+            else:
+                text = str(response or "").strip()
+                fence_match = re.match(
+                    r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
+                    text,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                if fence_match:
+                    text = fence_match.group(1).strip()
+                json_str = extract_balanced_json(text)
+                if not json_str:
+                    raise ValueError(
+                        "Schema-based parsing failed: No JSON object or array found in response."
+                    )
+                try:
+                    parsed_json = json.loads(json_str)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("Schema-based parsing failed: {}".format(exc)) from exc
+            ok, why = validate_json_schema_basic(parsed_json, self.output_schema)
+            if not ok:
+                raise ValueError("Schema-based parsing failed: {}".format(why))
+            return parsed_json
+
         if parser is None:
             # Default: return as string
             return response
@@ -1876,6 +2087,8 @@ class THOUGHT:
             "output_var": self.output_var,
             "required_vars": self.required_vars,
             "optional_vars": self.optional_vars,
+            "output_schema": self._sanitize_for_json(self.output_schema),
+            "reasoning": self._sanitize_for_json(self.reasoning),
             "validation": serializable_validation,
             "execution_history": self.execution_history,
             # Store metadata about non-serializable items
@@ -1928,6 +2141,10 @@ class THOUGHT:
         config_validation = config.pop("validation", None)
         for key in explicit_keys:
             config.pop(key, None)
+        if data.get("output_schema") is not None and "output_schema" not in config:
+            config["output_schema"] = data["output_schema"]
+        if data.get("reasoning") is not None and "reasoning" not in config:
+            config["reasoning"] = data["reasoning"]
 
         effective_validation = (
             validation

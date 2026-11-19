@@ -37,8 +37,16 @@ Template rendering and history inclusion are separate opt-in controls on THOUGHT
 | `include_history=False` | no | Send only configured system prompt plus one rendered user prompt |
 | `visibility='public'` | yes | Write the final assistant reply to `MEMORY` (`'internal'` and `'silent'` store `{name}_result` without writing to the chat transcript) |
 | `record_prompt=False` | yes | When `True`, save the rendered prompt string to `{name}_prompt` |
+| `output_schema=None` | yes | Optional JSON Schema dict forwarded natively to `LLM.call(output_schema=...)`, degrading automatically to prompt-guided JSON + `THOUGHT` parse-and-repair when a model endpoint rejects `response_format` |
+| `reasoning=None` | yes | Optional per-thought reasoning configuration (e.g. `{"effort": "low"}` or `reasoning_effort="low"`), normalized onto `openrouter`, `openai`, and `groq` wire shapes |
 
-Historical message content is never template-substituted. Both user and system prompt strings use the selected rendering mode. Dict-shaped prompts retain their legacy unrendered sections in format mode; substitute mode renders each string section before assembly. MEMORY variables enter template context as their latest values rather than internal event histories. `include_history=False` disables automatic history messages, but explicit placeholders such as `{messages}` or `{last_user_msg}` can still place MEMORY content in the configured prompt. JSON-heavy prompts should use `template_mode='substitute'`.
+Historical message content is never template-substituted. Both user and system prompt strings share a single atomic render decision (`system_prompt` and `prompt` both succeed before `last_prompt` or `last_msgs` updates), and doubled-brace escapes (`{{` / `}}`), field lookups (`{user[name]}`), and format specs (`{score:.2f}`) behave uniformly across `format` and `substitute` modes. Built-in template variables are discoverable via `THOUGHT.BUILTIN_TEMPLATE_VARS` (`('last_user_msg', 'last_asst_msg', 'messages')`), where `{messages}` renders clean `'role: content'` transcript lines rather than raw event dicts.
+
+### Standalone execution & prompt helpers (`thought.run`, `render_vars`, `require_grounded_quotes`)
+
+- **`thought.run(vars=None, memory=None)`:** Runs one `THOUGHT` (or `DECIDE` / `PLAN`) on a fresh or supplied `MEMORY`, seeds `vars`, and returns the parsed `{name}_result` directly.
+- **`render_vars(source, keys=None, empty='(none)', include_desc=False)`** (`thoughtflow._util`): Formats a `dict` or `MEMORY` variable store into `- key: value` prompt lines.
+- **`require_grounded_quotes(source, field=None, min_quotes=1, min_length=8)`** (`thoughtflow._util`): Builds a `validation=` callable verifying verbatim quotes against a ground-truth corpus.
 
 ## Schema language (`parsing_rules`)
 

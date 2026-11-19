@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-19
+
+Ergonomics, evaluation, serverless state, and orchestration release: adds `LLM.cassette` and thread-safe token/cost ledgers, multi-trial `Harness` baselines and comparisons, `MEMORY` belief upserts, prefix/stamp queries, slim snapshots, and branch merges, `DECIDE` explicit abstention and provenance, `THOUGHT(output_schema=, reasoning=)` and `.run()`, decoupled `run_plan` and `map_thought` combinators, bounded `PlanActAgent` replanning, and structured `ACTION` / `DELEGATE` outcome envelopes.
+
+### Added
+- `LLM.cassette(path, live=..., on_miss='raise', model_id=None)`: record-if-missing, else deterministic offline replay helper with atomic disk flushes (`save_cassette` and context-manager support).
+- `ReplayLLM` automatic adoption of recorded constructor `default_params` and `ReplayLLM.misses` inspection list for unmatched requests.
+- `LLM.usage` thread-safe cumulative token/cost ledger (`reset_usage()`), exchange-level `usage` persistence in `MEMORY.add_exchange(..., usage=...)`, automatic `'usage'` emits on recorded/agent `MEMORY` instances, and `ReplayLLM.total_usage()`.
+- `Harness.run(..., trials=N, pass_threshold=1.0)` multi-trial pass rates, per-case and suite `usage` / `total_cost` rollups, JSON baseline serialization (`results.save(path)`, `Harness.load(path)`), and noise-aware `results.compare(baseline, min_delta=None)`.
+- `MEMORY.upsert(key, value, desc='', metadata=None, source=None)` no-op-when-unchanged variable writes, structured variable metadata (`get_var_meta`, `get_var_meta_history`), `MEMORY.find_vars(...)`, and `MEMORY.get_events(..., since=stamp)` (mirrored on `MEMORY.scope`).
+- `MEMORY.to_json(..., slim=True, keep_recent_turns=None)` lean serverless snapshots, monotonic `MEMORY.revision` counter, `MEMORY.merge(other)` branch union, and atomic file persistence across `MEMORY.save()` and `MEMORY.to_json(filename=...)`.
+- Decoupled `cosine_similarity(vec_a, vec_b)` and `cosine_retrieve(query_vec, items, ...)` helpers in `thoughtflow.embed`.
+- `DECIDE(..., abstain=True | '<token>')` explicit abstention option across `LLM` and `DM`, `outcome['abstained']` flag, and `{name}_source` provenance variable on `MEMORY`.
+- `THOUGHT(..., output_schema={...}, reasoning={'effort': ...})` native provider structured output with automatic fallback to prompt-guided JSON + repair retries, cross-provider reasoning effort normalization, and `'usage'` emits on `MEMORY`.
+- Unified doubled-brace escaping (`{{` / `}}`) and field/spec lookup in `substitute` template mode, atomic `system_prompt` + `prompt` rendering, readable `{messages}` transcript formatting, and `THOUGHT.BUILTIN_TEMPLATE_VARS`.
+- `THOUGHT.run(vars=None, memory=None)` one-liner execution helper plus decoupled `render_vars(...)` and `require_grounded_quotes(...)` utilities in `thoughtflow._util`.
+- `ACTION` out-of-band `{name}_status` (`'ok'` | `'error'`), `{name}_error`, `{name}_outcome`, consistent `{name}_result` aliases across all 14 action verbs, identifier-only `_substitution.substitute(..., strict=False)` preserving JSON braces, and `TOOL.from_action(..., memory=None)` bound memory + `action.config` forwarding.
+- `run_plan(plan, memory, actions, on_error='stop', parallel_inner=False)` (exported) plan executor with `$step_N_result` / `$step_N.field` (and legacy `{step_N_result}`) reference resolution and `plan_receipts` tracking.
+- `PlanActAgent(..., max_replans=2)` bounded outer replan execution loop, single- and double-brace `{task}` / `{tool_list}` substitution, non-string step label coercion, structured tool failure detection, and `{name}_outcome` telemetry.
+- `DELEGATE(agents={'name': fn})` callable dict support, per-specialist structured outcomes (`ok`, `result`, `error`, `usage`, `messages`), optional `dispatch(..., merge_vars=, merge_msgs=)`, `broadcast(..., parallel=True)`, `delegate.dispatch_many(...)`, and `map_thought(...)` (exported) parallel fan-out.
+
 ## [0.3.0] - 2026-11-19
 
 Major feature, governance, decision-model, and reliability release: adds System-One decision models (`DM` + 4-mode `DECIDE`), structured native tool completions (`LLM.chat`), governed write-ahead `AGENT` & `WORKFLOW` suspend/resume, zero-copy `MEMORY` scopes & token budgets, hermetic `TOOL` record/replay, structured `{name}_outcome` telemetry, and multi-level package documentation.
@@ -274,7 +295,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/jrolf/thoughtflow/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...v0.2.4

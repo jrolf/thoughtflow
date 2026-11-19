@@ -575,3 +575,26 @@ class TestEmbedBaseURL:
         request = mock_urlopen.call_args[0][0]
         assert request.headers.get("X-custom") == "val"
         assert "Bearer k" in request.headers.get("Authorization", "")
+
+
+class TestCosineHelpers:
+    """Tests for decoupled cosine_similarity and cosine_retrieve helpers (#51)."""
+
+    def test_cosine_similarity_orthogonal_identical_and_zero_norm(self):
+        from thoughtflow.embed import cosine_similarity
+
+        assert cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
+        assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0
+        assert cosine_similarity([0.0, 0.0], [1.0, 2.0]) == 0.0
+
+    def test_cosine_retrieve_ranks_dicts_and_respects_min_score(self):
+        from thoughtflow.embed import cosine_retrieve
+
+        corpus = [
+            {"id": "billing", "embedding": [1.0, 0.0, 0.0]},
+            {"id": "shipping", "embedding": [0.0, 1.0, 0.0]},
+            {"id": "hybrid", "embedding": [0.8, 0.6, 0.0]},
+        ]
+        hits = cosine_retrieve([1.0, 0.1, 0.0], corpus, top_k=2, min_score=0.5)
+        assert [h["item"]["id"] for h in hits] == ["billing", "hybrid"]
+        assert hits[0]["score"] > hits[1]["score"] > 0.5

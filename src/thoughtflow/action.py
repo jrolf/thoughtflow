@@ -121,8 +121,87 @@ class ACTION:
         self.description = description or "Action: {}".format(name)
         self.last_result = None
         self.last_error = None
+        self.last_outcome = None
         self.execution_count = 0
         self.execution_history = []  # Full execution tracking with timing
+
+    @staticmethod
+    def _detect_structured_error(result):
+        """
+        Inspect an action return value for structured verb error shapes (#33).
+
+        Built-in verbs (``RUN``, ``READ``, ``FETCH``, ``POST``, ``SEARCH``,
+        ``SCRAPE``, ``CALL``, ``WAIT``) often return a dict such as
+        ``{"success": False, ...}``, ``{"error": "..."}``, or
+        ``{"status": "timeout", ...}`` instead of raising an exception.
+        """
+        if not isinstance(result, dict):
+            return None
+        if result.get("success") is False:
+            msg = (
+                result.get("error")
+                or result.get("stderr")
+                or (
+                    "Command exited with code {}".format(result["return_code"])
+                    if "return_code" in result
+                    else "Action reported success=False"
+                )
+            )
+            return str(msg).strip() or "Action reported success=False"
+        if "error" in result and result["error"]:
+            return str(result["error"])
+        if result.get("status") in ("error", "timeout"):
+            return str(result.get("error") or "Action status: {}".format(result["status"]))
+        return None
+
+    def _write_memory_slots(self, memory, value, status, error_str, duration_ms):
+        """
+        Write primary ``result_key``, canonical ``{name}_result`` alias, and
+        out-of-band ``{name}_status``, ``{name}_error``, and ``{name}_outcome``.
+        """
+        outcome = {
+            "ok": status == "ok",
+            "status": status,
+            "error": error_str,
+            "duration_ms": round(duration_ms, 2),
+            "result_key": self.result_key,
+        }
+        self.last_outcome = outcome
+
+        if not (hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None))):
+            return outcome
+
+        desc_prefix = "Result of action" if status == "ok" else "Error in action"
+        memory.set_var(
+            self.result_key,
+            value,
+            desc="{}: {}".format(desc_prefix, self.name),
+        )
+
+        if self.name:
+            canonical_key = "{}_result".format(self.name)
+            if canonical_key != self.result_key:
+                memory.set_var(
+                    canonical_key,
+                    value,
+                    desc="Canonical result alias for action: {}".format(self.name),
+                )
+            memory.set_var(
+                "{}_status".format(self.name),
+                status,
+                desc="Execution status ('ok' or 'error') for action: {}".format(self.name),
+            )
+            memory.set_var(
+                "{}_error".format(self.name),
+                error_str,
+                desc="Error message (or None) for action: {}".format(self.name),
+            )
+            memory.set_var(
+                "{}_outcome".format(self.name),
+                dict(outcome),
+                desc="Structured outcome for action: {}".format(self.name),
+            )
+        return outcome
     
     def __call__(self, memory, **kwargs):
         """
@@ -133,7 +212,9 @@ class ACTION:
             **kwargs: Parameters that override the default config for this execution.
             
         Returns:
-            MEMORY: The updated memory object with results stored in memory.vars[result_key].
+            MEMORY: The updated memory object with results stored in memory.vars[result_key]
+            (plus consistent ``{name}_result``, ``{name}_status``, ``{name}_error``,
+            and ``{name}_outcome`` variables).
             
         Note:
             The function receives (memory, **merged_kwargs) where merged_kwargs combines
@@ -154,69 +235,75 @@ class ACTION:
             # Execute the function
             result = self.fn(memory, **merged_kwargs)
             self.last_result = result
-            self.last_error = None
-            
-            # Calculate execution duration
             duration_ms = (time_module.time() - start_time) * 1000
-            
-            # Store result in memory using set_var (correct API)
-            if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
-                memory.set_var(self.result_key, result, desc="Result of action: {}".format(self.name))
-            
-            # Build execution event for logging (JSON format like THOUGHT)
-            execution_event = {
-                'action_name': self.name,
-                'action_id': self.id,
-                'status': 'success',
-                'duration_ms': round(duration_ms, 2),
-                'result_key': self.result_key
-            }
-            
-            # Log successful execution (single message with JSON, no invalid details param)
-            if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
-                memory.add_log("Action execution complete: " + json.dumps(execution_event))
-            
-            # Track execution history
-            self.execution_history.append({
-                'stamp': event_stamp(),
-                'memory_id': getattr(memory, 'id', None),
-                'duration_ms': duration_ms,
-                'success': True,
-                'error': None
-            })
+
+            structured_err = self._detect_structured_error(result)
+            if structured_err is not None:
+                self.last_error = RuntimeError(structured_err)
+                self._write_memory_slots(memory, result, "error", structured_err, duration_ms)
+                error_event = {
+                    'action_name': self.name,
+                    'action_id': self.id,
+                    'status': 'error',
+                    'error': structured_err,
+                    'duration_ms': round(duration_ms, 2),
+                    'result_key': self.result_key
+                }
+                if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
+                    memory.add_log("Action execution failed: " + json.dumps(error_event))
+                self.execution_history.append({
+                    'stamp': event_stamp(),
+                    'memory_id': getattr(memory, 'id', None),
+                    'duration_ms': duration_ms,
+                    'success': False,
+                    'error': structured_err
+                })
+            else:
+                self.last_error = None
+                self._write_memory_slots(memory, result, "ok", None, duration_ms)
+                execution_event = {
+                    'action_name': self.name,
+                    'action_id': self.id,
+                    'status': 'success',
+                    'duration_ms': round(duration_ms, 2),
+                    'result_key': self.result_key
+                }
+                if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
+                    memory.add_log("Action execution complete: " + json.dumps(execution_event))
+                self.execution_history.append({
+                    'stamp': event_stamp(),
+                    'memory_id': getattr(memory, 'id', None),
+                    'duration_ms': duration_ms,
+                    'success': True,
+                    'error': None
+                })
                 
         except Exception as e:
             # Handle and log exceptions
             self.last_error = e
-            
-            # Calculate execution duration
             duration_ms = (time_module.time() - start_time) * 1000
+            err_str = str(e)
             
-            # Build error event for logging
             error_event = {
                 'action_name': self.name,
                 'action_id': self.id,
                 'status': 'error',
-                'error': str(e),
+                'error': err_str,
                 'duration_ms': round(duration_ms, 2),
                 'result_key': self.result_key
             }
             
-            # Log failed execution (single message with JSON)
             if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                 memory.add_log("Action execution failed: " + json.dumps(error_event))
             
-            # Store error info in memory using set_var
-            if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
-                memory.set_var(self.result_key, error_event, desc="Error in action: {}".format(self.name))
+            self._write_memory_slots(memory, error_event, "error", err_str, duration_ms)
             
-            # Track execution history
             self.execution_history.append({
                 'stamp': event_stamp(),
                 'memory_id': getattr(memory, 'id', None),
                 'duration_ms': duration_ms,
                 'success': False,
-                'error': str(e)
+                'error': err_str
             })
         
         return memory
@@ -241,7 +328,7 @@ class ACTION:
     
     def reset_stats(self):
         """
-        Resets execution statistics (count, last_result, last_error, execution_history).
+        Resets execution statistics (count, last_result, last_error, last_outcome, execution_history).
         
         Returns:
             ACTION: Self for method chaining.
@@ -249,6 +336,7 @@ class ACTION:
         self.execution_count = 0
         self.last_result = None
         self.last_error = None
+        self.last_outcome = None
         self.execution_history = []
         return self
     

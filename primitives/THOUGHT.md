@@ -139,8 +139,14 @@ After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY wit
 | output_var | Variable name for result (default: {name}_result) |
 | pre_hook, post_hook | Callables for custom processing |
 | on_token | Callable receiving each streamed text chunk: fn(chunk) |
+| output_schema | Optional JSON Schema dict passed natively to `LLM.call(output_schema=...)`, automatically degrading to prompt-guided JSON + repair retries when an endpoint rejects `response_format` |
+| reasoning | Optional per-thought reasoning dict (e.g. `{'effort': 'low'}`) or `reasoning_effort='low'`, normalized across `openrouter`, `openai`, and `groq` |
 | channel | Channel for message tracking |
 | add_reflection | Whether to add reflection on success (default: False) |
+
+### Standalone execution (`thought.run`)
+
+For single-step calls without manual `MEMORY` setup, `thought.run(vars=None, memory=None)` runs the thought (or `DECIDE` / `PLAN`) against a fresh or supplied `MEMORY`, seeds `vars`, and returns the parsed `{name}_result` directly. Built-in template variables (`('last_user_msg', 'last_asst_msg', 'messages')`) are listed on `THOUGHT.BUILTIN_TEMPLATE_VARS`, and prompt helpers `render_vars(...)` and `require_grounded_quotes(...)` live in `thoughtflow._util`.
 
 ## Usage
 
@@ -222,6 +228,5 @@ THOUGHT consumes LLM (for llm_call) and MEMORY (for context and result storage).
 
 ## Considerations for Future Development
 
-- Native output_schema passthrough to LLM for providers with structured output
 - DECIDE and PLAN documented in their own primitive files
 - Execution history integration with workflow observability

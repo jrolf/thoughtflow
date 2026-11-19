@@ -166,3 +166,54 @@ def pick_anthropic_wire_params(wire_params):
         dict: Subset safe to merge into Anthropic payload.
     """
     return {k: wire_params[k] for k in ANTHROPIC_WIRE_KEYS if k in wire_params}
+
+
+def normalize_reasoning_params(wire_params, service):
+    """
+    Normalize ``reasoning`` / ``reasoning_effort`` onto provider wire shapes in place.
+
+    Accepts ``reasoning={"effort": "low", ...}``, ``reasoning="low"``, or
+    ``reasoning_effort="low"`` and translates to the target service:
+      - ``openrouter``: ``wire_params["reasoning"] = {"effort": ...}`` (preserving
+        extra OpenRouter reasoning keys such as ``max_tokens`` or ``exclude``).
+      - ``openai`` / ``groq``: ``wire_params["reasoning_effort"] = "<level>"``.
+      - Other services (``anthropic``, ``gemini``, ``ollama``): stripped cleanly
+        so unsupported keys never cause HTTP 400 errors.
+
+    Args:
+        wire_params (dict): Mutable wire param dict.
+        service (str): Provider service identifier.
+
+    Returns:
+        dict: ``wire_params`` mutated in place.
+    """
+    has_reasoning = "reasoning" in wire_params
+    has_effort = "reasoning_effort" in wire_params
+    if not has_reasoning and not has_effort:
+        return wire_params
+
+    raw_reasoning = wire_params.pop("reasoning", None)
+    raw_effort = wire_params.pop("reasoning_effort", None)
+
+    effort = raw_effort
+    if effort is None:
+        if isinstance(raw_reasoning, dict):
+            effort = raw_reasoning.get("effort")
+        elif isinstance(raw_reasoning, str) and raw_reasoning.strip():
+            effort = raw_reasoning.strip()
+
+    if service == "openrouter":
+        if isinstance(raw_reasoning, dict):
+            cfg = dict(raw_reasoning)
+            if effort is not None and "effort" not in cfg:
+                cfg["effort"] = str(effort)
+            if cfg:
+                wire_params["reasoning"] = cfg
+        elif effort is not None:
+            wire_params["reasoning"] = {"effort": str(effort)}
+    elif service in ("openai", "groq"):
+        if effort is not None:
+            wire_params["reasoning_effort"] = str(effort)
+
+    return wire_params
+

@@ -18,8 +18,12 @@ trace machinery is needed: the memory IS the recording.
 
 from __future__ import annotations
 
+import copy
 import http.client
 import json
+import os
+import tempfile
+import threading
 import urllib.request
 import urllib.error
 
@@ -29,6 +33,7 @@ from thoughtflow.llm_params import (
     merge_call_params,
     split_call_params,
     normalize_usage,
+    normalize_reasoning_params,
     build_gemini_generation_config,
     pick_anthropic_wire_params,
 )
@@ -56,6 +61,85 @@ from thoughtflow.llm_chat import (
 
 class ReplayMissError(KeyError):
     """Raised when a ReplayLLM receives a request that was never recorded."""
+
+
+def _empty_usage_ledger():
+    """
+    Create a fresh zeroed usage ledger dictionary.
+
+    Returns:
+        dict: Token and cost counters initialized to zero.
+    """
+    return {
+        "calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cost": 0.0,
+    }
+
+
+def _accumulate_usage_into(ledger, usage_record):
+    """
+    Add one normalized usage record into a mutable ledger dictionary.
+
+    Handles OpenAI, Anthropic, Groq, and OpenRouter cache/reasoning token
+    fields uniformly and keeps floating-point cost rounded cleanly.
+
+    Args:
+        ledger (dict): Mutable ledger created by ``_empty_usage_ledger()``.
+        usage_record (dict or None): Normalized usage from ``normalize_usage``.
+    """
+    if not isinstance(usage_record, dict) or not usage_record:
+        return
+    prompt = int(usage_record.get("prompt_tokens") or 0)
+    completion = int(usage_record.get("completion_tokens") or 0)
+    total = int(usage_record.get("total_tokens") or (prompt + completion))
+    reasoning = int(usage_record.get("reasoning_tokens") or 0)
+    cached = int(usage_record.get("cached_tokens") or 0) + int(
+        usage_record.get("cache_read_input_tokens") or 0
+    )
+    cost = float(usage_record.get("cost") or 0.0)
+
+    ledger["calls"] += 1
+    ledger["prompt_tokens"] += prompt
+    ledger["completion_tokens"] += completion
+    ledger["total_tokens"] += total
+    ledger["reasoning_tokens"] += reasoning
+    ledger["cached_tokens"] += cached
+    ledger["cost"] = round(ledger["cost"] + cost, 10)
+
+
+def _atomic_write_json_memory(memory, path):
+    """
+    Persist a MEMORY snapshot to ``path`` atomically via temp file + replace.
+
+    Creates parent directories if missing so ``LLM.cassette("tests/cassettes/x.json")``
+    works out of the box without manual directory setup.
+
+    Args:
+        memory: MEMORY instance to serialize.
+        path (str or os.PathLike): Destination JSON file path.
+    """
+    target = os.path.abspath(os.fspath(path))
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = memory.to_json()
+    fd, tmp_path = tempfile.mkstemp(prefix=".cassette_", suffix=".tmp", dir=parent or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp_path, target)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 # Maps ThoughtFlow-internal roles to each provider's accepted role strings.
@@ -151,6 +235,10 @@ class LLM:
         self.request_timeout = 120
         self.on_usage = None
         self.allow_reasoning_fallback = False
+        self._usage_lock = threading.Lock()
+        self._usage = _empty_usage_ledger()
+        self.cassette_path = None
+        self.cassette_mode = None
 
         # Reserved client keys — never stored in default_params or sent on wire
         self._record_memory = kwargs.pop('record', None)
@@ -170,6 +258,66 @@ class LLM:
 
         # Make the object directly callable
         self.__call__ = self.call
+
+    @property
+    def usage(self):
+        """
+        Return cumulative token and cost usage across all calls on this LLM instance.
+
+        Thread-safe snapshot dictionary with keys ``calls``, ``prompt_tokens``,
+        ``completion_tokens``, ``total_tokens``, ``reasoning_tokens``,
+        ``cached_tokens``, and ``cost``.
+
+        Returns:
+            dict: Defensive copy of the cumulative usage counters.
+
+        Example:
+            >>> llm.call([{"role": "user", "content": "Hello"}])
+            >>> llm.usage["calls"]
+            1
+        """
+        with self._usage_lock:
+            return dict(self._usage)
+
+    def reset_usage(self):
+        """
+        Reset cumulative ``llm.usage`` counters back to zero.
+
+        Returns:
+            LLM: ``self`` for chaining.
+        """
+        with self._usage_lock:
+            self._usage = _empty_usage_ledger()
+        return self
+
+    def _accumulate_usage(self, usage_record):
+        """Thread-safely fold one call's normalized usage into ``self._usage``."""
+        if not isinstance(usage_record, dict) or not usage_record:
+            return
+        with self._usage_lock:
+            _accumulate_usage_into(self._usage, usage_record)
+
+    def save_cassette(self):
+        """
+        Flush recorded exchanges to ``self.cassette_path`` when in cassette record mode.
+
+        Safe no-op when this client was not created in ``LLM.cassette`` record mode.
+
+        Returns:
+            LLM: ``self`` for chaining.
+        """
+        if self.cassette_mode == "record" and self.cassette_path and self._record_memory is not None:
+            _atomic_write_json_memory(self._record_memory, self.cassette_path)
+        return self
+
+    def __enter__(self):
+        """Support ``with LLM.cassette(...) as llm:`` context management."""
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        """Flush any cassette recording atomically on context exit."""
+        self.save_cassette()
+        return False
 
     def record(self, memory):
         """
@@ -206,8 +354,14 @@ class LLM:
         key = exchange_key(self.service, self.model, request)
         return key, request
 
+    def _clean_default_params(self):
+        """Return constructor ``default_params`` stripped of transport-only keys."""
+        return {
+            k: v for k, v in self.default_params.items() if k not in TRANSPORT_PARAM_KEYS
+        }
+
     def _record_exchange(self, key, request, choices):
-        """Append one exchange event to the recording memory (if any)."""
+        """Append one exchange event (and usage emit) to the recording memory."""
         if self._record_memory is None:
             return
         self._record_memory.add_exchange(
@@ -217,7 +371,12 @@ class LLM:
             model=self.model,
             request=request,
             response=list(choices),
+            usage=self.last_usage,
+            default_params=self._clean_default_params(),
         )
+        if self.last_usage and hasattr(self._record_memory, "emit"):
+            self._record_memory.emit("usage", dict(self.last_usage, kind="call"))
+        self.save_cassette()
 
     def _record_stream(self, gen, key, request):
         """Wrap a streaming generator so the joined text is recorded on completion."""
@@ -228,14 +387,15 @@ class LLM:
         self._record_exchange(key, request, ["".join(chunks)])
 
     @classmethod
-    def replay(cls, memory, on_miss='raise', model_id=None):
+    def replay(cls, memory, on_miss='raise', model_id=None, **kwargs):
         """
         Build a ReplayLLM that serves responses recorded in the given MEMORY.
 
         The returned object is call-compatible with LLM, so it can be handed
         to any THOUGHT, AGENT, or WORKFLOW in place of a live model. Requests
-        are matched by content hash; flows replay deterministically, offline,
-        with no API keys.
+        are matched by content hash, and recorded constructor sampling params
+        are adopted automatically so callers do not need to copy
+        ``default_params`` manually.
 
         Args:
             memory: A MEMORY containing recorded exchanges (see LLM.record).
@@ -243,6 +403,8 @@ class LLM:
                 request, or a live LLM instance to fall back to.
             model_id: 'service:model' to replay as. Only needed when the
                 memory contains recordings from more than one model.
+            **kwargs: Optional explicit parameter overrides on top of the
+                adopted recording defaults.
 
         Returns:
             ReplayLLM
@@ -252,7 +414,68 @@ class LLM:
             >>> llm = LLM.replay(recorded)
             >>> memory = my_flow(MEMORY(), llm)   # deterministic, offline
         """
-        return ReplayLLM(memory, on_miss=on_miss, model_id=model_id)
+        return ReplayLLM(memory, on_miss=on_miss, model_id=model_id, **kwargs)
+
+    @classmethod
+    def cassette(cls, path, live=None, on_miss='raise', model_id=None, **kwargs):
+        """
+        Record if ``path`` does not exist yet; otherwise replay deterministically from ``path``.
+
+        Eliminates test-suite boilerplate around ``LLM.record`` and ``LLM.replay``.
+        Works both as a plain assignment (auto-flushing atomically after every
+        recorded exchange) and as a ``with LLM.cassette(...) as llm:`` context
+        manager.
+
+        Args:
+            path (str or os.PathLike): JSON file path storing the recorded MEMORY.
+            live (LLM or callable, optional): Live ``LLM`` instance or zero-arg
+                factory ``() -> LLM`` invoked only when ``path`` is missing.
+            on_miss: Passed to ``LLM.replay`` when replaying (default ``'raise'``).
+            model_id (str, optional): Passed to ``LLM.replay`` when multi-model.
+            **kwargs: Optional parameter overrides passed to ``LLM.replay``.
+
+        Returns:
+            LLM: Either a ``ReplayLLM`` (when ``path`` exists) or the live ``LLM``
+            configured to record and flush atomically to ``path``.
+
+        Raises:
+            ValueError: When ``path`` does not exist and ``live`` is None.
+            TypeError: When ``live`` does not resolve to an ``LLM`` instance.
+
+        Example:
+            >>> llm = LLM.cassette(
+            ...     "tests/cassettes/greeting.json",
+            ...     live=lambda: LLM("openai:gpt-4o", temperature=0.0),
+            ... )
+        """
+        from thoughtflow.memory import MEMORY
+
+        target = os.fspath(path)
+        if os.path.isfile(target):
+            recorded = MEMORY.from_json(target)
+            replayer = cls.replay(recorded, on_miss=on_miss, model_id=model_id, **kwargs)
+            replayer.cassette_path = target
+            replayer.cassette_mode = "replay"
+            return replayer
+
+        if live is None:
+            raise ValueError(
+                "Cassette file {!r} does not exist and no 'live' LLM or factory was provided.".format(
+                    target
+                )
+            )
+        client = live() if callable(live) else live
+        if not isinstance(client, LLM):
+            raise TypeError(
+                "'live' must be an LLM instance or a callable returning an LLM, got {}.".format(
+                    type(client).__name__
+                )
+            )
+        cassette_mem = MEMORY()
+        client.record(cassette_mem)
+        client.cassette_path = target
+        client.cassette_mode = "record"
+        return client
 
     def _normalize_messages(self, msg_list):
         """
@@ -452,6 +675,7 @@ class LLM:
         self.last_params = dict(merged)
         allow_reasoning = merged.pop("allow_reasoning_fallback", self.allow_reasoning_fallback)
         wire_params, transport = split_call_params(merged)
+        normalize_reasoning_params(wire_params, self.service)
         self.last_finish_reason = None
 
         requested_n = wire_params.get("n")
@@ -550,6 +774,7 @@ class LLM:
         merged = merge_call_params(self.default_params, params or {})
         self.last_params = dict(merged)
         wire_params, transport = split_call_params(merged)
+        normalize_reasoning_params(wire_params, self.service)
 
         key = request = None
         if self._record_memory is not None:
@@ -576,11 +801,21 @@ class LLM:
         return exchange_key(self.service, self.model, request), request
 
     def _record_chat_message(self, key, request, message):
-        """Record one structured exchange; the response is ``[message]``."""
+        """Record one structured exchange (with usage) and emit usage on recording memory."""
+        msg_usage = message.get("usage") if isinstance(message, dict) else None
         self._record_memory.add_exchange(
-            kind='chat', key=key, service=self.service, model=self.model,
-            request=request, response=[message],
+            kind='chat',
+            key=key,
+            service=self.service,
+            model=self.model,
+            request=request,
+            response=[message],
+            usage=msg_usage,
+            default_params=self._clean_default_params(),
         )
+        if msg_usage and hasattr(self._record_memory, "emit"):
+            self._record_memory.emit("usage", dict(msg_usage, kind="chat"))
+        self.save_cassette()
 
     def _record_chat_stream(self, events, key, request):
         """Pass events through and record the final message when ``done`` arrives."""
@@ -590,10 +825,11 @@ class LLM:
             yield event
 
     def _note_chat_message(self, message):
-        """Update ``last_error``, ``last_usage``, ``last_finish_reason`` and fire ``on_usage`` after a chat."""
+        """Update ``last_error``, ``last_usage``, ``usage``, ``last_finish_reason`` and fire ``on_usage``."""
         self.last_error = None
         self.last_usage = message.get("usage")
         self.last_finish_reason = message.get("finish_reason")
+        self._accumulate_usage(self.last_usage)
         if self.on_usage and callable(self.on_usage) and self.last_usage:
             self.on_usage(self.last_usage)
 
@@ -1157,6 +1393,7 @@ class LLM:
 
                 self.last_error = None
                 self.last_usage = normalize_usage(parsed, self.service, self.model)
+                self._accumulate_usage(self.last_usage)
                 if self.on_usage and callable(self.on_usage) and self.last_usage:
                     self.on_usage(self.last_usage)
                 return parsed
@@ -1200,7 +1437,7 @@ class ReplayLLM(LLM):
         >>> memory2 = my_flow(MEMORY())       # no network, same outputs
     """
 
-    def __init__(self, memory, on_miss='raise', model_id=None):
+    def __init__(self, memory, on_miss='raise', model_id=None, **kwargs):
         """
         Args:
             memory: MEMORY containing recorded 'chat' exchanges.
@@ -1209,6 +1446,8 @@ class ReplayLLM(LLM):
                 to (useful for re-recording drifted flows).
             model_id: 'service:model' to replay as. Optional when the memory
                 contains recordings from exactly one model.
+            **kwargs: Explicit parameter/client overrides applied on top of
+                the adopted recording parameters.
         """
         exchanges = memory.get_exchanges(kind='chat')
 
@@ -1227,17 +1466,86 @@ class ReplayLLM(LLM):
                 )
             )
 
-        super().__init__(model_id="{}:{}".format(service, model), key='replay')
-        self.on_miss = on_miss
+        model_exchanges = [
+            e for e in exchanges if (e.get('service'), e.get('model')) == (service, model)
+        ]
+        adopted_params = self._infer_recorded_default_params(model_exchanges)
+        init_kwargs = dict(adopted_params)
+        init_kwargs.update(kwargs)
 
-        # key -> list of recorded responses, in chronological order
+        super().__init__(model_id="{}:{}".format(service, model), key='replay', **init_kwargs)
+        self.on_miss = on_miss
+        self.misses = []
+
+        # key -> list of recorded responses and usages, in chronological order
         self._responses = {}
+        self._usages = {}
+        self._all_exchange_usages = []
         self._cursor = {}
-        for e in exchanges:
-            if (e.get('service'), e.get('model')) != (service, model):
-                continue
-            self._responses.setdefault(e['key'], []).append(e.get('response', []))
-            self._cursor[e['key']] = 0
+        for e in model_exchanges:
+            ex_key = e['key']
+            resp = e.get('response', [])
+            self._responses.setdefault(ex_key, []).append(resp)
+            ex_usage = e.get('usage')
+            if ex_usage is None and isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                ex_usage = resp[0].get('usage')
+            self._usages.setdefault(ex_key, []).append(ex_usage)
+            if isinstance(ex_usage, dict) and ex_usage:
+                self._all_exchange_usages.append(copy.deepcopy(ex_usage))
+            self._cursor[ex_key] = 0
+
+    @staticmethod
+    def _infer_recorded_default_params(model_exchanges):
+        """
+        Infer constructor ``default_params`` from recorded exchanges.
+
+        Prefers explicit ``default_params`` captured at record time; falls back
+        to the intersection of identical ``request['params']`` entries across
+        all exchanges so legacy recordings replay without manual setup.
+        """
+        if not model_exchanges:
+            return {}
+
+        for exchange in model_exchanges:
+            explicit = exchange.get("default_params")
+            if isinstance(explicit, dict):
+                return copy.deepcopy(explicit)
+
+        first_params = (model_exchanges[0].get("request") or {}).get("params") or {}
+        if not isinstance(first_params, dict) or not first_params:
+            return {}
+
+        shared = {}
+        for param_key, param_val in first_params.items():
+            canonical_val = json.dumps(param_val, sort_keys=True)
+            consistent = True
+            for other in model_exchanges[1:]:
+                other_params = (other.get("request") or {}).get("params") or {}
+                if param_key not in other_params:
+                    consistent = False
+                    break
+                if json.dumps(other_params[param_key], sort_keys=True) != canonical_val:
+                    consistent = False
+                    break
+            if consistent:
+                shared[param_key] = copy.deepcopy(param_val)
+        return shared
+
+    def total_usage(self):
+        """
+        Compute total token and cost usage across all exchanges stored in this recording.
+
+        Works offline directly from the recorded exchanges before or after replay.
+
+        Returns:
+            dict: Aggregated ledger with ``calls``, ``prompt_tokens``,
+            ``completion_tokens``, ``total_tokens``, ``reasoning_tokens``,
+            ``cached_tokens``, and ``cost``.
+        """
+        ledger = _empty_usage_ledger()
+        for ex_usage in self._all_exchange_usages:
+            _accumulate_usage_into(ledger, ex_usage)
+        return ledger
 
     def call(self, msg_list, params={}, output_schema=None, stream=False):
         """
@@ -1254,6 +1562,11 @@ class ReplayLLM(LLM):
         recorded = self._responses.get(key)
 
         if recorded is None:
+            self.misses.append({
+                "kind": "call",
+                "key": key,
+                "request": copy.deepcopy(_request),
+            })
             if self.on_miss == 'raise' or self.on_miss is None:
                 raise ReplayMissError(
                     "No recorded response for this request (key={}). The flow "
@@ -1269,8 +1582,16 @@ class ReplayLLM(LLM):
         idx = min(self._cursor[key], len(recorded) - 1)
         self._cursor[key] += 1
         choices = list(recorded[idx])
+        usages_for_key = self._usages.get(key) or []
+        replayed_usage = copy.deepcopy(usages_for_key[idx]) if idx < len(usages_for_key) else None
         self.last_error = None
         self.last_finish_reason = "stop"
+        self.last_usage = replayed_usage
+        self._accumulate_usage(replayed_usage)
+        if self.on_usage and callable(self.on_usage) and replayed_usage:
+            self.on_usage(replayed_usage)
+        if self._record_memory is not None:
+            self._record_exchange(key, _request, choices)
 
         if stream:
             def _single_yield():
@@ -1278,7 +1599,6 @@ class ReplayLLM(LLM):
                     yield text
             return _single_yield()
         return choices
-
 
     def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
         """
@@ -1293,6 +1613,11 @@ class ReplayLLM(LLM):
         key, _request = self._chat_signature(messages, tools, merged)
         recorded = self._responses.get(key)
         if recorded is None:
+            self.misses.append({
+                "kind": "chat",
+                "key": key,
+                "request": copy.deepcopy(_request),
+            })
             if self.on_miss == 'raise' or self.on_miss is None:
                 raise ReplayMissError(
                     "No recorded chat response for this request (key={}). The flow "
@@ -1303,8 +1628,13 @@ class ReplayLLM(LLM):
             return self.on_miss.chat(messages, tools=tools, params=params, stream=stream, cancel=cancel)
         idx = min(self._cursor[key], len(recorded) - 1)
         self._cursor[key] += 1
-        message = recorded[idx][0]
+        message = copy.deepcopy(recorded[idx][0])
+        usages_for_key = self._usages.get(key) or []
+        if message.get("usage") is None and idx < len(usages_for_key) and usages_for_key[idx] is not None:
+            message["usage"] = copy.deepcopy(usages_for_key[idx])
         self._note_chat_message(message)
+        if self._record_memory is not None:
+            self._record_chat_message(key, _request, message)
         if stream:
             return iter(message_to_events(message))
         return message
