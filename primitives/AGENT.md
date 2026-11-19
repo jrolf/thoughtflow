@@ -32,6 +32,14 @@ Tool interactions are stored in memory using "action" (the tool request) and "re
 | on_tool_call | Callable(tool_name, arguments) called before each execution; return False to block | None |
 | merge_augments | Fold augmenting memory events into user messages for LLM calls only | False |
 
+## Native tool calls, governance, and resume
+
+When the llm has `chat()` (`protocol="auto"` or `"native"`), AGENT uses native tool calls and follows a write-ahead contract: the assistant message with its `tool_calls` is written to MEMORY before any tool runs, a `checkpoint(memory)` hook fires after it and after every tool result, every `tool_call_id` is answered (including vetoed, unknown, and budget-skipped calls, which strict providers require), and pending work is derived from the transcript, so a crashed run continues without re-running answered calls. LLMs that only have `call()` keep the original text-JSON loop.
+
+Governance options (native protocol only): `allow=[names]`; `policy={"refund": {"mode": "approve_over", "field": "amount", "limit": 100}}` with modes `allow`, `deny` (add `"halt": True` to end the run), `approve`, and `approve_over`, or a callable `policy(name, arguments)`; `budget={"max_model_calls", "max_tool_calls", "max_tokens"}`. A call that needs approval suspends the run (`memory.suspend`, `{name}_status == "suspended"`). Rehydrate the MEMORY later and call `agent(memory, decision={"approve": True})` (or a list or dict of call ids) to resume; repeating the decision never double-executes a tool.
+
+`{name}_status` ends as `final`, `suspended`, `max_iterations`, `budget_exhausted`, `vetoed`, or `error`, and `{name}_outcome` carries counters (`model_calls`, `tool_calls`, token usage, `vetoed`). `tool_loop(memory, llm, tools, policy=..., budget=..., allow=..., checkpoint=..., decision=...)` is a one-call helper over the same code.
+
 ## Usage
 
 ```python

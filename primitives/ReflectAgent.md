@@ -26,6 +26,8 @@ Each revision is recorded in `revision_history` with the response, critique, and
 | max_revisions | Max critique/revision cycles | 2 |
 | llm, tools, system_prompt, max_iterations, name, on_tool_call | Same as AGENT | (see AGENT) |
 
+The critic now sees the task (the latest user message) as well as the response: `critique_prompt` may use `{task}`, `{response}`, and `{system_prompt}`, and prompts that only use `{response}` still work. Approval is negation-safe ("not approved", "cannot approve", "needs improvement", and "revise" never approve). Each revision is also written to MEMORY as an assistant message, so `last_asst_msg()` matches `{name}_result`. When revisions run out, one last critique judges the final draft; `{name}_outcome` records `approved`, `revisions`, and `final_critique`.
+
 ## Usage
 
 ```python
