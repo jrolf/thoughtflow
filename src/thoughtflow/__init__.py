@@ -54,7 +54,7 @@ from thoughtflow.thoughts import DECIDE, PLAN
 from thoughtflow.action import ACTION
 from thoughtflow.tool import TOOL, ReplayTOOL
 from thoughtflow.mcp import MCP
-from thoughtflow.agent import AGENT
+from thoughtflow.agent import AGENT, tool_loop
 from thoughtflow.agents import ReactAgent, ReflectAgent, PlanActAgent
 from thoughtflow.delegate import DELEGATE
 from thoughtflow.workflow import WORKFLOW
@@ -137,6 +137,7 @@ __all__ = [
     "ReplayTOOL",
     "MCP",
     "AGENT",
+    "tool_loop",
     "ReactAgent",
     "ReflectAgent",
     "PlanActAgent",

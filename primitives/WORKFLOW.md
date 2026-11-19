@@ -46,6 +46,12 @@ Branch method:
 | branches | Dict mapping keys to callables |
 | name | Branch step identifier |
 
+## Success checks, status routing, loops, and resume
+
+`step(fn, ok=...)` checks success after the step returns. `ok="auto"` reads `{fn.name}_outcome["ok"]` (THOUGHT and AGENT both write it); `ok=lambda memory: ...` is a custom predicate. A False result logs status `degraded` and applies `on_error` just like an exception. `branch(None, {"failed": repair, "ok": keep}, on="previous_failed")` routes on the previous step's outcome; `on="previous_status"` uses the raw log status (`completed`, `degraded`, `error`, ...) with `"default"` as the fallback key. `while_(condition, body_fn, max_iterations=10, state_key=None)` is a bounded loop that logs `iterations` and why it `stopped` (`condition_false`, `max_iterations`, or `stopped_repeated` when the watched variable did not change).
+
+The log is persisted at `{name}_log` next to `{name}_status`. When a step leaves the memory suspended (an AGENT waiting for approval, a step calling `memory.suspend`), the workflow logs `suspended`, stores `{name}_cursor`, and returns. Rehydrate the memory and call `workflow(memory, decision={"approve": True})` to resume at that step: steps that accept `decision=` (AGENT does) receive it, other steps get the suspension resolved for them, and the earlier log entries are kept. A suspended step is waiting, not failing, so `ok` is not evaluated until it finishes.
+
 ## Usage
 
 ```python

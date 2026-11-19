@@ -838,3 +838,26 @@ class TestDecideWithDecisionModels:
         assert mem2.get_var("m_result") == {"q": "yes"}
         assert failures == [1]
 
+    def test_dm_failover_to_fallback_llm_and_copy_config(self, mock_llm):
+        """DECIDE(model=dm, retry={'fallback_llm': llm}) fails over cleanly on DM outage."""
+        down_dm = _ScriptedDM([DecisionError("503 down", status=503, retryable=False)])
+        backup_llm = mock_llm(responses=["billing"])
+
+        step = DECIDE(
+            name="route",
+            model=down_dm,
+            choices=["billing", "tech"],
+            prompt="Route {ticket}",
+            retry={"fallback_llm": backup_llm},
+            include_history=False,
+        )
+        cloned = step.copy()
+        assert cloned.retry["fallback_llm"] is backup_llm
+
+        mem = MEMORY()
+        mem.set_var("ticket", "Invoice overcharge")
+        mem = cloned(mem)
+        assert mem.get_var("route_result") == "billing"
+        assert mem.get_var("route_outcome")["used_fallback_llm"] is True
+
+

@@ -369,3 +369,257 @@ class TestWorkflowRepr:
         r = repr(wf)
         assert "my_flow" in r
         assert "skip" in r
+
+
+# ============================================================================
+# ok predicate, status branching, bounded loops, suspend/resume (#52, #44)
+# ============================================================================
+
+
+class _Named:
+    """Callable step with a ``name`` that writes an outcome like THOUGHT does."""
+
+    def __init__(self, name, ok):
+        self.name = name
+        self.ok = ok
+
+    def __call__(self, memory):
+        memory.set_var("{}_outcome".format(self.name), {"ok": self.ok})
+        return memory
+
+
+class TestOkPredicate:
+    def test_auto_reads_outcome_and_marks_degraded(self):
+        wf = WORKFLOW("w", on_error="stop")
+        wf.step(_Named("bad", ok=False), ok="auto")
+        wf.step(step_increment, name="after")
+        memory = wf(MEMORY())
+        assert wf.execution_log[0]["status"] == "degraded"
+        assert memory.get_var("counter") is None
+        assert memory.get_var("w_status")["degraded"] == 1
+
+    def test_degraded_with_skip_continues(self):
+        wf = WORKFLOW("w", on_error="skip")
+        wf.step(_Named("bad", ok=False), ok="auto")
+        wf.step(step_increment, name="after")
+        memory = wf(MEMORY())
+        assert memory.get_var("counter") == 1
+
+    def test_custom_predicate_and_passing_auto(self):
+        wf = WORKFLOW("w")
+        wf.step(_Named("good", ok=True), ok="auto")
+        wf.step(step_increment, name="inc", ok=lambda m: m.get_var("counter") == 1)
+        wf(MEMORY())
+        assert [e["status"] for e in wf.execution_log] == ["completed", "completed"]
+
+    def test_retry_reruns_degraded_step(self):
+        calls = []
+
+        def flaky(memory):
+            calls.append(1)
+            memory.set_var("good", len(calls) > 1)
+            return memory
+
+        wf = WORKFLOW("w", on_error="retry")
+        wf.step(flaky, name="flaky", ok=lambda m: m.get_var("good"))
+        wf(MEMORY())
+        assert wf.execution_log[-1]["status"] == "completed_on_retry"
+
+    def test_invalid_ok_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            WORKFLOW("w").step(step_increment, ok="nope")
+
+
+class TestBranchOnStatus:
+    def test_previous_failed_routes_to_repair(self):
+        wf = WORKFLOW("w", on_error="skip")
+        wf.step(_Named("bad", ok=False), ok="auto")
+        wf.branch(None, {"failed": step_set_flag, "ok": step_increment}, on="previous_failed")
+        memory = wf(MEMORY())
+        assert memory.get_var("flag") is True
+        assert memory.get_var("counter") is None
+
+    def test_previous_status_uses_default(self):
+        wf = WORKFLOW("w")
+        wf.step(step_increment, name="inc")
+        wf.branch(None, {"default": step_set_flag}, on="previous_status")
+        assert wf(MEMORY()).get_var("flag") is True
+
+    def test_branch_requires_router_or_on(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            WORKFLOW("w").branch(None, {})
+
+
+class TestWhileLoop:
+    def test_runs_until_condition_false(self):
+        wf = WORKFLOW("w")
+        wf.while_(lambda m: (m.get_var("counter") or 0) < 3, step_increment, name="loop")
+        memory = wf(MEMORY())
+        assert memory.get_var("counter") == 3
+        assert wf.execution_log[0]["iterations"] == 3
+        assert wf.execution_log[0]["stopped"] == "condition_false"
+
+    def test_max_iterations_caps_runaway(self):
+        wf = WORKFLOW("w")
+        wf.while_(lambda m: True, step_increment, name="loop", max_iterations=4)
+        memory = wf(MEMORY())
+        assert memory.get_var("counter") == 4
+        assert wf.execution_log[0]["stopped"] == "max_iterations"
+
+    def test_stops_when_state_repeats(self):
+        wf = WORKFLOW("w")
+        wf.while_(lambda m: True, lambda m: m, name="loop", state_key="counter", max_iterations=9)
+        wf(MEMORY())
+        assert wf.execution_log[0]["stopped"] == "stopped_repeated"
+        assert wf.execution_log[0]["iterations"] == 1
+
+
+class _ApprovalStep:
+    """Suspends the memory the first time, finishes when given a decision."""
+
+    name = "gate"
+
+    def __init__(self):
+        self.runs = 0
+
+    def __call__(self, memory, decision=None):
+        self.runs += 1
+        if memory.is_suspended() and decision is not None:
+            memory.resolve_suspension(decision)
+            memory.set_var("approved", decision["approve"])
+        elif not memory.is_suspended():
+            memory.suspend("approval_required", pending={"what": "refund"})
+        return memory
+
+
+class TestWorkflowSuspendResume:
+    def test_log_persisted_on_memory(self):
+        wf = WORKFLOW("w")
+        wf.step(step_increment, name="inc")
+        memory = wf(MEMORY())
+        assert memory.get_var("w_log")[0]["step"] == "inc"
+        assert memory.get_var("w_cursor") is None
+
+    def test_suspends_then_resumes_after_rehydrate_with_log_preserved(self):
+        gate = _ApprovalStep()
+        wf = WORKFLOW("w")
+        wf.step(step_increment, name="before")
+        wf.step(gate, name="gate")
+        wf.step(step_set_flag, name="after")
+
+        memory = wf(MEMORY())
+        assert [e["status"] for e in wf.execution_log] == ["completed", "suspended"]
+        assert memory.get_var("w_cursor") == 1
+        assert memory.get_var("flag") is None
+
+        restored = MEMORY.from_json(memory.to_json())
+        wf2 = WORKFLOW("w")
+        wf2.step(step_increment, name="before")
+        wf2.step(gate, name="gate")
+        wf2.step(step_set_flag, name="after")
+
+        waiting = wf2(restored)
+        assert waiting.is_suspended() and gate.runs == 1  # no decision: nothing re-ran
+
+        done = wf2(restored, decision={"approve": True})
+        assert done.get_var("approved") is True and done.get_var("flag") is True
+        assert not done.is_suspended()
+        statuses = [e["status"] for e in wf2.execution_log]
+        assert statuses == ["completed", "suspended", "completed", "completed"]
+        assert wf2.execution_log[2]["resumed"] is True
+        assert done.get_var("w_cursor") is None
+
+    def test_plain_step_resolved_by_workflow(self):
+        def ask(memory):
+            if not memory.is_suspended() and not memory.get_var("asked"):
+                memory.set_var("asked", True)
+                memory.suspend("wait")
+            return memory
+
+        wf = WORKFLOW("w")
+        wf.step(ask, name="ask")
+        wf.step(step_set_flag, name="after")
+        memory = wf(MEMORY())
+        assert memory.is_suspended()
+        memory = wf(memory, decision={"ok": 1})
+        assert memory.get_var("flag") is True
+        assert not memory.is_suspended()
+
+
+class TestWorkflowWithGovernedAgent:
+    def test_agent_approval_suspends_workflow_and_resumes(self):
+        from thoughtflow import AGENT, TOOL
+
+        class Script:
+            def __init__(self):
+                self.n = 0
+
+            def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
+                self.n += 1
+                if self.n == 1:
+                    return {"content": "", "finish_reason": "tool_calls", "usage": None,
+                            "tool_calls": [{"id": "c1", "name": "pay", "arguments": {"amount": 900},
+                                            "raw_arguments": "{}", "arguments_error": None}]}
+                return {"content": "paid", "tool_calls": [], "finish_reason": "stop", "usage": None}
+
+        paid = []
+        tool = TOOL("pay", "Pay", {"amount": {"type": "number"}}, lambda amount: paid.append(amount) or "ok")
+        llm = Script()
+        policy = {"pay": "approve"}
+
+        def build():
+            wf = WORKFLOW("flow")
+            wf.step(AGENT(llm=llm, tools=[tool], policy=policy, name="payer"), name="payer", ok="auto")
+            wf.step(step_set_flag, name="after")
+            return wf
+
+        memory = MEMORY()
+        memory.add_msg("user", "Pay 900")
+        memory = build()(memory)
+        assert memory.is_suspended() and paid == []
+
+        restored = MEMORY.from_json(memory.to_json())
+        restored = build()(restored, decision={"approve": True})
+        assert paid == [900]
+        assert restored.get_var("flag") is True
+        assert restored.get_var("payer_status") == "final"
+
+
+class TestWhileSuspension:
+    def test_suspending_body_stops_loop_and_resume_keeps_progress(self):
+        calls = []
+
+        def body(memory, decision=None):
+            calls.append(decision)
+            n = (memory.get_var("counter") or 0) + 1
+            if n == 2 and decision is None:
+                memory.suspend("approval_required")
+                return memory
+            if decision is not None:
+                memory.resolve_suspension(decision)
+            memory.set_var("counter", n)
+            return memory
+
+        def build():
+            wf = WORKFLOW("w")
+            wf.while_(lambda m: (m.get_var("counter") or 0) < 3, body, name="loop")
+            return wf
+
+        wf = build()
+        memory = wf(MEMORY())
+        assert memory.is_suspended()
+        assert memory.get_var("counter") == 1
+        assert len(calls) == 2  # iteration 1 and the suspending attempt, then it stopped
+        assert wf.execution_log[0]["status"] == "suspended"
+
+        restored = MEMORY.from_json(memory.to_json())
+        wf2 = build()
+        done = wf2(restored, decision={"approve": True})
+        assert done.get_var("counter") == 3
+        assert not done.is_suspended()
+        assert wf2.execution_log[-1]["iterations"] == 3
+        assert calls[2] == {"approve": True}

@@ -818,6 +818,10 @@ class MEMORY:
         channel=None,
         metadata_filter=None,
         exclude_metadata=None,
+        budget_tokens=None,
+        pinned=True,
+        summarizer=None,
+        token_counter=None,
     ):
         """
         Build LLM-ready message dicts from stored events.
@@ -843,6 +847,19 @@ class MEMORY:
             include: Optional list of roles to include (passed to ``get_msgs``).
             exclude: Optional list of roles to exclude (passed to ``get_msgs``).
             format: ``'raw'`` (default) or ``'openai'`` (provider-valid history).
+            budget_tokens: Optional token budget for the returned view. Oldest
+                unpinned messages are dropped first. Stored events are never
+                modified. ``None`` (default) disables budgeting.
+            pinned: When budgeting, always keep system messages and the most
+                recent user message (default True).
+            summarizer: Optional ``fn(dropped_msgs) -> str``. When messages are
+                dropped for budget, its result is inserted as one system
+                message so the model still sees a digest.
+            token_counter: Optional ``fn(text) -> int``; defaults to a
+                ``len(text) // 4`` estimate.
+
+        Messages covered by a ``compact()`` summary are replaced in the view by
+        that summary (the originals stay in the event log).
 
         Returns:
             list[dict]: Messages ready for ``LLM.call()`` or ``LLM.chat()``.
@@ -861,7 +878,215 @@ class MEMORY:
             metadata_filter=metadata_filter,
             exclude_metadata=exclude_metadata,
         )
-        return self._fold_llm_events(events, merge_augments=merge_augments, format=format)
+        return self._build_llm_view(
+            events,
+            merge_augments=merge_augments,
+            format=format,
+            budget_tokens=budget_tokens,
+            pinned=pinned,
+            summarizer=summarizer,
+            token_counter=token_counter,
+        )
+
+    @staticmethod
+    def _estimate_tokens(text):
+        """Cheap, dependency-free token estimate (about 4 characters per token)."""
+        return max(1, len(str(text or '')) // 4)
+
+    def _build_llm_view(
+        self,
+        events,
+        merge_augments=False,
+        format='raw',
+        budget_tokens=None,
+        pinned=True,
+        summarizer=None,
+        token_counter=None,
+    ):
+        """Apply compaction summaries, folding, and optional token budgeting."""
+        covered = set()
+        for event in events:
+            meta = event.get('metadata') or {}
+            if meta.get('summary'):
+                covered.update(meta.get('summary_of') or [])
+        if covered:
+            summaries = [e for e in events if (e.get('metadata') or {}).get('summary')]
+            rest = [
+                e for e in events
+                if not (e.get('metadata') or {}).get('summary')
+                and e.get('stamp') not in covered
+            ]
+            events = summaries + rest
+
+        msgs = self._fold_llm_events(events, merge_augments=merge_augments, format=format)
+        if budget_tokens is None:
+            return msgs
+
+        count = token_counter or self._estimate_tokens
+
+        def cost(msg):
+            total = count(msg.get('content', ''))
+            if msg.get('tool_calls'):
+                total += count(json.dumps(msg['tool_calls'], default=str))
+            return total
+
+        keep = set()
+        if pinned:
+            for i, msg in enumerate(msgs):
+                if msg.get('role') == 'system':
+                    keep.add(i)
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get('role') == 'user':
+                    keep.add(i)
+                    break
+        used = sum(cost(msgs[i]) for i in keep)
+        for i in range(len(msgs) - 1, -1, -1):
+            if i in keep:
+                continue
+            c = cost(msgs[i])
+            if used + c > budget_tokens:
+                break
+            keep.add(i)
+            used += c
+
+        # Keep tool turns paired: drop an assistant tool_calls message when any of
+        # its results exists but was dropped, then drop results left without a caller.
+        result_idx = {}
+        for i, msg in enumerate(msgs):
+            if msg.get('role') == 'tool':
+                result_idx[msg.get('tool_call_id')] = i
+        for i in sorted(keep):
+            ids = [tc.get('id') for tc in msgs[i].get('tool_calls') or []]
+            if any(cid in result_idx and result_idx[cid] not in keep for cid in ids):
+                keep.discard(i)
+        live_ids = set()
+        for i in sorted(keep):
+            for tc in msgs[i].get('tool_calls') or []:
+                live_ids.add(tc.get('id'))
+        for i in sorted(keep):
+            if msgs[i].get('role') == 'tool' and msgs[i].get('tool_call_id') not in live_ids:
+                keep.discard(i)
+
+        out = [msgs[i] for i in sorted(keep)]
+        dropped = [msgs[i] for i in range(len(msgs)) if i not in keep]
+        if dropped and summarizer is not None:
+            digest = {'role': 'system', 'content': str(summarizer(dropped))}
+            lead = 0
+            while lead < len(out) and out[lead].get('role') == 'system':
+                lead += 1
+            out.insert(lead, digest)
+        return out
+
+    def compact(self, keep=6, summarizer=None, channel='unknown'):
+        """
+        Summarize older conversation turns without deleting them.
+
+        Adds one ``system`` message tagged ``metadata={'summary': True,
+        'internal': True, 'summary_of': [stamps]}`` covering every user,
+        assistant, and tool message except the most recent ``keep``. Original
+        events stay in the log; ``get_llm_msgs`` shows the summary instead of
+        the covered messages. Already-summarized messages are not re-covered.
+
+        Args:
+            keep: Number of most recent conversational messages left untouched.
+            summarizer: Optional ``fn(msgs) -> str`` over the event dicts being
+                covered. Default: one truncated ``role: content`` line each.
+            channel: Channel for the summary message.
+
+        Returns:
+            dict or None: ``{'stamp', 'covered'}`` for the new summary, or
+            ``None`` when there was nothing to compact.
+        """
+        events = self.get_msgs(include=['user', 'assistant', 'tool'])
+        covered = set()
+        for event in self.get_msgs(include=['system']):
+            meta = event.get('metadata') or {}
+            if meta.get('summary'):
+                covered.update(meta.get('summary_of') or [])
+        live = [e for e in events if e.get('stamp') not in covered]
+        cut = max(0, len(live) - keep) if keep > 0 else len(live)
+        # Never split an assistant tool_calls message from its tool results.
+        while 0 < cut < len(live) and live[cut].get('role') == 'tool':
+            cut -= 1
+        older = live[:cut]
+        if not older:
+            return None
+        if summarizer is not None:
+            text = str(summarizer(older))
+        else:
+            text = 'Summary of earlier conversation:\n' + '\n'.join(
+                '{}: {}'.format(e.get('role'), str(e.get('content', ''))[:80])
+                for e in older
+            )
+        stamps = [e['stamp'] for e in older]
+        self.add_msg(
+            'system',
+            text,
+            channel=channel,
+            metadata={'summary': True, 'internal': True, 'summary_of': stamps},
+        )
+        self.emit('memory_compacted', {'covered': len(stamps), 'kept': keep})
+        base = getattr(self, 'base', self)
+        return {'stamp': base.get_msgs(include=['system'])[-1]['stamp'], 'covered': len(stamps)}
+
+    def suspend(self, reason, pending=None, resume_at=None, suspension_id=None):
+        """
+        Mark this run as suspended, waiting for an external decision.
+
+        Stores a ``_suspension`` variable (JSON-safe, survives ``to_dict`` /
+        ``from_dict``) and emits ``run_suspended``. A later
+        ``resolve_suspension`` resumes it exactly once.
+
+        Args:
+            reason: Short string such as ``'approval_required'``.
+            pending: JSON-safe dict describing what is waiting (tool calls, step).
+            resume_at: Optional timestamp or label for scheduled resumes.
+            suspension_id: Optional stable id; defaults to a stamp of the contents.
+
+        Returns:
+            dict: The stored suspension record.
+        """
+        record = {
+            'id': suspension_id or event_stamp({'reason': reason, 'pending': pending, 'n': len(self.get_events())}),
+            'reason': reason,
+            'pending': copy.deepcopy(pending) if pending is not None else {},
+            'resume_at': resume_at,
+            'status': 'suspended',
+            'decision': None,
+        }
+        self.set_var('_suspension', record, desc='Suspended-run marker')
+        self.emit('run_suspended', {'id': record['id'], 'reason': reason})
+        return copy.deepcopy(record)
+
+    def get_suspension(self):
+        """Return the current suspension record, or None if never suspended."""
+        record = self.get_var('_suspension')
+        return copy.deepcopy(record) if record else None
+
+    def is_suspended(self):
+        """True while a suspension is recorded and not yet resolved."""
+        record = self.get_suspension()
+        return bool(record) and record.get('status') == 'suspended'
+
+    def resolve_suspension(self, decision=None):
+        """
+        Resolve the current suspension. Safe to call more than once.
+
+        Returns:
+            dict: ``{'status': 'resolved', 'suspension': record}`` the first
+            time, ``{'status': 'already_resolved', ...}`` on repeats (the stored
+            decision is not overwritten), or ``{'status': 'not_suspended'}``.
+        """
+        record = self.get_suspension()
+        if record is None:
+            return {'status': 'not_suspended', 'suspension': None}
+        if record.get('status') != 'suspended':
+            return {'status': 'already_resolved', 'suspension': record}
+        record['status'] = 'resolved'
+        record['decision'] = copy.deepcopy(decision)
+        self.set_var('_suspension', record, desc='Suspended-run marker')
+        self.emit('run_resumed', {'id': record['id']})
+        return {'status': 'resolved', 'suspension': copy.deepcopy(record)}
 
     def _fold_llm_events(self, events, merge_augments=False, format='raw'):
         """Project filtered message events into LLM dicts with optional augment folding."""
@@ -2642,6 +2867,10 @@ class _MemoryScope:
         channel=None,
         metadata_filter=None,
         exclude_metadata=None,
+        budget_tokens=None,
+        pinned=True,
+        summarizer=None,
+        token_counter=None,
     ):
         if format not in ('raw', 'openai'):
             raise ValueError("Invalid format '{}'. Choose 'raw' or 'openai'.".format(format))
@@ -2655,7 +2884,30 @@ class _MemoryScope:
             metadata_filter=metadata_filter,
             exclude_metadata=exclude_metadata,
         )
-        return self.base._fold_llm_events(events, merge_augments=merge_augments, format=format)
+        return self.base._build_llm_view(
+            events,
+            merge_augments=merge_augments,
+            format=format,
+            budget_tokens=budget_tokens,
+            pinned=pinned,
+            summarizer=summarizer,
+            token_counter=token_counter,
+        )
+
+    def compact(self, keep=6, summarizer=None, channel='unknown'):
+        return MEMORY.compact(self, keep=keep, summarizer=summarizer, channel=channel)
+
+    def suspend(self, reason, pending=None, resume_at=None, suspension_id=None):
+        return MEMORY.suspend(self, reason, pending, resume_at, suspension_id)
+
+    def get_suspension(self):
+        return MEMORY.get_suspension(self)
+
+    def is_suspended(self):
+        return MEMORY.is_suspended(self)
+
+    def resolve_suspension(self, decision=None):
+        return MEMORY.resolve_suspension(self, decision)
 
     def last_user_msg(self, content_only=False):
         msgs = self.get_msgs(include=['user'])

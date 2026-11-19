@@ -518,7 +518,29 @@ class DECIDE(THOUGHT):
         self._fallback_result = None
 
         if self._is_decision_model():
-            return self._execute_dm_call(memory, vars, dm_client=self.llm, **kwargs)
+            res, err, attempts = self._execute_dm_call(memory, vars, dm_client=self.llm, **kwargs)
+            fallback = (self.retry or {}).get("fallback_llm")
+            if (
+                res is None
+                and err is not None
+                and fallback is not None
+                and not self._used_fallback_llm
+                and (not self._failure_attempts or self._failure_attempts[-1].get("failure_kind") not in ("template", "replay_miss"))
+            ):
+                self._used_fallback_llm = True
+                primary_llm = self.llm
+                try:
+                    self.llm = fallback
+                    if getattr(fallback, "is_decision_model", False):
+                        res2, err2, attempts2 = self._execute_dm_call(memory, vars, dm_client=fallback, **kwargs)
+                    elif self.decide_mode == "multi":
+                        res2, err2, attempts2 = self._execute_dm_call(memory, vars, dm_client=DM.from_llm(fallback), **kwargs)
+                    else:
+                        res2, err2, attempts2 = super()._execute_llm_call(memory, vars, **kwargs)
+                    return res2, err2, attempts + attempts2
+                finally:
+                    self.llm = primary_llm
+            return res, err, attempts
         if self.decide_mode == "multi":
             if self.llm is None:
                 raise ValueError("No LLM or DM instance provided to this DECIDE.")
@@ -788,6 +810,7 @@ class DECIDE(THOUGHT):
         validation=None,
         pre_hook=None,
         post_hook=None,
+        fallback_llm=None,
         **kwargs,
     ):
         """Reconstruct a DECIDE instance from a dictionary representation."""
@@ -854,6 +877,8 @@ class DECIDE(THOUGHT):
             post_hook=post_hook,
             **config,
         )
+        if fallback_llm is not None:
+            inst.retry["fallback_llm"] = fallback_llm
         if data.get("id"):
             inst.id = data["id"]
         inst.execution_history = copy.deepcopy(data.get("execution_history", []))
@@ -861,7 +886,7 @@ class DECIDE(THOUGHT):
 
     def copy(self):
         """Return an independent deep copy of this DECIDE sharing the same ``llm``/``DM`` reference."""
-        cfg = copy.deepcopy(self.config)
+        cfg = self._copy_config()
         for key in (
             "name",
             "llm",
@@ -916,6 +941,9 @@ class DECIDE(THOUGHT):
             post_hook=self.post_hook,
             **cfg,
         )
+        cloned.visibility = self.visibility
+        cloned.instruct_schema = self.instruct_schema
+        cloned.record_prompt = self.record_prompt
         cloned.id = event_stamp()
         cloned.execution_history = copy.deepcopy(self.execution_history)
         cloned.last_result = copy.deepcopy(self.last_result)

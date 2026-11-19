@@ -413,6 +413,12 @@ def valid_extract(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
             humanize_schema_error("Validation failed for candidate: {}".format(msg), schema)
         )
 
+    # Bare-word answers for a top-level enum (e.g. reply was just: positive).
+    if _is_enum_schema(schema):
+        bare = str(raw_text).strip().strip("`\"'.").strip()
+        if bare in list(schema["enum"]):
+            return bare
+
     # If we got here, nothing parsed+validated.
     if last_err:
         raise ValidExtractError(str(last_err))
@@ -477,6 +483,42 @@ def _parse_segment(segment: str, kind: str = "python") -> Any:
 
     raise ValidExtractError("Unsupported kind: {!r}".format(kind))
 
+_TYPE_NAMES = {
+    "str": str, "string": str,
+    "int": int, "integer": int,
+    "float": float, "number": (int, float),
+    "bool": bool, "boolean": bool,
+    "null": type(None), "none": type(None),
+    "list": list, "array": list,
+    "dict": dict, "object": dict,
+}
+
+
+def _is_enum_schema(schema: Any) -> bool:
+    """Return True for the ``{"enum": [...]}`` literal-set dialect."""
+    return isinstance(schema, dict) and set(schema.keys()) == {"enum"} and isinstance(schema["enum"], (list, tuple))
+
+
+def _typename_union(schema: Any) -> Optional[Tuple[type, ...]]:
+    """
+    Parse a type-name string such as ``"int"`` or ``"str|null"``.
+
+    Returns a flat tuple of Python types when every pipe-separated part is a
+    known type name, else None (so ordinary exemplar strings like ``'hello'``
+    keep their old meaning: any str).
+    """
+    if not isinstance(schema, str) or not schema.strip():
+        return None
+    parts = [part.strip().lower() for part in schema.split("|")]
+    types: list = []
+    for part in parts:
+        if part not in _TYPE_NAMES:
+            return None
+        mapped = _TYPE_NAMES[part]
+        types.extend(mapped if isinstance(mapped, tuple) else (mapped,))
+    return tuple(types)
+
+
 def _is_oneof_schema(schema: Any) -> bool:
     """Return True when schema uses the optional oneOf dialect."""
     return isinstance(schema, dict) and "oneOf" in schema and isinstance(schema["oneOf"], list)
@@ -493,6 +535,8 @@ def _delims_for_schema(schema: Any) -> Tuple[Optional[str], Optional[str]]:
     """
     if _is_oneof_schema(schema):
         return "{", "}"
+    if _is_enum_schema(schema):
+        return None, None
     # list
     if isinstance(schema, list):
         return "[", "]"
@@ -597,13 +641,19 @@ def format_schema_annotation(schema: Any) -> str:
         for i, branch in enumerate(schema["oneOf"]):
             branches.append("branch {}: {}".format(i, format_schema_annotation(branch)))
         return "oneOf [{}]".format("; ".join(branches))
+    if _is_enum_schema(schema):
+        return "one of {}".format(list(schema["enum"]))
+    if _typename_union(schema) is not None:
+        return str(schema)
     if isinstance(schema, dict):
         parts = []
         for key, subschema in schema.items():
             base_key, optional = _is_optional_key(key)
             label = base_key + ("?" if optional else "")
             t = _schema_type(subschema)
-            if t is not None and t not in (list, dict, tuple):
+            if _is_enum_schema(subschema) or _typename_union(subschema) is not None:
+                parts.append("{}: {}".format(label, format_schema_annotation(subschema)))
+            elif t is not None and t not in (list, dict, tuple):
                 parts.append("{}: {}".format(label, t.__name__))
             elif isinstance(subschema, dict):
                 parts.append("{}: {{...}}".format(label))
@@ -797,6 +847,21 @@ def _validate_schema(obj: Any, schema: Any, path: str = "$") -> Tuple[bool, str]
                 return True, "ok"
             errors.append("branch {}: {}".format(i, msg))
         return False, "no oneOf branch matched ({})".format("; ".join(errors))
+
+    # Literal-set dialect: {"enum": ["a", "b"]}
+    if _is_enum_schema(schema):
+        if obj in list(schema["enum"]):
+            return True, "ok"
+        return False, "{}: expected one of {!r}, got {!r}".format(path, list(schema["enum"]), obj)
+
+    # Type-name strings and pipe unions: "int", "str|null"
+    union = _typename_union(schema)
+    if union is not None:
+        if isinstance(obj, bool) and bool not in union:
+            return False, "{}: expected {}, got bool".format(path, schema)
+        if isinstance(obj, union):
+            return True, "ok"
+        return False, "{}: expected {}, got {}".format(path, schema, type(obj).__name__)
 
     # 1) Primitive types via exemplar or type
     t = _schema_type(schema)

@@ -69,7 +69,7 @@ class TOOL:
         >>> result = tool({"query": "latest news"})
     """
 
-    def __init__(self, name, description, parameters, fn):
+    def __init__(self, name, description, parameters, fn, needs_context=False):
         """
         Initialize a TOOL with a name, description, parameter schema, and function.
 
@@ -84,8 +84,14 @@ class TOOL:
                 definitions is passed, it will be wrapped automatically.
             fn (callable): The function to execute. It receives keyword arguments
                 matching the parameter names the LLM provides.
+            needs_context (bool): When True, ``fn`` also receives a ``context``
+                keyword argument (a dict such as ``{"call_id", "memory",
+                "agent"}`` supplied by the agent loop; ``None`` when called
+                directly). Context never appears in the schema and is not part
+                of the recorded request signature.
         """
         self.name = name
+        self.needs_context = needs_context
         self.id = event_stamp()
         self.description = description
         self.parameters = self._normalize_parameters(parameters)
@@ -181,7 +187,7 @@ class TOOL:
 
         return {"type": "object", "properties": parameters}
 
-    def __call__(self, arguments=None):
+    def __call__(self, arguments=None, context=None):
         """
         Execute the tool with the given arguments.
 
@@ -192,6 +198,9 @@ class TOOL:
         Args:
             arguments (dict, optional): Keyword arguments for the function,
                 as provided by the LLM. Defaults to {}.
+            context (dict, optional): Runtime context forwarded to ``fn`` as
+                ``context=`` only when the tool was built with
+                ``needs_context=True``.
 
         Returns:
             The result of executing the wrapped function.
@@ -210,7 +219,10 @@ class TOOL:
             rec_key, rec_request = self._request_signature(arguments)
 
         try:
-            result = self.fn(**arguments)
+            if self.needs_context:
+                result = self.fn(context=context, **arguments)
+            else:
+                result = self.fn(**arguments)
             self.last_result = result
             self.last_error = None
 
@@ -311,9 +323,9 @@ class TOOL:
         wrapped so that it can be called without a memory object — the TOOL
         receives keyword arguments from the LLM, not a memory.
 
-        The resulting TOOL's function does NOT receive a memory object. If the
-        underlying ACTION function requires memory, the agent loop is
-        responsible for providing it at execution time.
+        The resulting TOOL declares ``needs_context=True``: when an agent loop
+        passes ``context={"memory": memory, ...}`` the ACTION's function
+        receives that memory; when called directly it receives ``None``.
 
         Args:
             action (ACTION): The ACTION instance to promote.
@@ -345,16 +357,19 @@ class TOOL:
         # agent loop is responsible for memory integration.
         raw_fn = action.fn
 
-        def tool_fn(**kwargs):
-            """Wrapper that calls the ACTION's fn with None for memory."""
-            return raw_fn(None, **kwargs)
+        def tool_fn(context=None, **kwargs):
+            """Wrapper that calls the ACTION's fn with the context memory (or None)."""
+            memory = (context or {}).get("memory")
+            return raw_fn(memory, **kwargs)
 
         # Preserve the original function name for debugging
         tool_fn.__name__ = getattr(raw_fn, '__name__', name)
         tool_fn.__qualname__ = getattr(raw_fn, '__qualname__', name)
         tool_fn._source_action = action
 
-        return cls(name=name, description=desc, parameters=params, fn=tool_fn)
+        return cls(
+            name=name, description=desc, parameters=params, fn=tool_fn, needs_context=True
+        )
 
     def to_dict(self):
         """
@@ -373,6 +388,7 @@ class TOOL:
             "parameters": self.parameters,
             "fn_name": getattr(self.fn, '__name__', self.name),
             "execution_count": self.execution_count,
+            "needs_context": self.needs_context,
         }
 
     @classmethod
@@ -399,6 +415,7 @@ class TOOL:
             description=data["description"],
             parameters=data["parameters"],
             fn=fn_registry[fn_name],
+            needs_context=data.get("needs_context", False),
         )
         if data.get("id"):
             tool.id = data["id"]
@@ -436,6 +453,7 @@ class ReplayTOOL(TOOL):
             description=source_tool.description,
             parameters=source_tool.parameters,
             fn=source_tool.fn,
+            needs_context=source_tool.needs_context,
         )
         self._source_tool = source_tool
         self._memory = memory
@@ -453,7 +471,7 @@ class ReplayTOOL(TOOL):
                 self._responses.setdefault(key, []).append(payload[0])
                 self._cursor.setdefault(key, 0)
 
-    def __call__(self, arguments=None):
+    def __call__(self, arguments=None, context=None):
         arguments = arguments or {}
         key, _request = self._request_signature(arguments)
 
@@ -477,7 +495,7 @@ class ReplayTOOL(TOOL):
                     )
                 )
             if self.on_miss == "live":
-                return self._source_tool(arguments)
+                return self._source_tool(arguments, context=context)
             if callable(self.on_miss):
                 return self.on_miss(arguments)
             raise ValueError("Unsupported on_miss policy: {!r}".format(self.on_miss))

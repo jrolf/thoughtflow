@@ -2364,3 +2364,223 @@ class TestThoughtObjectLazinessAndPortability:
         assert all(text == "actor=TAG-{}".format(idx) for idx, text in pairs)
 
 
+
+
+class _ScriptedLLM:
+    """Scripted LLM: each step is (text, finish_reason) or an Exception to raise."""
+
+    def __init__(self, steps, model="scripted"):
+        self.steps = list(steps)
+        self.model = model
+        self.service = "mock"
+        self.calls = []
+        self.last_error = None
+        self.last_usage = None
+        self.last_finish_reason = None
+
+    def call(self, msgs, params=None):
+        self.calls.append({"msgs": msgs, "params": dict(params or {})})
+        step = self.steps[min(len(self.calls), len(self.steps)) - 1]
+        self.last_error = None
+        if isinstance(step, Exception):
+            self.last_error = str(step)
+            self.last_finish_reason = None
+            return [""]
+        text, finish = step
+        self.last_finish_reason = finish
+        return [text]
+
+
+class TestSchemaDialect:
+    """Type-name strings, pipe unions, and enum literals (#37)."""
+
+    def test_pipe_union_and_enum_validate(self):
+        from thoughtflow._util import valid_extract
+
+        rules = {
+            "kind": "json",
+            "format": {"label": {"enum": ["pos", "neg"]}, "score": "int|null", "note?": "str"},
+        }
+        assert valid_extract('{"label": "pos", "score": null}', rules)["label"] == "pos"
+        assert valid_extract('{"label": "neg", "score": 3, "note": "x"}', rules)["score"] == 3
+        with pytest.raises(Exception):
+            valid_extract('{"label": "maybe", "score": 1}', rules)
+        with pytest.raises(Exception):
+            valid_extract('{"label": "pos", "score": "high"}', rules)
+
+    def test_top_level_enum_accepts_bare_word(self):
+        from thoughtflow._util import valid_extract
+
+        rules = {"kind": "json", "format": {"enum": ["yes", "no"]}}
+        assert valid_extract("yes", rules) == "yes"
+        assert valid_extract('"no"', rules) == "no"
+
+    def test_plain_exemplar_strings_keep_meaning(self):
+        from thoughtflow._util import valid_extract
+
+        rules = {"kind": "json", "format": {"name": "Ada"}}
+        assert valid_extract('{"name": "Grace"}', rules) == {"name": "Grace"}
+
+    def test_bool_is_not_int(self):
+        from thoughtflow._util import valid_extract
+
+        with pytest.raises(Exception):
+            valid_extract('{"n": true}', {"kind": "json", "format": {"n": "int"}})
+
+    def test_first_attempt_prompt_names_the_schema(self, memory):
+        llm = _ScriptedLLM([('{"label": "pos"}', "stop")])
+        thought = THOUGHT(
+            name="cls",
+            llm=llm,
+            prompt="Classify",
+            parsing_rules={"kind": "json", "format": {"label": {"enum": ["pos", "neg"]}}},
+        )
+        memory.add_msg("user", "great", channel="api")
+        thought(memory)
+        assert "Expected format:" in llm.calls[0]["msgs"][-1]["content"]
+        assert "one of ['pos', 'neg']" in llm.calls[0]["msgs"][-1]["content"]
+
+    def test_instruct_schema_false_leaves_prompt_alone(self, memory):
+        llm = _ScriptedLLM([('{"a": "x"}', "stop")])
+        thought = THOUGHT(
+            name="quiet",
+            llm=llm,
+            prompt="Go",
+            parsing_rules={"kind": "json", "format": {"a": ""}},
+            instruct_schema=False,
+        )
+        thought(memory)
+        assert "Expected format" not in llm.calls[0]["msgs"][-1]["content"]
+
+
+class TestRetryPolicy:
+    """Budget doubling, backoff, and fallback llm (#50)."""
+
+    def test_length_doubles_max_tokens(self, memory):
+        llm = _ScriptedLLM([("trunc", "length"), ('{"a": "ok"}', "stop")])
+        thought = THOUGHT(
+            name="grow",
+            llm=llm,
+            prompt="Go",
+            parsing_rules={"kind": "json", "format": {"a": ""}},
+            max_retries=3,
+            llm_params={"max_tokens": 100},
+            retry={"on": {"length": "double_budget"}},
+        )
+        thought(memory)
+        assert llm.calls[0]["params"]["max_tokens"] == 100
+        assert llm.calls[1]["params"]["max_tokens"] == 200
+        assert memory.get_var("grow_outcome")["ok"] is True
+
+    def test_http_backoff_retries_then_succeeds(self, memory):
+        llm = _ScriptedLLM([RuntimeError("503"), ('{"a": "ok"}', "stop")])
+        thought = THOUGHT(
+            name="flaky",
+            llm=llm,
+            prompt="Go",
+            parsing_rules={"kind": "json", "format": {"a": ""}},
+            max_retries=3,
+            retry={"on": {"http": "backoff"}, "backoff_base": 0.0},
+        )
+        thought(memory)
+        assert len(llm.calls) == 2
+        assert memory.get_var("flaky_outcome")["ok"] is True
+
+    def test_fallback_llm_runs_after_exhaustion(self, memory):
+        primary = _ScriptedLLM([RuntimeError("down")], model="primary")
+        backup = _ScriptedLLM([('{"a": "saved"}', "stop")], model="backup")
+        thought = THOUGHT(
+            name="resilient",
+            llm=primary,
+            prompt="Go",
+            parsing_rules={"kind": "json", "format": {"a": ""}},
+            max_retries=2,
+            retry={"fallback_llm": backup},
+        )
+        thought(memory)
+        outcome = memory.get_var("resilient_outcome")
+        assert outcome["ok"] is True
+        assert outcome["used_fallback_llm"] is True
+        assert len(primary.calls) == 2 and len(backup.calls) == 1
+        assert thought.llm is primary
+
+    def test_no_retry_config_keeps_old_behavior(self, memory):
+        llm = _ScriptedLLM([("trunc", "length")])
+        thought = THOUGHT(name="plain", llm=llm, prompt="Go", max_retries=2, llm_params={"max_tokens": 50})
+        thought(memory)
+        assert all(c["params"]["max_tokens"] == 50 for c in llm.calls)
+        assert "used_fallback_llm" not in memory.get_var("plain_outcome")
+
+
+class TestVisibility:
+    """visibility, record_prompt, and user-message dedup (#36)."""
+
+    def test_internal_and_silent_skip_assistant_write(self, memory):
+        for mode in ("internal", "silent"):
+            llm = _ScriptedLLM([("hidden", "stop")])
+            thought = THOUGHT(name="v_" + mode, llm=llm, prompt="Go", visibility=mode)
+            thought(memory)
+            assert memory.get_var("v_{}_result".format(mode)) == "hidden"
+        assert memory.get_msgs(include=["assistant"]) == []
+
+    def test_public_writes_assistant_message(self, memory):
+        THOUGHT(name="pub", llm=_ScriptedLLM([("shown", "stop")]), prompt="Go")(memory)
+        assert memory.last_asst_msg(content_only=True) == "shown"
+
+    def test_invalid_visibility_rejected(self):
+        with pytest.raises(ValueError):
+            THOUGHT(name="bad", prompt="Go", visibility="loud")
+
+    def test_last_user_msg_not_duplicated(self, memory):
+        llm = _ScriptedLLM([("ok", "stop")])
+        memory.add_msg("user", "What is 2+2?", channel="api")
+        THOUGHT(name="dd", llm=llm, prompt="Answer: {last_user_msg}")(memory)
+        sent = [m["content"] for m in llm.calls[0]["msgs"] if m["role"] == "user"]
+        assert sent == ["Answer: What is 2+2?"]
+
+    def test_history_kept_when_template_does_not_reference_it(self, memory):
+        llm = _ScriptedLLM([("ok", "stop")])
+        memory.add_msg("user", "What is 2+2?", channel="api")
+        THOUGHT(name="keep", llm=llm, prompt="Be brief")(memory)
+        sent = [m["content"] for m in llm.calls[0]["msgs"] if m["role"] == "user"]
+        assert "What is 2+2?" in sent
+
+    def test_record_prompt_stores_rendered_prompt(self, memory):
+        llm = _ScriptedLLM([("ok", "stop")])
+        THOUGHT(name="rp", llm=llm, prompt="Say hi", record_prompt=True)(memory)
+        assert "Say hi" in memory.get_var("rp_prompt")
+
+
+class TestReviewFeedbackThought:
+    def test_doubling_starts_from_llm_default_params(self, memory):
+        llm = _ScriptedLLM([("trunc", "length"), ('{"a": "ok"}', "stop")])
+        llm.default_params = {"max_tokens": 200}
+        thought = THOUGHT(
+            name="dp", llm=llm, prompt="Go",
+            parsing_rules={"kind": "json", "format": {"a": ""}},
+            max_retries=3, retry={"on": {"length": "double_budget"}},
+        )
+        thought(memory)
+        assert llm.calls[1]["params"]["max_tokens"] == 400
+
+    def test_to_dict_round_trip_keeps_new_options_and_flags_fallback(self):
+        import json
+
+        backup = _ScriptedLLM([("x", "stop")])
+        thought = THOUGHT(
+            name="rt", llm=_ScriptedLLM([("x", "stop")]), prompt="Go", visibility="internal",
+            instruct_schema=False, record_prompt=True,
+            retry={"on": {"length": "double_budget"}, "fallback_llm": backup},
+        )
+        data = json.loads(json.dumps(thought.to_dict()))
+        assert data["has_fallback_llm"] is True
+        clone = THOUGHT.from_dict(data, llm=_ScriptedLLM([("x", "stop")]), fallback_llm=backup)
+        assert clone.visibility == "internal" and clone.instruct_schema is False
+        assert clone.record_prompt is True
+        assert clone.retry["on"] == {"length": "double_budget"}
+        assert clone.retry["fallback_llm"] is backup
+
+    def test_copy_shares_fallback_llm(self):
+        backup = _ScriptedLLM([("x", "stop")])
+        thought = THOUGHT(name="cp", llm=None, prompt="Go", retry={"fallback_llm": backup})
+        assert thought.copy().retry["fallback_llm"] is backup
