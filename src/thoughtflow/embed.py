@@ -9,10 +9,121 @@ instead of chat completion endpoints.
 from __future__ import annotations
 
 import json
+import math
 import urllib.request
 import urllib.error
 
 from thoughtflow._util import exchange_key, TRANSPORT_PARAM_KEYS
+
+
+def cosine_similarity(vec_a, vec_b):
+    """
+    Compute cosine similarity between two numeric vectors using the standard library.
+
+    Decoupled from ``EMBED`` so callers can score precomputed, cached, or
+    replayed vectors without instantiating a client or loading NumPy.
+
+    Args:
+        vec_a (Sequence[float]): First non-empty numeric vector.
+        vec_b (Sequence[float]): Second numeric vector of equal length.
+
+    Returns:
+        float: Similarity score in ``[-1.0, 1.0]`` (returns ``0.0`` when either
+        vector has zero Euclidean norm).
+
+    Raises:
+        ValueError: When either vector is empty or lengths differ.
+
+    Example:
+        >>> cosine_similarity([1.0, 0.0], [1.0, 0.0])
+        1.0
+    """
+    if len(vec_a) == 0 or len(vec_b) == 0:
+        raise ValueError("Vectors must be non-empty.")
+    if len(vec_a) != len(vec_b):
+        raise ValueError(
+            "Vector dimension mismatch: {} vs {}.".format(len(vec_a), len(vec_b))
+        )
+
+    dot = 0.0
+    norm_a_sq = 0.0
+    norm_b_sq = 0.0
+    for a, b in zip(vec_a, vec_b):
+        fa = float(a)
+        fb = float(b)
+        dot += fa * fb
+        norm_a_sq += fa * fa
+        norm_b_sq += fb * fb
+
+    if norm_a_sq == 0.0 or norm_b_sq == 0.0:
+        return 0.0
+
+    score = dot / (math.sqrt(norm_a_sq) * math.sqrt(norm_b_sq))
+    if score > 1.0:
+        return 1.0
+    if score < -1.0:
+        return -1.0
+    return score
+
+
+def cosine_retrieve(query_vec, items, key=None, top_k=5, min_score=None):
+    """
+    Rank and retrieve the top-K items closest to ``query_vec`` by cosine similarity.
+
+    Accepts flexible item shapes without forcing a wrapper document class:
+      - ``list[dict]`` containing an ``'embedding'`` or ``'vector'`` key (or a
+        custom dict field name passed via ``key='my_vec'``)
+      - ``list[tuple[item, vector]]`` 2-tuples
+      - ``list[list[float]]`` raw vectors
+      - arbitrary objects when ``key`` is a callable ``fn(item) -> vector``
+
+    Args:
+        query_vec (Sequence[float]): Query embedding vector.
+        items (Iterable): Candidate items to score.
+        key (str or callable, optional): Dict key name or ``fn(item) -> vector``.
+        top_k (int): Maximum matches to return (default 5).
+        min_score (float, optional): Minimum similarity cutoff (inclusive).
+
+    Returns:
+        list[dict]: Ranked matches ``[{'score': float, 'index': int, 'item': Any}, ...]``
+        ordered from highest score to lowest (ties broken by input index).
+
+    Example:
+        >>> docs = [{"text": "dogs", "embedding": [1.0, 0.0]}, {"text": "math", "embedding": [0.0, 1.0]}]
+        >>> hits = cosine_retrieve([0.9, 0.1], docs, top_k=1)
+        >>> hits[0]["item"]["text"]
+        'dogs'
+    """
+    if top_k <= 0:
+        return []
+
+    scored = []
+    for idx, item in enumerate(items):
+        if callable(key):
+            vec = key(item)
+        elif isinstance(key, str) and isinstance(item, dict):
+            vec = item[key]
+        elif isinstance(item, dict):
+            if "embedding" in item:
+                vec = item["embedding"]
+            elif "vector" in item:
+                vec = item["vector"]
+            else:
+                raise KeyError(
+                    "Dict item at index {} has neither 'embedding' nor 'vector'; pass key=.".format(idx)
+                )
+        elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (list, tuple)):
+            vec = item[1]
+        else:
+            vec = item
+
+        sim = cosine_similarity(query_vec, vec)
+        if min_score is not None and sim < float(min_score):
+            continue
+        scored.append({"score": sim, "index": idx, "item": item})
+
+    scored.sort(key=lambda entry: (-entry["score"], entry["index"]))
+    return scored[:top_k]
 
 
 class EMBED:
@@ -544,3 +655,11 @@ class ReplayEMBED(EMBED):
         if single_input and vectors:
             return vectors[0]
         return list(vectors)
+
+
+__all__ = [
+    "EMBED",
+    "ReplayEMBED",
+    "cosine_similarity",
+    "cosine_retrieve",
+]
