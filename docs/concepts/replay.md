@@ -61,7 +61,7 @@ assert fresh.get_var("respond_result") == original
 
 The replayed flow runs in a fresh MEMORY against the recorded responses. If the flow is unchanged, the output is identical. If repeated identical requests were recorded, they replay in their recorded order.
 
-`EMBED` mirrors this exactly: `embed.record(memory)` and `EMBED.replay(memory)` return a `ReplayEMBED` that serves recorded vectors.
+`EMBED`, `DM`, and `TOOL` mirror this seam: `embed.record(memory)` / `EMBED.replay(memory)` return a `ReplayEMBED` that serves recorded vectors, `dm.record(memory)` / `DM.replay(memory)` return a `ReplayDM` that serves recorded System-One decision distributions, and `tool.record(memory)` / `tool.replay(memory)` (or `TOOL.replay_all(tools, memory)`) return `ReplayTOOL` instances that serve recorded tool or MCP outputs offline without re-firing external side effects. Passing `on_miss="live"` to `tool.replay(...)` alongside `LLM.replay(recorded, on_miss=live_llm)` or `DM.replay(recorded, on_miss=live_dm)` enables time-travel splice debugging: recorded prefix steps replay in under a millisecond while diverged calls fall through to the live system.
 
 ---
 
@@ -78,7 +78,7 @@ except ReplayMissError:
     print("Flow has drifted from the recording. Re-record.")
 ```
 
-Note that primitives with their own error handling absorb the miss into their normal failure path: a THOUGHT, for example, retries and then stores `None` as its result with the error logged in memory, rather than letting the exception propagate. Inspect `{name}_last_error` and structured `thought_failure` log events to see why. Either way, a drifted flow cannot silently produce stale answers. See [Thought](thought.md) for the full parse-validate-retry pipeline.
+Note that primitives with their own error handling absorb `ReplayMissError` immediately (fail-fast on attempt 1, without burning retries) into their normal failure path: a `THOUGHT` or `DECIDE` stores `None` (or `default`) in `{name}_result` and records `error_class="replay_miss"` in `{name}_outcome`. When running inside `Harness(..., strict=True)`, any absorbed `replay_miss` automatically fails the test case so drifted recordings never produce false-green suites. See [Thought](thought.md).
 
 ### Replay vs provider prompt caching
 
@@ -120,12 +120,12 @@ harness = Harness([
     ),
 ])
 
-results = harness.run(lambda m: answer_flow(m, replay_llm))
+results = harness.run(lambda m: answer_flow(m, replay_llm), strict=True)
 print(results.summary())
 assert results.pass_rate == 1.0, results.failures
 ```
 
-Each case runs in a fresh, isolated MEMORY. Exceptions — including `ReplayMissError` — are contained as failures rather than aborting the run, so one drifted case does not hide the others.
+Each case runs in a fresh, isolated MEMORY. Passing `strict=True` ensures that even if an inner `THOUGHT` or `DECIDE` absorbed a `ReplayMissError` or schema failure, the case still fails with an explicit `reason` and `absorbed_errors` list, while uncaught exceptions preserve the partial `TestResult.memory` for inspection.
 
 `TestCase` also accepts `messages=[...]` instead of `setup`, and `expected=` (an exact string or a predicate over the final assistant message) instead of `check`.
 

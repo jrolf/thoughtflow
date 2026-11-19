@@ -54,19 +54,24 @@ The final response is added to memory as an `assistant` message and also stored 
 
 ---
 
-## The Tool Loop
+## The Tool Loop: Native Write-Ahead vs Text Fallback
 
-Each iteration of the loop:
+`AGENT` supports two execution protocols (`protocol="auto"` by default):
 
-1. **Build messages** — system prompt plus conversation history from memory.
-2. **Call the LLM** with the tool schemas (`tools=[t.to_schema() for t in tools]`).
-3. **Parse tool calls** from the response. The LLM proposes calls as JSON — `{"tool_calls": [...]}`, `{"tool_call": {...}}`, or a single `{"name": ..., "arguments": ...}`.
-4. **Execute each tool** and record the interaction in memory: the request as an `action` message, the output as a `result` message.
-5. **Repeat** until the LLM responds without tool calls (the final answer) or `max_iterations` is reached.
+### 1. Native Write-Ahead Protocol (`openai`, `openrouter`, `groq`, or custom `.chat()` LLMs)
 
-`max_iterations` (default 10) is the safety valve against runaway loops. When it is hit without a final answer, the agent logs the fact and returns the memory as-is.
+When the `LLM` supports `chat()`, `AGENT` (and the functional `tool_loop(memory, llm, tools, ...)` helper) runs a durable, governed write-ahead loop:
 
-The `action` and `result` roles are ThoughtFlow-internal; the LLM translates them to each provider's native role strings at the API boundary. See [LLM — Role Mapping](llm.md#role-mapping).
+1. **Build OpenAI messages** via `memory.get_llm_msgs(format="openai", merge_augments=self.merge_augments)`.
+2. **Call `llm.chat(messages, tools=...)`** to obtain native `tool_calls` with stable IDs and usage metrics.
+3. **Write-ahead persist** — write the `assistant` message with its `tool_calls` to `MEMORY` *before* any tool executes, and fire `checkpoint(memory)` if configured.
+4. **Govern & execute** — check `allow=[...]`, `on_tool_call`, `policy` (`"allow"`, `"deny"`, `"approve"`, `"approve_over"`, or `callable(name, args)`), and `budget` (`max_model_calls`, `max_tool_calls`, `max_tokens`). Every `tool_call_id` receives a `role="tool"` answer (even when vetoed, unknown, or budget-halted) and triggers `checkpoint(memory)`.
+5. **Suspend & resume** — if a call requires approval, `AGENT` calls `memory.suspend(...)` and returns with `{name}_status == "suspended"`. Rehydrate the `MEMORY` later and call `agent(memory, decision={"approve": True})` to resume directly from the unanswered `tool_calls` without re-running completed tools.
+6. **Outcome recording** — stores `{name}_status` (`"final"`, `"suspended"`, `"max_iterations"`, `"budget_exhausted"`, `"vetoed"`, or `"error"`) and `{name}_outcome` (`ok`, `model_calls`, `tool_calls`, token counts, `vetoed`).
+
+### 2. Text-JSON Fallback Protocol (`anthropic`, `gemini`, `ollama`, or `call()`-only mocks)
+
+When the `LLM` does not support `LLM.chat()`, `AGENT` automatically runs the text-JSON loop: calling `llm.call()`, parsing JSON tool-call blocks, and recording interactions under `action` and `result` roles (translated at the provider boundary via `PROVIDER_ROLE_MAP`).
 
 ---
 

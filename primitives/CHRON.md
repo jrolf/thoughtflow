@@ -36,6 +36,7 @@ CHRON includes a pure-Python cron expression parser (zero dependencies). It supp
 - Ranges: `1-5`
 - Steps: `*/15`, `1-10/3`
 - Lists: `1,15,30`
+- Shorthand aliases: `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`
 - Day-of-week: 0=Sunday, 6=Saturday (7 is also accepted as Sunday)
 - Standard OR-logic when both day-of-month and day-of-week are restricted
 
@@ -65,6 +66,7 @@ When no `state_file` is provided, state lives in memory only.
 | name | No | "chron" | Identifier for this scheduler instance. |
 | state_file | No | None | Path to JSON file for persisting job state across restarts. |
 | timezone | No | "UTC" | Default timezone for cron evaluation (e.g. "America/New_York"). |
+| on_state_error | No | "warn" | `"warn"` (emit `RuntimeWarning` and set `last_state_error`) or `"raise"` on corrupt/unwritable state file. |
 
 ### add() Parameters
 

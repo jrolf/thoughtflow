@@ -474,6 +474,51 @@ class TestLlmViewAugments:
 
         assert contents == ['Visible question']
 
+    def test_tool_role_and_structured_tool_fields_roundtrip_and_openai_projection(self, memory):
+        """Issue #35: MEMORY stores native assistant tool_calls + tool results and projects OpenAI format."""
+        memory.add_msg('user', 'Read a.py', channel='api')
+        memory.add_msg(
+            'assistant',
+            '',
+            channel='api',
+            tool_calls=[{'id': 'call_1', 'name': 'read', 'arguments': {'path': 'a.py'}}],
+        )
+        memory.add_msg('tool', '{"text": "print(1)"}', channel='api', tool_call_id='call_1', name='read')
+        memory.add_msg('query', 'internal scratch query', channel='api')
+        memory.add_msg('assistant', 'File prints 1.', channel='api')
+
+        # Raw projection preserves structured fields
+        raw = memory.get_llm_msgs()
+        assert raw[1]['tool_calls'][0]['name'] == 'read'
+        assert raw[2]['role'] == 'tool'
+        assert raw[2]['tool_call_id'] == 'call_1'
+
+        # OpenAI projection drops non-OpenAI roles ('query') and formats wire tool_calls
+        openai_msgs = memory.get_llm_msgs(format='openai')
+        assert [m['role'] for m in openai_msgs] == ['user', 'assistant', 'tool', 'assistant']
+        assert openai_msgs[1]['tool_calls'] == [{
+            'id': 'call_1',
+            'type': 'function',
+            'function': {'name': 'read', 'arguments': '{"path": "a.py"}'},
+        }]
+        assert openai_msgs[2] == {
+            'role': 'tool',
+            'content': '{"text": "print(1)"}',
+            'tool_call_id': 'call_1',
+            'name': 'read',
+        }
+
+        # JSON serialization round-trip preserves structured tool fields
+        restored = MEMORY.from_json(memory.to_json())
+        assert restored.get_llm_msgs(format='openai') == openai_msgs
+
+    def test_tool_message_validation_guards(self, memory):
+        """Issue #35: tool role requires tool_call_id; tool_calls requires assistant role."""
+        with pytest.raises(ValueError, match="tool_call_id"):
+            memory.add_msg('tool', 'output without id')
+        with pytest.raises(ValueError, match="only valid on 'assistant'"):
+            memory.add_msg('user', 'hi', tool_calls=[{'id': 'c1', 'name': 'x', 'arguments': {}}])
+
 
 # ============================================================================
 # Log Operation Tests
@@ -1525,3 +1570,340 @@ class TestEmitOperations:
         emits = memory.get_emits()
         assert len(emits) == 2
         assert all(event["type"] == "emit" for event in emits)
+
+
+# ============================================================================
+# Causal Event Ordering & Scoped Views
+# ============================================================================
+
+
+class TestCausalOrderingAndScopes:
+    """Tests for sub-millisecond from_events ordering, get_llm_msgs filters, and memory.scope()."""
+
+    def test_from_events_unordered_preserves_submillisecond_writes_and_tombstones(self, memory):
+        """
+        from_events() documents that input order does not matter; reversed tight
+        sub-millisecond writes and deletions must still replay in causal order.
+        """
+        memory.set_var("phase", "step_1")
+        memory.set_var("phase", "step_2")
+        memory.set_var("phase", "step_3")
+        memory.set_var("temp_secret", "ephemeral")
+        memory.del_var("temp_secret")
+
+        snap = memory.snapshot()
+        shuffled = list(reversed(list(snap["events"].values())))
+        restored = MEMORY.from_events(shuffled, memory_id=memory.id, objects=snap["objects"])
+
+        assert restored.get_var("phase") == "step_3"
+        assert restored.is_var_deleted("temp_secret") is True
+        assert restored.get_var("temp_secret") is None
+
+        # Duplicate ancestor events (e.g. from branch event-list union) are deduplicated cleanly.
+        merged_union = MEMORY.from_events(shuffled + list(snap["events"].values()), memory_id=memory.id)
+        assert len(merged_union.events) == len(memory.events)
+        assert len(merged_union.idx_all) == len(memory.idx_all)
+        assert merged_union.get_var("phase") == "step_3"
+
+    def test_get_llm_msgs_supports_channel_and_metadata_filters(self, memory):
+        """get_llm_msgs() must forward channel, metadata_filter, and exclude_metadata."""
+        memory.add_msg("user", "Public brief", channel="webapp", metadata={"room": "public"})
+        memory.add_msg("assistant", "Private counsel note", channel="api", metadata={"room": "private", "internal": True})
+
+        public_only = memory.get_llm_msgs(metadata_filter={"room": "public"})
+        non_internal = memory.get_llm_msgs(exclude_metadata={"internal": True})
+        webapp_only = memory.get_llm_msgs(channel="webapp")
+
+        assert public_only == [{"role": "user", "content": "Public brief"}]
+        assert non_internal == [{"role": "user", "content": "Public brief"}]
+        assert webapp_only == [{"role": "user", "content": "Public brief"}]
+
+    def test_scope_isolates_rooms_and_scratchpad_variables_with_thought(self, memory, mock_llm):
+        """
+        memory.scope() must isolate private room messages and actor scratchpad
+        variables ({name}_result) while sharing public_keys and export_keys.
+        """
+        from thoughtflow import THOUGHT
+
+        memory.set_var("deal_target", "CloudPulse")
+        alpha = memory.scope(
+            "alpha",
+            read_rooms={"public_room", "alpha_board"},
+            write_room="alpha_board",
+            public_keys={"deal_target"},
+            export_keys={"shared_verdict"},
+        )
+        beta = memory.scope(
+            "beta",
+            read_rooms={"public_room", "beta_board"},
+            write_room="beta_board",
+            public_keys={"deal_target"},
+        )
+
+        alpha.set_var("ceiling", 78)
+        beta.set_var("ceiling", 92)
+        alpha.add_msg("user", "ALPHA-SECRET: cap is 78")
+        beta.add_msg("user", "BETA-SECRET: cap is 92")
+
+        llm_b = mock_llm(responses=["Bid 90"])
+        step = THOUGHT(
+            name="bid",
+            llm=llm_b,
+            prompt="Target={deal_target} ceiling={ceiling} note={last_user_msg}",
+        )
+        step(beta)
+        alpha.set_var("shared_verdict", "ready")
+
+        sent_blob = str(step.last_msgs)
+        assert "CloudPulse" in sent_blob
+        assert "92" in sent_blob
+        assert "ALPHA-SECRET" not in sent_blob
+        assert "78" not in sent_blob
+        assert beta.get_var("bid_result") == "Bid 90"
+        assert "beta__bid_result" in memory.vars
+        assert "bid_result" not in memory.vars
+        assert memory.get_var("shared_verdict") == "ready"
+        assert beta.get_var("ceiling") == 92
+        assert alpha.get_var("ceiling") == 78
+
+    def test_scope_rejects_blank_actor(self, memory):
+        """scope() must reject empty or whitespace-only actor identifiers."""
+        with pytest.raises(ValueError, match="actor"):
+            memory.scope("   ")
+
+    def test_from_events_forked_branch_merge_is_order_independent_on_seq_ties(self, memory):
+        """
+        Two branches forked from a common MEMORY share post-fork _seq values;
+        merging their event lists via from_events() must break (dt_utc, _seq)
+        ties deterministically by stamp regardless of argument order.
+        """
+        memory.set_var("shared_seed", "init")
+        branch_a = memory.copy()
+        branch_b = memory.copy()
+
+        # Force identical dt_utc and _seq across the two independent branches.
+        branch_a.set_var("outcome", "from_a")
+        branch_b.set_var("outcome", "from_b")
+        ev_a = [e for s, e in branch_a.events.items() if s not in memory.events][0]
+        ev_b = [e for s, e in branch_b.events.items() if s not in memory.events][0]
+        ev_b["dt_utc"] = ev_a["dt_utc"]
+        assert ev_a["_seq"] == ev_b["_seq"]
+
+        events_a = list(branch_a.snapshot()["events"].values())
+        events_b = list(branch_b.snapshot()["events"].values())
+
+        merged_ab = MEMORY.from_events(events_a + events_b, memory_id=memory.id)
+        merged_ba = MEMORY.from_events(events_b + events_a, memory_id=memory.id)
+
+        assert merged_ab.get_var("outcome") == merged_ba.get_var("outcome")
+        assert [p[-1] for p in merged_ab.idx_all] == [p[-1] for p in merged_ba.idx_all]
+
+    def test_nested_scope_unwraps_root_and_filters_events_and_last_result_msg(self, memory):
+        """
+        Nested scope.scope() must unwrap directly to the root MEMORY (preserving
+        vars/del_var/is_var_deleted), filter scope.events to visible rooms/vars,
+        support concurrent room creation, and expose last_result_msg().
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        memory.set_var("global_cfg", "v1")
+        alpha = memory.scope(
+            "alpha",
+            read_rooms={"public", "alpha_room"},
+            write_room="alpha_room",
+            public_keys={"global_cfg"},
+            export_keys={"final_report"},
+        )
+        beta = memory.scope(
+            "beta",
+            read_rooms={"public", "beta_room"},
+            write_room="beta_room",
+        )
+        beta.add_msg("user", "BETA-PRIVATE-NOTE")
+        beta.set_var("secret_num", 999)
+
+        alpha.set_var("team_brief", "focus on latency")
+        sub = alpha.scope(
+            "worker",
+            public_keys={"global_cfg", "team_brief"},
+            export_keys={"draft", "final_report"},
+        )
+        assert sub.base is memory
+        assert sub.get_var("global_cfg") == "v1"
+        assert sub.get_var("team_brief") == "focus on latency"
+
+        sub.set_var("scratch", "tmp")
+        sub.del_var("scratch")
+        assert sub.is_var_deleted("scratch") is True
+        assert sub.get_var("scratch") is None
+
+        # draft exports to parent scope alpha; final_report exports to root memory
+        sub.set_var("draft", "worker draft")
+        sub.set_var("final_report", "published")
+        assert alpha.get_var("draft") == "worker draft"
+        assert memory.get_var("draft") is None
+        assert memory.get_var("final_report") == "published"
+
+        # scope.events must exclude beta's private room message and secret var
+        visible_contents = [str(ev.get("content", "")) for ev in sub.events.values()]
+        assert all("BETA-PRIVATE-NOTE" not in c for c in visible_contents)
+        assert all(ev.get("var_name") != "beta__secret_num" for ev in sub.events.values())
+
+        # last_result_msg mirrors MEMORY.last_result_msg within visible rooms
+        alpha.add_msg("result", "tool-output-42")
+        beta.add_msg("result", "beta-hidden-result")
+        assert alpha.last_result_msg(content_only=True) == "tool-output-42"
+
+        # Concurrent scope creation across worker threads registers channels atomically
+        def make_worker_scope(i):
+            room = "parallel_room_{}".format(i)
+            sc = memory.scope("w{}".format(i), read_rooms={room}, write_room=room)
+            sc.add_msg("user", "hi {}".format(i))
+            return room
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rooms = list(pool.map(make_worker_scope, range(16)))
+        assert set(rooms).issubset(memory.valid_channels)
+
+
+
+
+# ============================================================================
+# Token budget, compaction, suspend/resume (#46, #44)
+# ============================================================================
+
+
+def _chatty_memory(n=10):
+    memory = MEMORY()
+    memory.add_msg('system', 'Be brief.')
+    for i in range(n):
+        memory.add_msg('user', 'question {} '.format(i) + 'x' * 40)
+        memory.add_msg('assistant', 'answer {} '.format(i) + 'y' * 40)
+    return memory
+
+
+class TestTokenBudget:
+    def test_budget_drops_oldest_and_pins_system_and_last_user(self):
+        memory = _chatty_memory()
+        msgs = memory.get_llm_msgs(budget_tokens=60)
+        assert msgs[0]['role'] == 'system'
+        assert any(m['role'] == 'user' and 'question 9' in m['content'] for m in msgs)
+        assert not any('question 0' in m['content'] for m in msgs)
+        assert len(memory.get_msgs()) == 21
+
+    def test_no_budget_returns_everything(self):
+        assert len(_chatty_memory().get_llm_msgs()) == 21
+
+    def test_summarizer_digest_inserted_after_system(self):
+        memory = _chatty_memory()
+        msgs = memory.get_llm_msgs(
+            budget_tokens=60, summarizer=lambda dropped: '{} dropped'.format(len(dropped))
+        )
+        assert msgs[1]['role'] == 'system' and 'dropped' in msgs[1]['content']
+
+    def test_orphan_tool_results_are_not_returned(self):
+        memory = MEMORY()
+        memory.add_msg('user', 'go')
+        memory.add_msg('assistant', 'z' * 400, tool_calls=[{'id': 'c1', 'name': 't', 'arguments': {}}])
+        memory.add_msg('tool', 'ok', tool_call_id='c1', name='t')
+        memory.add_msg('user', 'again')
+        msgs = memory.get_llm_msgs(budget_tokens=10)
+        assert not any(m['role'] == 'tool' for m in msgs)
+
+    def test_scope_supports_budget(self):
+        memory = _chatty_memory()
+        scoped = memory.scope('a')
+        assert len(scoped.get_llm_msgs(budget_tokens=60)) < 21
+
+
+class TestCompact:
+    def test_compact_is_non_destructive(self):
+        memory = _chatty_memory()
+        result = memory.compact(keep=4)
+        assert result['covered'] == 16
+        assert len(memory.get_msgs(include=['user', 'assistant'])) == 20
+        view = memory.get_llm_msgs()
+        assert len(view) < 21
+        assert any('Summary' in m['content'] for m in view)
+        assert memory.get_emits('memory_compacted')
+
+    def test_compact_twice_does_not_recover_summarized(self):
+        memory = _chatty_memory()
+        memory.compact(keep=4)
+        assert memory.compact(keep=4) is None
+
+    def test_custom_summarizer(self):
+        memory = _chatty_memory(4)
+        memory.compact(keep=2, summarizer=lambda msgs: 'S{}'.format(len(msgs)))
+        assert memory.get_llm_msgs()[0]['content'] in ('Be brief.', 'S6')
+        assert any(m['content'] == 'S6' for m in memory.get_llm_msgs())
+
+
+class TestSuspension:
+    def test_suspend_and_resolve_once(self):
+        memory = MEMORY()
+        assert not memory.is_suspended()
+        memory.suspend('approval_required', pending={'calls': ['c1']})
+        assert memory.is_suspended()
+        first = memory.resolve_suspension({'approve': True})
+        second = memory.resolve_suspension({'approve': False})
+        assert first['status'] == 'resolved'
+        assert second['status'] == 'already_resolved'
+        assert second['suspension']['decision'] == {'approve': True}
+        assert not memory.is_suspended()
+        assert len(memory.get_emits('run_resumed')) == 1
+
+    def test_suspension_survives_round_trip(self):
+        memory = MEMORY()
+        memory.suspend('wait', pending={'x': 1})
+        restored = MEMORY.from_json(memory.to_json())
+        assert restored.is_suspended()
+        assert restored.get_suspension()['pending'] == {'x': 1}
+
+    def test_resolve_without_suspension(self):
+        assert MEMORY().resolve_suspension()['status'] == 'not_suspended'
+
+
+class TestToolPairBoundaries:
+    """Review feedback on PR 59: tool turns stay paired under compact and budgets."""
+
+    def _tool_memory(self):
+        memory = MEMORY()
+        memory.add_msg('user', 'first')
+        memory.add_msg('assistant', 'a' * 20, tool_calls=[{'id': 'c1', 'name': 't', 'arguments': {}}])
+        memory.add_msg('tool', 'r1', tool_call_id='c1', name='t')
+        memory.add_msg('assistant', 'done')
+        return memory
+
+    def _valid(self, msgs):
+        calls = set()
+        for m in msgs:
+            for tc in m.get('tool_calls') or []:
+                calls.add(tc['id'])
+        results = {m['tool_call_id'] for m in msgs if m['role'] == 'tool'}
+        return results == calls
+
+    def test_compact_does_not_split_assistant_from_tool_result(self):
+        memory = self._tool_memory()
+        memory.compact(keep=2)  # naive cut would keep [tool, assistant]
+        assert self._valid(memory.get_llm_msgs(format='openai'))
+
+    def test_budget_drops_assistant_when_its_result_was_dropped(self):
+        memory = MEMORY()
+        memory.add_msg('user', 'q')
+        memory.add_msg('assistant', '', tool_calls=[
+            {'id': 'a', 'name': 't', 'arguments': {}}, {'id': 'b', 'name': 't', 'arguments': {}},
+        ])
+        memory.add_msg('tool', 'x' * 400, tool_call_id='a', name='t')
+        memory.add_msg('tool', 'y', tool_call_id='b', name='t')
+        memory.add_msg('user', 'again')
+        for budget in (5, 20, 40, 80, 200):
+            assert self._valid(memory.get_llm_msgs(format='openai', budget_tokens=budget))
+
+    def test_scope_compact_with_write_only_room(self):
+        memory = MEMORY()
+        for i in range(6):
+            memory.add_msg('user', 'm{}'.format(i), channel='api')
+        scoped = memory.scope('x', read_rooms=['api'], write_room='cli')
+        result = scoped.compact(keep=2)
+        assert result['covered'] == 4 and result['stamp']

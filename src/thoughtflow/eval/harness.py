@@ -64,14 +64,72 @@ class TestCase:
 
     def evaluate(self, memory: MEMORY) -> bool:
         """Evaluate the result MEMORY against this case's expectations."""
+        passed, _reason, _observed = self.evaluate_with_detail(memory)
+        return passed
+
+    def evaluate_with_detail(
+        self, memory: MEMORY
+    ) -> tuple[bool, str | None, Any]:
+        """Evaluate expectations and return (passed, failure_reason, observed)."""
         if self.check is not None:
-            return bool(self.check(memory))
+            verdict = self.check(memory)
+            if isinstance(verdict, tuple) and len(verdict) >= 2:
+                ok = bool(verdict[0])
+                why = str(verdict[1]) if verdict[1] is not None else None
+                observed = verdict[2] if len(verdict) >= 3 else None
+                return ok, (None if ok else (why or "check returned False")), observed
+            ok = bool(verdict)
+            return ok, (None if ok else "check returned False"), None
         if self.expected is not None:
             response = memory.last_asst_msg(content_only=True) or ""
             if callable(self.expected):
-                return bool(self.expected(response))
-            return response == self.expected
-        return True
+                ok = bool(self.expected(response))
+                reason = None if ok else "expected predicate returned False for {!r}".format(response)
+                return ok, reason, response
+            ok = response == self.expected
+            reason = None if ok else "expected {!r}, got {!r}".format(self.expected, response)
+            return ok, reason, response
+        return True, None, None
+
+
+def _collect_absorbed_errors(memory: MEMORY | None) -> list[dict[str, Any]]:
+    """Extract structured THOUGHT/primitive failures absorbed inside ``memory``."""
+    if memory is None:
+        return []
+    absorbed: list[dict[str, Any]] = []
+    seen_thoughts: set[str] = set()
+
+    if hasattr(memory, "get_all_vars") and callable(getattr(memory, "get_all_vars", None)):
+        all_vars = memory.get_all_vars()
+    elif hasattr(memory, "vars") and isinstance(memory.vars, dict):
+        all_vars = memory.vars
+    else:
+        all_vars = {}
+
+    for key, val in all_vars.items():
+        if key.endswith("_outcome") and isinstance(val, dict) and val.get("ok") is False:
+            thought_name = key[:-len("_outcome")]
+            seen_thoughts.add(thought_name)
+            absorbed.append({
+                "source": thought_name,
+                "error_class": val.get("error_class"),
+                "reason": val.get("error"),
+                "attempts": val.get("attempts"),
+            })
+
+    for key, val in all_vars.items():
+        if key.endswith("_last_error") and isinstance(val, dict):
+            thought_name = key[:-len("_last_error")]
+            if thought_name in seen_thoughts:
+                continue
+            absorbed.append({
+                "source": thought_name,
+                "error_class": val.get("failure_kind"),
+                "reason": val.get("reason"),
+                "attempts": len(val.get("attempts") or []),
+            })
+
+    return absorbed
 
 
 @dataclass
@@ -82,9 +140,12 @@ class TestResult:
         test_case: The test case that was run.
         passed: Whether the test passed.
         response: The final assistant message from the result MEMORY.
-        error: Error message when the flow raised.
+        error: Error message when the flow or check raised.
+        reason: Human-readable explanation when ``passed`` is False.
+        observed: Observed value surfaced by ``expected`` or a 3-tuple ``check``.
+        absorbed_errors: Structured errors absorbed by primitives during the run.
         duration_ms: How long the case took.
-        memory: The result MEMORY (for post-hoc inspection).
+        memory: The result MEMORY (preserved even when the flow or check raises).
     """
 
     # Tell pytest this is not a test class despite the name
@@ -94,6 +155,9 @@ class TestResult:
     passed: bool
     response: str | None = None
     error: str | None = None
+    reason: str | None = None
+    observed: Any = None
+    absorbed_errors: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: int | None = None
     memory: MEMORY | None = None
 
@@ -139,12 +203,16 @@ class HarnessResults:
 
     def summary(self) -> dict[str, Any]:
         """Get a summary dict of the results."""
+        absorbed_cases = [
+            r.test_case.name for r in self.results if r.absorbed_errors
+        ]
         return {
             "total": self.total_count,
             "passed": self.passed_count,
             "failed": self.failed_count,
             "pass_rate": self.pass_rate,
             "failures": [r.test_case.name for r in self.failures],
+            "cases_with_absorbed_errors": absorbed_cases,
         }
 
 
@@ -187,12 +255,16 @@ class Harness:
         self,
         flow: Callable[[MEMORY], MEMORY],
         filter_tags: list[str] | None = None,
+        strict: bool = False,
     ) -> HarnessResults:
         """Run all (or tag-filtered) test cases against a flow.
 
         Args:
             flow: Any ``memory -> memory`` callable.
             filter_tags: Optional tags to filter which cases run.
+            strict: When True, any case whose resulting MEMORY contains
+                absorbed primitive failures (e.g. a failed THOUGHT or
+                ReplayMissError) is marked failed even if ``check`` passed.
 
         Returns:
             HarnessResults with one TestResult per case.
@@ -202,22 +274,46 @@ class Harness:
         results = HarnessResults()
         for case in cases:
             start = time.time()
+            memory: MEMORY | None = None
             try:
                 memory = case.prepare()
-                memory = flow(memory)
-                passed = case.evaluate(memory)
+                returned = flow(memory)
+                if returned is not None:
+                    memory = returned
+                passed, reason, observed = case.evaluate_with_detail(memory)
+                absorbed = _collect_absorbed_errors(memory)
+                if strict and absorbed and passed:
+                    passed = False
+                    first = absorbed[0]
+                    reason = "strict mode: absorbed error in '{}' ({}: {})".format(
+                        first.get("source"),
+                        first.get("error_class"),
+                        first.get("reason"),
+                    )
                 results.results.append(TestResult(
                     test_case=case,
                     passed=passed,
-                    response=memory.last_asst_msg(content_only=True),
+                    response=memory.last_asst_msg(content_only=True) if memory is not None else None,
+                    reason=reason,
+                    observed=observed,
+                    absorbed_errors=absorbed,
                     duration_ms=int((time.time() - start) * 1000),
                     memory=memory,
                 ))
             except Exception as e:
+                err_str = "{}: {}".format(type(e).__name__, e)
+                absorbed = _collect_absorbed_errors(memory)
+                resp = None
+                if memory is not None and hasattr(memory, "last_asst_msg"):
+                    resp = memory.last_asst_msg(content_only=True)
                 results.results.append(TestResult(
                     test_case=case,
                     passed=False,
-                    error="{}: {}".format(type(e).__name__, e),
+                    response=resp,
+                    error=err_str,
+                    reason=err_str,
+                    absorbed_errors=absorbed,
                     duration_ms=int((time.time() - start) * 1000),
+                    memory=memory,
                 ))
         return results

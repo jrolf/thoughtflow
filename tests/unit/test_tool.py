@@ -471,3 +471,127 @@ class TestToolRepr:
         tool = TOOL("search", "Search the web", {}, lambda: None)
         assert "search" in repr(tool)
         assert "Search the web" in repr(tool)
+
+
+# ============================================================================
+# Record / Replay / Splice Tests
+# ============================================================================
+
+
+class TestToolRecordReplay:
+    """Tests for hermetic TOOL.record(), tool.replay(), and splice fallback."""
+
+    def test_record_and_offline_replay_preserves_stateful_sequence_without_side_effects(self):
+        """
+        Replaying a recorded tool from MEMORY.from_json() must reproduce sequential
+        stateful outputs (TKT-1, TKT-2) with zero live invocations, and raise
+        ReplayMissError on drift.
+        """
+        from thoughtflow import MEMORY, ReplayMissError, ReplayTOOL
+
+        side_effects = []
+
+        def create_ticket(cluster):
+            tid = "TKT-{}".format(len(side_effects) + 1)
+            side_effects.append((cluster, tid))
+            return {"ticket_id": tid, "cluster": cluster}
+
+        live_tool = TOOL(
+            name="create_ticket",
+            description="Open a ticket",
+            parameters={"cluster": {"type": "string"}},
+            fn=create_ticket,
+        )
+        tape = MEMORY()
+        live_tool.record(tape)
+
+        first = live_tool({"cluster": "eu-1"})
+        second = live_tool({"cluster": "eu-1"})
+        assert first["ticket_id"] == "TKT-1"
+        assert second["ticket_id"] == "TKT-2"
+        assert len(side_effects) == 2
+
+        rehydrated_tape = MEMORY.from_json(tape.to_json())
+        replayed = live_tool.replay(rehydrated_tape)
+
+        assert isinstance(replayed, ReplayTOOL)
+        assert replayed.to_schema() == live_tool.to_schema()
+        assert replayed({"cluster": "eu-1"}) == {"ticket_id": "TKT-1", "cluster": "eu-1"}
+        assert replayed({"cluster": "eu-1"}) == {"ticket_id": "TKT-2", "cluster": "eu-1"}
+        # Zero additional external side effects occurred during replay!
+        assert len(side_effects) == 2
+
+        with pytest.raises(ReplayMissError, match="create_ticket"):
+            replayed({"cluster": "us-west-unrecorded"})
+
+    def test_splice_mode_replays_recorded_prefix_and_executes_diverged_call_live(self):
+        """
+        on_miss='live' must serve recorded calls offline and fall through to the
+        live tool only when arguments diverge (time-travel splice debugging).
+        """
+        from thoughtflow import MEMORY
+
+        live_calls = []
+        tool = TOOL(
+            name="remediate",
+            description="Apply action",
+            parameters={"action": {"type": "string"}},
+            fn=lambda action="": (live_calls.append(action), {"applied": action})[1],
+        )
+        tape = MEMORY()
+        tool.record(tape)
+        tool({"action": "inspect"})
+        tool.record(None)
+
+        spliced = tool.replay(tape, on_miss="live")
+        assert spliced({"action": "inspect"}) == {"applied": "inspect"}
+        assert live_calls == ["inspect"]  # served from tape, not re-run!
+
+        assert spliced({"action": "throttle_tenant"}) == {"applied": "throttle_tenant"}
+        assert live_calls == ["inspect", "throttle_tenant"]
+
+    def test_replay_isolates_caller_mutation_and_compresses_large_outputs(self):
+        """
+        Mutating a returned dict/list must not corrupt recorded or replayed
+        entries, and tool outputs exceeding memory.object_threshold must store
+        compressed object refs in memory.objects rather than inline JSON blobs.
+        """
+        from thoughtflow import MEMORY
+
+        def fetch_bundle(doc_id):
+            return {"doc_id": doc_id, "items": ["a", "b"], "body": "Z" * 25000}
+
+        tool = TOOL(
+            name="fetch_bundle",
+            description="Fetch large document bundle",
+            parameters={"doc_id": {"type": "string"}},
+            fn=fetch_bundle,
+        )
+        tape = MEMORY()
+        tool.record(tape)
+
+        live_out = tool({"doc_id": "D-1"})
+        # Mutate returned live object in place to ensure recorded copy is isolated
+        live_out["items"].append("mutated_live")
+
+        exchanges = tape.get_exchanges(kind="tool")
+        assert len(exchanges) == 1
+        assert "result_obj_ref" in exchanges[0]["response"][0]
+        assert "result" not in exchanges[0]["response"][0]
+        # Compressed session JSON stays compact despite 25 KB payload
+        serialized = tape.to_json()
+        assert len(serialized) < 6000
+
+        restored_tape = MEMORY.from_json(serialized)
+        replayed = tool.replay(restored_tape)
+
+        first_replay = replayed({"doc_id": "D-1"})
+        assert first_replay["items"] == ["a", "b"]
+        assert len(first_replay["body"]) == 25000
+
+        # Mutate first replay return in place; second replay must still be pristine
+        first_replay["items"].append("mutated_replay")
+        second_replay = replayed({"doc_id": "D-1"})
+        assert second_replay["items"] == ["a", "b"]
+
+

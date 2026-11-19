@@ -93,7 +93,7 @@ supply-chain anxiety. The core library uses only Python's standard library —
 pip install --upgrade thoughtflow
 
 # Pin to a specific version for stability
-pip install thoughtflow==0.2.5
+pip install thoughtflow==0.3.0
 
 # Check your installed version
 python -c "import thoughtflow; print(thoughtflow.__version__)"
@@ -199,7 +199,9 @@ assert memory2.last_asst_msg() == memory.last_asst_msg()   # passes, forever
   download one JSON file, and step through the exact conversation locally.
 
 The same seam exists for embeddings (`EMBED.record()` / `EMBED.replay()`),
-and a thin [eval harness](#-testing--evaluation) turns recorded flows into
+decision models (`DM.record()` / `DM.replay()`), and tools (`TOOL.record()` /
+`tool.replay()` / `TOOL.replay_all()`), and a thin [eval harness](#-testing--evaluation)
+with `strict=True` absorbed-error detection turns recorded flows into
 structured test suites. See the runnable demo:
 [`examples/scripts/13_record_replay.py`](examples/scripts/13_record_replay.py).
 
@@ -303,9 +305,9 @@ ThoughtFlow is built in layers. Four **foundational** primitives form the base; 
 │  CAPABILITY           TOOL · MCP                                        │
 │  ─────────────────────────────────────────────────────────────────────── │
 │  COGNITION            THOUGHT  (→ DECIDE · PLAN)                        │
-│  OPERATION            ACTION   (→ 16 elemental subclasses)              │
+│  OPERATION            ACTION   (→ 14 elemental subclasses)              │
 │  STATE                MEMORY                                            │
-│  INTELLIGENCE         LLM · EMBED                                       │
+│  INTELLIGENCE         LLM · EMBED · DM                                  │
 │  ─────────────────────────────────────────────────────────────────────── │
 │  ↑ Foundational layer            ↑ Higher-level layer                   │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -329,18 +331,20 @@ Built on the foundational layer for richer capabilities.
 | Primitive | Layer | Purpose |
 |-----------|-------|---------|
 | **EMBED** | Intelligence | Vector embeddings from any provider |
-| **DECIDE** | Cognition | Constrained decisions from finite choices (extends THOUGHT) |
+| **DM** | Intelligence | Structured System-One decision models (`choice`, `noul`, `score`, `box`) |
+| **DECIDE** | Cognition | Constrained decisions over `LLM` or `DM` (extends THOUGHT) |
 | **PLAN** | Cognition | Structured multi-step execution plans (extends THOUGHT) |
-| **TOOL** | Capability | Wrap any callable as an LLM-invocable tool |
-| **MCP** | Capability | Model Context Protocol client for external tool servers |
-| **AGENT** | Autonomy | Autonomous reasoning loop (think → act → observe) |
+| **TOOL** | Capability | Wrap any callable as an LLM-invocable tool (`needs_context`, `record`/`replay`) |
+| **MCP** | Capability | Model Context Protocol client (`stdio` argv/shell + `http`, `prefix=`) |
+| **AGENT** | Autonomy | Governed write-ahead tool loop (`allow`, `policy`, `budget`, `checkpoint`, `decision=`) |
+| **tool_loop** | Autonomy | One-call functional helper over native governed `AGENT` |
 | **ReactAgent** | Autonomy | ReAct-style agent (extends AGENT) |
-| **ReflectAgent** | Autonomy | Self-reflective agent (extends AGENT) |
+| **ReflectAgent** | Autonomy | Self-reflective agent with task-aware critic (extends AGENT) |
 | **PlanActAgent** | Autonomy | Plan-then-execute agent (extends AGENT) |
-| **DELEGATE** | Coordination | Route tasks across a team of named agents |
+| **DELEGATE** | Coordination | Route tasks across a team of named agents (`handoff`, `dispatch`, `broadcast`) |
 | **CHAT** | Coordination | Multi-turn conversational interface |
-| **WORKFLOW** | Orchestration | Directed graph of steps with branching and merging |
-| **CHRON** | Orchestration | Schedule manager for recurring cron and interval jobs |
+| **WORKFLOW** | Orchestration | Step sequence with `ok=` checks, status branching, `while_`, and suspend/resume |
+| **CHRON** | Orchestration | Schedule manager for recurring cron (`@daily`, `0 2 * * *`) and interval jobs |
 
 ### Action Subclasses (Elemental Operations)
 
@@ -527,26 +531,53 @@ llm.call([
 # OpenAI-compat providers: markers stripped from bodies; opt-in wire params apply
 
 # ═══════════════════════════════════════════════════════════════════════════
-# OBSERVABILITY — last_error, last_usage, request_timeout (v0.2.2+)
+# OBSERVABILITY — last_error, last_usage, last_finish_reason, request_timeout
 # ═══════════════════════════════════════════════════════════════════════════
 
-llm = LLM("openai:gpt-4o", key="sk-...", request_timeout=30)
+llm = LLM("openai:gpt-4o", key="sk-...", request_timeout=30)  # default timeout is 120s
 response = llm.call([{"role": "user", "content": "Hi"}])
-print(llm.last_usage)   # normalized token counts when the provider returns them
-print(llm.last_error)   # None on success, error string on provider failure
+print(llm.last_usage)          # normalized token counts + cache/cost fields
+print(llm.last_finish_reason)  # "stop", "length", "tool_calls", etc.
+print(llm.last_error)          # None on success, error string on provider failure
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STRUCTURED CHAT (`LLM.chat`) — native tool calls, separate reasoning, abort
+# ═══════════════════════════════════════════════════════════════════════════
+
+import threading
+
+# Returns the complete assistant message dict instead of list[str]:
+msg = llm.chat(
+    [{"role": "user", "content": "Read config.json"}],
+    tools=[read_tool.to_schema()],
+)
+# msg = {
+#   "role": "assistant", "content": "", "reasoning": "...",
+#   "tool_calls": [{"id": "call_1", "name": "read", "arguments": {"path": "config.json"}, ...}],
+#   "finish_reason": "tool_calls", "usage": {...}, "model": "gpt-4o"
+# }
+
+# Typed streaming events + immediate cross-thread socket abort:
+cancel = threading.Event()
+for event in llm.chat([{"role": "user", "content": "Explain"}], stream=True, cancel=cancel):
+    if event["type"] == "text_delta":
+        print(event["delta"], end="", flush=True)
+    elif event["type"] == "done":
+        final_msg = event["message"]  # finish_reason == "aborted" if cancel.set() fired
 ```
 
 **Key features:**
 - **Automatic message normalization** — Pass dicts, strings, or mixed formats
-- **Consistent response format** — Always returns a list of response strings
+- **Two complementary call surfaces** — `llm.call()` returns `list[str]` for text thoughts; `llm.chat()` returns the structured assistant message dict (native `tool_calls`, separate `reasoning`, `finish_reason`, `usage`, typed stream deltas, and `cancel=` socket abort)
 - **Zero provider-specific code** — Switch providers by changing one string
-- **Direct HTTP calls** — No middleware, no overhead, no surprises
+- **Direct HTTP calls** — No middleware, no stdout noise, 120s default timeout (`None` opts out)
+- **Honest truncation & reasoning handling** — Tracks `last_finish_reason` and never leaks raw chain-of-thought when `content` is empty (opt-in via `allow_reasoning_fallback=True`)
 - **Structured output** — JSON Schema enforcement via each provider's native mechanism
 - **Streaming** — SSE/NDJSON streaming with a plain generator interface
-- **Record/replay** — Capture exchanges into MEMORY; replay them deterministically
+- **Record/replay** — Capture both `call()` and `chat()` exchanges into MEMORY; replay them deterministically
 - **Prompt caching** — `cached_system()` / `cache=True` for stable agent prefixes
 - **Production provider classes** — `GroqLLM`, `CerebrasLLM`, `OpenRouterLLM`
-- **Unified param pipeline** — Transport keys (`base_url`, `referer`) never leak into JSON bodies
+- **Unified param pipeline** — Transport keys (`base_url`, `referer`, `account_id`) never leak into JSON bodies
 
 ---
 
@@ -774,19 +805,64 @@ memory.get_var("big_data")  # Returns full 50KB string
 # Or store objects explicitly
 stamp = memory.set_obj(large_binary_data, name="attachment", desc="PDF file")
 memory.get_var("attachment")  # Returns decompressed data
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NATIVE TOOL TRANSCRIPTS — assistant tool_calls + tool results
+# ═══════════════════════════════════════════════════════════════════════════
+
+memory.add_msg(
+    "assistant", "",
+    tool_calls=[{"id": "call_1", "name": "read", "arguments": {"path": "a.py"}}],
+)
+memory.add_msg("tool", '{"lines": 42}', tool_call_id="call_1", name="read")
+
+# Provider-valid OpenAI/OpenRouter/Groq message history (drops internal roles):
+wire_msgs = memory.get_llm_msgs(format="openai")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOKEN BUDGETS & NON-DESTRUCTIVE COMPACTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Trim oldest unpinned turns for the LLM view only (pins system + latest user;
+# never splits an assistant tool_calls message from its tool results):
+window = memory.get_llm_msgs(format="openai", budget_tokens=4000)
+
+# Or write a non-destructive summary event while keeping every original event:
+memory.compact(keep=6)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ZERO-COPY SCOPED VIEWS (`memory.scope`) — multi-party & parallel isolation
+# ═══════════════════════════════════════════════════════════════════════════
+
+alpha = memory.scope(
+    "alpha",
+    read_rooms={"public", "alpha_board"},
+    write_room="alpha_board",
+    public_keys={"deal_target"},
+    export_keys={"final_verdict"},
+)
+# alpha.set_var("bid", 80) writes under "alpha__bid" without copying events
+
+# ═══════════════════════════════════════════════════════════════════════════
+# IDEMPOTENT SUSPEND & RESUME — human approvals and durable checkpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+memory.suspend("approval_required", pending={"call_id": "call_1"})
+memory.is_suspended()                        # True (survives to_json / from_json)
+memory.resolve_suspension({"approve": True}) # resolves once; repeats are no-ops
 ```
 
 **Key features:**
-- **Event-sourced** — Every change is an event with a sortable ID
-- **Full variable history** — See every change with timestamps
-- **Channel tracking** — Build omni-channel agents (web, mobile, Telegram, etc.)
-- **Message metadata** — Tag events and filter views (UI-visible vs internal)
-- **RAG augments** — `add_augment()` + `get_llm_msgs(merge_augments=True)` for optional LLM-view merging
-- **Lifecycle emits** — `emit()` / `get_emits()` for typed JSON-safe run facts alongside prose logs
-- **Tombstone deletion** — History is never lost
-- **Auto-compression** — Large values handled automatically
-- **Multiple export formats** — JSON, Pickle, snapshots for cloud sync
-- **Record/replay substrate** — LLM exchanges store as events; recordings survive JSON round-trips
+- **Event-sourced & causally ordered** — Every change carries a sortable stamp and monotonic `_seq` for sub-millisecond `from_events()` branch merges
+- **Full variable history** — See every change with timestamps and tombstone deletions
+- **Native tool transcripts** — `role="tool"`, assistant `tool_calls`, `tool_call_id`, and `get_llm_msgs(format="openai")`
+- **Context budgets & compaction** — `get_llm_msgs(budget_tokens=...)` and non-destructive `memory.compact(keep=...)`
+- **Zero-copy scopes (`memory.scope`)** — Isolate rooms/channels and `{actor}__{key}` scratchpads on one shared `MEMORY`
+- **Suspend / resume** — JSON-safe `suspend()` / `resolve_suspension()` with idempotent duplicate protection
+- **Channel & metadata filtering** — Build omni-channel agents and separate UI history from internal events
+- **RAG augments & lifecycle emits** — `add_augment()` and typed `emit()` / `get_emits()`
+- **Auto-compression** — Large values (`>10KB`) compressed automatically into `memory.objects`
+- **Record/replay substrate** — Stores `'chat'`, `'embed'`, `'decide'`, and `'tool'` exchanges across JSON round-trips
 
 ---
 
@@ -976,21 +1052,37 @@ thought = THOUGHT(
 # and are forwarded without template substitution on historical content.
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PRODUCTION LANE — opt-in hardening (v0.2.2+, defaults unchanged)
+# PRODUCTION LANE — schema dialect, retry policies, visibility, outcomes
 # ═══════════════════════════════════════════════════════════════════════════
 
 thought = THOUGHT(
-    name="extract_plan",
+    name="triage_ticket",
     llm=llm,
-    prompt="Return JSON for: {task}",
-    parser="json",
-    validation_mode="rescue",   # try repair before failing
-    strict_schema=True,         # enforce schema shape strictly
-    hold_msg=True,              # keep failed assistant msg out of history
-    on_failure=lambda m, err: m.add_log("extract_plan failed: " + str(err)),
+    prompt="Classify support ticket: {ticket}",
+    template_mode="substitute",
+    visibility="internal",      # store result var only; keep out of chat history
+    record_prompt=True,         # save rendered prompt to triage_ticket_prompt
+    parsing_rules={
+        "kind": "json",
+        "format": {
+            "priority": {"enum": ["p1", "p2", "p3"]},
+            "refund_cents": "int|null",
+            "summary": "str",
+        },
+    },
+    validation=[                # pure-JSON declarative rules (survive to_dict!)
+        {"op": "non_empty", "field": "summary"},
+    ],
+    retry={
+        "on": {"length": "double_budget", "http": "backoff"},
+        "fallback_llm": backup_llm,
+    },
     max_retries=2,
 )
-# Failures surface on MEMORY: {name}_last_error, {name}_attempts, failed: true events
+# Every run (success or failure) writes a uniform JSON-safe outcome dict:
+# memory.get_var("triage_ticket_outcome") ->
+# {"ok": True, "error_class": None, "finish_reason": "stop",
+#  "usage": {...}, "attempts": 1, "validation_messages": []}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SERIALIZATION — save and restore thoughts
@@ -1024,17 +1116,13 @@ thought.last_response    # Raw LLM response
 
 **Key features:**
 - **Callable interface** — `memory = thought(memory)` is the entire API
-- **Automatic retry** — With repair prompts that explain what went wrong
-- **Schema-based parsing** — Via `valid_extract` for bulletproof extraction
-- **Multiple validators** — Built-in or custom, via the `validation=` parameter
-- **Token streaming** — `on_token=` hook streams chunks without breaking the contract
-- **Prompt rendering** — `template_mode='substitute'` for JSON-heavy prompts; `include_history=False` for single-turn calls
-- **History via MEMORY** — Prior turns come from `get_llm_msgs()` without mutating stored events
-- **Production lane (opt-in)** — `validation_mode`, `strict_schema`, `hold_msg`, `on_failure`
-- **Structured failure visibility** — `{name}_last_error` and `{name}_attempts` on MEMORY
-- **Four operations** — `llm_call`, `memory_query`, `variable_set`, `conditional`
-- **Pre/post hooks** — Custom processing before and after execution
-- **Full serialization** — Save, restore, and copy thoughts
+- **Uniform `{name}_outcome` telemetry** — Every run records `ok`, `error_class`, `finish_reason`, `usage`, `attempts`, and `validation_messages`
+- **Rich schema dialect** — Type names (`"str"`, `"int"`), pipe unions (`"int|null"`), `{"enum": [...]}`, `oneOf` branches, optional `"key?"`, and automatic first-attempt `Expected format:` hints (`instruct_schema=False` opts out)
+- **Declarative & callable validation** — Pure-JSON rule lists (`in`, `non_empty`, `range`, `regex`, `has_keys`), built-in strings, or Python callables
+- **Smart retry policies** — `retry={"on": {"length": "double_budget", "http": "backoff"}, "fallback_llm": ...}` plus `hold_msg=True` by default so failed drafts never pollute chat history
+- **Visibility & lazy context** — `visibility="internal"|"silent"` skips transcript writes; unreferenced `>10KB` `_obj_ref` blobs in `MEMORY` are never decompressed
+- **Loud template safety** — Missing placeholders or `required_vars` fail before calling the LLM (`TemplateRenderError`, `failure_kind="template"`)
+- **Pure-JSON portability** — `json.dumps(thought.to_dict())` and `THOUGHT.from_dict()` work cleanly with declarative rules and schema types
 
 ---
 
@@ -1229,12 +1317,12 @@ result = memory.get_var("route_request_result")  # "approve", "reject", or "esca
 ```
 
 **Key features:**
-- **Constrained output** — Forces LLM to pick from valid choices
-- **Flexible input** — List for simple choices, dict for choices with descriptions
-- **Smart parsing** — Handles exact matches, embedded choices, and case variations
-- **Higher retry default** — 5 retries vs THOUGHT's 1, since classification often needs correction
-- **Default fallback** — Optional default choice when all retries fail
-- **Inherits from THOUGHT** — Full serialization, hooks, and history support
+- **Works with `LLM` or `DM`** — Pass a generative `LLM` or a System-One `DM("openrouter:typesafe/jev-1.14", key=...)` (`model=` alias supported) with zero downstream code changes
+- **Four decision modes** — Categorical `choices`, binary `choices=bool` (`noul`), ordered `levels=[...]` (`score`), and single-pass `questions={...}` batching
+- **Calibrated uncertainty gating** — `min_confidence=` and `min_margin=` route ambiguous ties to `default=` with full probabilities in `{name}_outcome`
+- **Automatic `state` isolation** — On `DM` calls, `{var}` placeholders are lifted into structured `state` data separate from `instructions`
+- **Smart LLM parsing & retries** — Handles exact, leading, and non-negated embedded matches with choice-specific repair prompts (`max_retries=5`)
+- **Inherits from THOUGHT** — Full JSON serialization, hooks, lifecycle emits, and execution history support
 
 ---
 
@@ -1474,62 +1562,80 @@ weather_tool = TOOL(
     fn=get_weather,
 )
 
-# Pass to an AGENT — the LLM decides when to call it
+# Tools with needs_context=True receive context={'call_id', 'memory', 'agent'}:
+audit_tool = TOOL(
+    name="log_note",
+    description="Save a note to memory.",
+    parameters={"note": {"type": "string"}},
+    fn=lambda note, context=None: context["memory"].set_var("last_note", note) or "ok",
+    needs_context=True,
+)
+
+# Record live tool/MCP outputs and replay offline without external side effects:
+weather_tool.record(memory)
+offline_weather = weather_tool.replay(memory)           # ReplayTOOL (or on_miss="live" for splice)
 ```
 
 ---
 
 ### `MCP` — Model Context Protocol Client
 
-MCP connects to external tool servers using the open [Model Context Protocol](https://modelcontextprotocol.io). It discovers remote tools and returns them as native TOOL instances. Supports **stdio** (local subprocess) and **HTTP+SSE** (remote server) transports.
+MCP connects to external tool servers using the open [Model Context Protocol](https://modelcontextprotocol.io). It discovers remote tools and returns them as native TOOL instances. Supports **stdio** (shell string or `shell=False` argv list) and **HTTP+SSE** (with custom `headers`, `timeout`, and `prefix` namespacing).
 
 ```python
 from thoughtflow import MCP
 
-# Local MCP server via stdio
-with MCP("npx -y @modelcontextprotocol/server-filesystem /tmp") as mcp:
-    tools = mcp.list_tools()    # Returns list of TOOL instances
-    result = mcp.call_tool("read_file", {"path": "/tmp/notes.txt"})
+# Local MCP server via safe argv list (shell=False) with tool prefixing
+with MCP(["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"], prefix="fs__") as mcp:
+    tools = mcp.list_tools()    # Returns TOOL instances (e.g. "fs__read_file")
+    result = mcp.call_tool("read_file", {"path": "/tmp/notes.txt"})  # raises RuntimeError on isError=True
 
-# Remote MCP server via HTTP
-with MCP("https://my-mcp-server.example.com/mcp") as mcp:
+# Remote MCP server via HTTP with custom auth headers and timeout
+with MCP("https://my-mcp-server.example.com/mcp", headers={"Authorization": "Bearer ..."}, timeout=30) as mcp:
     tools = mcp.list_tools()
 ```
 
 ---
 
-### `AGENT` — Autonomous Tool-Use Loop
+### `AGENT` & `tool_loop` — Governed Write-Ahead Autonomy
 
-AGENT is the primitive that turns an LLM into an autonomous agent. It runs the cycle: **call LLM → parse tool requests → execute tools → feed results back → repeat** until the LLM produces a final text response or the iteration limit is reached.
+AGENT turns an LLM into an autonomous tool-using agent. When paired with an OpenAI-compatible `LLM` (`openai`, `openrouter`, `groq`), AGENT runs a **native write-ahead tool loop** over `LLM.chat()`: assistant `tool_calls` are persisted to `MEMORY` before any tool executes, every `tool_call_id` is answered (even when vetoed or over budget), and interrupted or approval-suspended runs resume directly from the transcript without re-executing completed tools. Models without `chat()` automatically use the text-JSON fallback loop.
 
 ```python
-from thoughtflow import LLM, MEMORY, TOOL, AGENT
+from thoughtflow import LLM, MEMORY, TOOL, AGENT, tool_loop
 
 llm = LLM("openai:gpt-4o", key="...")
-tools = [weather_tool]  # TOOL instances
 
 agent = AGENT(
     llm=llm,
-    tools=tools,
-    system_prompt="You are a helpful weather assistant.",
-    max_iterations=10,
-    merge_augments=False,  # set True to fold RAG augments into user messages for the LLM
+    tools=[weather_tool, refund_tool],
+    system_prompt="You are a support specialist.",
+    allow=["get_weather", "issue_refund"],
+    policy={"issue_refund": {"mode": "approve_over", "field": "amount", "limit": 100}},
+    budget={"max_model_calls": 6, "max_tool_calls": 4, "max_tokens": 8000},
+    checkpoint=lambda mem: mem.to_json("checkpoint.json"),
 )
 
 memory = MEMORY()
-memory.add_msg("user", "What's the weather in Paris?")
-memory = agent(memory)  # Autonomous loop runs here
+memory.add_msg("user", "Refund $250 for order #91.")
+memory = agent(memory)
 
-print(memory.last_asst_msg(content_only=True))
+# High-value refund suspends cleanly: memory.get_var("agent_status") == "suspended"
+# Rehydrate later (even in another Lambda invocation) and resume with a decision:
+if memory.is_suspended():
+    memory = agent(memory, decision={"approve": True})
+
+print(memory.get_var("agent_status"))   # "final" | "suspended" | "budget_exhausted" | "vetoed" | ...
+print(memory.get_var("agent_outcome"))  # model_calls, tool_calls, prompt/completion tokens, vetoed
 ```
 
-Subclasses provide different agentic strategies:
+`tool_loop(memory, llm, tools, policy=..., budget=..., decision=...)` provides a one-call functional wrapper over the same governed loop. Subclasses implement specialized strategies:
 
 | Subclass | Strategy |
 |----------|----------|
-| **ReactAgent** | ReAct: interleaved reasoning and acting |
-| **ReflectAgent** | Self-reflective: critiques its own output before finalizing |
-| **PlanActAgent** | Plan-then-execute: generates a plan, then executes it step by step |
+| **ReactAgent** | ReAct: interleaved `Thought:` / `Action:` / `Observation:` text loop (preserves multi-line `Final Answer:` and veto observations) |
+| **ReflectAgent** | Self-reflective: task-aware, negation-safe self-critique and revision synced into `MEMORY` + `{name}_outcome` |
+| **PlanActAgent** | Plan-then-execute: generates a structured plan, then executes steps sequentially |
 
 ---
 
@@ -1561,39 +1667,48 @@ results = delegate.broadcast(memory, "Summarize your findings")
 
 ### `WORKFLOW` — Step-Based Orchestration
 
-WORKFLOW chains steps (THOUGHTs, ACTIONs, AGENTs, or plain functions) into a directed sequence with conditional branching and error handling. It is "Python control flow with guardrails."
+WORKFLOW chains steps (THOUGHTs, DECIDEs, ACTIONs, AGENTs, or plain functions) into a directed sequence with `ok=` outcome predicates, status-based branching, bounded `while_` loops, persisted `{name}_log` state, and durable suspend/resume (`workflow(memory, decision=...)`). It is "Python control flow with guardrails."
 
 ```python
 from thoughtflow import MEMORY, THOUGHT, WORKFLOW
 
 workflow = WORKFLOW(name="research_flow", on_error="skip")
 
-workflow.step(classify_thought, name="classify")
-workflow.step(search_action, condition=lambda m: m.get_var("needs_search"))
-workflow.step(summarize_thought, name="summarize")
+workflow.step(classify_thought, name="classify", ok="auto")  # checks classify_outcome["ok"]
+workflow.branch(None, {"failed": fallback_step, "ok": search_action}, on="previous_failed")
+workflow.while_(
+    condition=lambda m: not m.get_var("draft_ready"),
+    body_fn=refine_thought,
+    max_iterations=4,
+    state_key="refine_result",  # stops early as 'stopped_repeated' if unchanged
+)
+workflow.step(approval_agent, name="publish", ok="auto")
 
 memory = MEMORY()
 memory.add_msg("user", "Tell me about quantum computing")
 memory = workflow(memory)
 
-# Inspect execution
-for entry in workflow.execution_log:
-    print(f"{entry['step']}: {entry['duration_ms']:.0f}ms — {'ok' if entry['success'] else 'error'}")
+# If 'publish' suspended for human approval, rehydrate later and resume in place:
+if memory.is_suspended():
+    memory = workflow(memory, decision={"approve": True})
+
+for entry in memory.get_var("research_flow_log"):
+    print(f"{entry['step']}: {entry['status']}")
 ```
 
 ---
 
 ### `CHRON` — Schedule Manager
 
-CHRON manages recurring jobs with cron expressions or fixed intervals. It supports two execution modes: **tick mode** for serverless environments (Lambda, Cloud Functions) and **loop mode** for long-running daemons. Job state optionally persists to a JSON file.
+CHRON manages recurring jobs with 5-field cron expressions, `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly` aliases, or fixed intervals. It supports two execution modes: **tick mode** for serverless environments (Lambda, Cloud Functions) and **loop mode** for long-running daemons. Job state persists atomically to a JSON file.
 
 ```python
 from thoughtflow import CHRON
 
 chron = CHRON(name="ops", state_file="jobs.json")
 
-# Cron expression: run at 2am daily
-chron.add("nightly_cleanup", schedule="0 2 * * *", action=run_cleanup)
+# Cron expression or @-alias: run daily at midnight
+chron.add("nightly_cleanup", schedule="@daily", action=run_cleanup)
 
 # Fixed interval: every 60 seconds
 chron.add("heartbeat", every=60, action=lambda m: print("alive"))
@@ -1655,6 +1770,40 @@ print(embed.last_error)  # None on success; error string on provider failure
 ```
 
 Supported embedding providers: OpenAI, Gemini, Groq, OpenRouter, and local Ollama (`ollama:all-minilm:33m`, etc.).
+
+### `DM` — Structured Decision Models
+
+`DM` is the System-One decision counterpart to `LLM` and `EMBED`. Instead of generating prose and regex-parsing labels, `DM` sends structured `state` and one or more typed `questions` (`choice`, `noul`, `score`, `box`) to a decision model and returns calibrated probabilities in a single forward pass — normalizing wire dialects across OpenRouter, TypeSafe (Jev), OpenAI (`/v1/decisions`), Liquid (`d1`), Cloudflare (`clef`), Perplexity, Inception, Upstage, local Ollama (`d3`, `clef`), and vLLM:
+
+```python
+from thoughtflow import DM, DECIDE, MEMORY
+
+dm = DM("openrouter:typesafe/jev-1.14", key="sk-or-...")
+
+# Plug straight into DECIDE (1-line swap from LLM)
+router = DECIDE(
+    name="route",
+    model=dm,
+    choices={"billing": "Invoices and charges", "tech": "Crashes and bugs"},
+    prompt="Route this ticket: {last_user_msg}",
+    min_margin=0.60,
+    default="escalate",
+)
+
+# Or evaluate multiple typed questions over shared state in one pass
+res = dm.call(
+    state={"ticket": "Charged twice on invoice #901."},
+    questions={
+        "dept": {"type": "choice", "instructions": "Owner?", "choices": ["billing", "tech"]},
+        "is_refund": {"type": "noul", "instructions": "Asking for money back?"},
+        "urgency": {"type": "score", "instructions": "Urgency?", "levels": ["Low", "Med", "High"]},
+    },
+)
+
+# Deterministic offline replay via MEMORY
+dm.record(memory)
+replay_dm = DM.replay(memory)
+```
 
 ---
 
@@ -1798,6 +1947,9 @@ except ValidExtractError as e:
 - `{"k": schema}` → dict with required key "k"
 - `{"k?": schema}` → dict with optional key "k"
 - `{"oneOf": [schema, ...]}` → first matching branch wins (classification)
+- `"str"`, `"int"`, `"float"`, `"number"`, `"bool"`, `"null"`, `"list"`, `"dict"` → type-name strings
+- `"int|null"`, `"str|number"` → pipe-delimited type unions
+- `{"enum": ["pos", "neg"]}` → constrained literal set (inline or top-level)
 
 ---
 
@@ -2216,7 +2368,7 @@ memory = persistent_mem.load(session_id="abc123")
 
 | Version | Python | Status | Notes |
 |---------|--------|--------|-------|
-| **0.2.x** | 3.9 - 3.13 | 🟢 Active | Current development |
+| **0.3.x** | 3.9 - 3.13 | 🟢 Active | Current development |
 
 **Compatibility Policy:**
 - We test against Python 3.9 through 3.13 on every push (see CI)
@@ -2272,18 +2424,21 @@ harness = Harness([
 ])
 
 # A flow is any `memory -> memory` callable: a THOUGHT, AGENT, WORKFLOW,
-# or plain function. Each case runs in a fresh, isolated MEMORY.
-results = harness.run(my_flow_with(replay_llm))
+# or plain function. Pass strict=True to fail cases whose MEMORY absorbed
+# any THOUGHT/DECIDE/ReplayMissError failure even if a downstream fallback ran.
+results = harness.run(my_flow_with(replay_llm), strict=True)
 
 print(results.summary())
-# {"total": 2, "passed": 2, "failed": 0, "pass_rate": 1.0, "failures": []}
+# {"total": 2, "passed": 2, "failed": 0, "pass_rate": 1.0,
+#  "failures": [], "cases_with_absorbed_errors": []}
 
 for failure in results.failures:
-    print(failure.test_case.name, failure.error, failure.memory)
+    print(failure.test_case.name, failure.reason, failure.absorbed_errors, failure.memory)
 ```
 
-Pair the harness with a replay LLM and your agent test suite is fully
-deterministic: no API keys in CI, no flaky outputs, no spend. The complete
+Pair the harness with `ReplayLLM`, `ReplayDM`, `ReplayEMBED`, and `ReplayTOOL`
+and your entire agent test suite is 100% deterministic: no API keys in CI, no
+external tool side effects, no flaky outputs, and zero spend. The complete
 lifecycle is demonstrated in
 [`examples/scripts/13_record_replay.py`](examples/scripts/13_record_replay.py).
 
@@ -2292,11 +2447,13 @@ Enable with `THOUGHTFLOW_INTEGRATION_TESTS=1` and provider API keys in your envi
 
 ```bash
 THOUGHTFLOW_INTEGRATION_TESTS=1 pytest tests/integration/test_llm_providers.py \
-  tests/integration/test_embed_providers.py -v
+  tests/integration/test_embed_providers.py \
+  tests/integration/test_dm_providers.py -v
 ```
 
 These cover base `LLM` routing, native provider classes (`GroqLLM`, `CerebrasLLM`,
-`OpenRouterLLM`), Ollama, prompt caching, record/replay, and `EMBED` providers.
+`OpenRouterLLM`), Ollama, prompt caching, record/replay, `EMBED` providers, and
+OpenRouter `DM` decision models (`typesafe/jev-1.14`, `liquid/d1.2`).
 Tests skip automatically when a key or account lacks access to a provider.
 
 ---
@@ -2306,38 +2463,43 @@ Tests skip automatically when a key or account lacks access to a provider.
 ```
 thoughtflow/
 ├── src/thoughtflow/
+│   ├── README.md        # Architectural guide to the package internals
 │   ├── __init__.py      # Public API exports
-│   ├── llm.py           # LLM — multi-provider model interface
+│   ├── llm.py           # LLM — multi-provider model interface + ReplayLLM
+│   ├── llm_chat.py      # LLM.chat — structured native tool calls, stream events, abort
 │   ├── llm_params.py    # Unified model-param pipeline (transport vs wire)
 │   ├── llm_cache.py     # Prompt caching helpers (cached_system, etc.)
-│   ├── providers/       # GroqLLM, CerebrasLLM, OpenRouterLLM
-│   ├── embed.py         # EMBED — multi-provider embeddings
-│   ├── memory.py        # MEMORY — event-sourced state container
-│   ├── thought.py       # THOUGHT — atomic cognitive unit
+│   ├── providers/       # GroqLLM, CerebrasLLM, OpenRouterLLM (+ README.md)
+│   ├── embed.py         # EMBED — multi-provider embeddings + ReplayEMBED
+│   ├── dm.py            # DM — multi-provider structured decision models + ReplayDM
+│   ├── memory.py        # MEMORY — event-sourced state, scopes, budgets, suspend/resume
+│   ├── message.py       # Message dataclass & normalization helpers
+│   ├── thought.py       # THOUGHT — atomic cognitive unit + outcomes & retry policies
 │   ├── action.py        # ACTION — external operations base class
-│   ├── tool.py          # TOOL — LLM-selectable capabilities
-│   ├── mcp.py           # MCP — Model Context Protocol client
-│   ├── agent.py         # AGENT — autonomous tool-use loop
+│   ├── tool.py          # TOOL — LLM-selectable capabilities + ReplayTOOL
+│   ├── mcp.py           # MCP — Model Context Protocol client (stdio & HTTP+SSE)
+│   ├── agent.py         # AGENT & tool_loop — governed write-ahead tool loop
 │   ├── delegate.py      # DELEGATE — multi-agent coordination
-│   ├── workflow.py      # WORKFLOW — step-based orchestration
-│   ├── chron.py         # CHRON — schedule manager (cron/interval)
+│   ├── workflow.py      # WORKFLOW — step orchestration, while_, & suspend/resume
+│   ├── chron.py         # CHRON — schedule manager (cron/aliases/interval)
 │   ├── chat.py          # CHAT — interactive conversation loop
 │   ├── _cron_expr.py    # Internal cron expression parser
-│   ├── _util.py         # Utilities (event_stamp, valid_extract, etc.)
-│   ├── thoughts/        # THOUGHT subclasses (DECIDE, PLAN)
-│   ├── actions/         # ACTION subclasses (16 elemental operations)
-│   ├── agents/          # AGENT subclasses (ReactAgent, ReflectAgent, PlanActAgent)
-│   └── eval/            # Evaluation harness (record/replay lives in llm.py/memory.py)
-├── primitives/          # Per-primitive documentation (Markdown) — canonical API reference
-├── examples/            # Working, runnable examples
+│   ├── _util.py         # Utilities (event_stamp, valid_extract, schema dialect, etc.)
+│   ├── thoughts/        # THOUGHT subclasses: DECIDE, PLAN (+ README.md)
+│   ├── actions/         # ACTION subclasses: 14 elemental operations (+ README.md)
+│   ├── agents/          # AGENT subclasses: ReactAgent, ReflectAgent, PlanActAgent (+ README.md)
+│   └── eval/            # Evaluation harness: Harness, TestCase (+ README.md)
+├── primitives/          # Per-primitive documentation (32 Markdown specs + README.md)
+├── examples/            # Working, runnable examples (+ README.md)
 │   ├── scripts/         # Numbered walkthroughs (01_hello_world ... 15_thought_integration_test)
+│   ├── notebooks1/      # Interactive Jupyter notebooks (01_foundations ... 05_persona_example)
 │   ├── reference/       # Copy-and-edit agent loop recipes with focused tests
 │   └── serverless/      # Deployable AWS Lambda chat handler
-├── tests/               # Comprehensive test suite
-│   ├── unit/
-│   └── integration/
-├── docs/                # Documentation source
-├── developer/           # Developer guides
+├── tests/               # Comprehensive test suite (+ README.md)
+│   ├── unit/            # ~980 fast, zero-network unit tests
+│   └── integration/     # Opt-in live provider smoke suites
+├── docs/                # MkDocs documentation site source
+├── developer/           # Contributor & maintainer guides (01 ... 21)
 ├── assets/              # Logo and media
 └── ZEN.md               # Philosophy document
 ```
@@ -2351,17 +2513,17 @@ thoughtflow/
 git clone https://github.com/jrolf/thoughtflow.git
 cd thoughtflow
 
-# Install in development mode with dev tooling (pytest, ruff, mypy)
+# Install in development mode with dev tooling (pytest, ruff)
 pip install -e ".[dev]"
 
-# Run the test suite
-pytest
+# Run the unit test suite
+pytest tests/unit -q
 
 # Run with coverage
 pytest --cov=src/thoughtflow
 
-# Lint the code (bug-catching only, no style enforcement)
-ruff check src/
+# Lint the code (Pyflakes bug-catching only, no style enforcement)
+ruff check src/ tests/
 ```
 
 See [developer/](developer/) for comprehensive development documentation.
@@ -2372,19 +2534,19 @@ See [developer/](developer/) for comprehensive development documentation.
 
 | Aspect | Status | Notes |
 |--------|--------|-------|
-| **Foundational Primitives** | ✅ Stable | LLM, EMBED, MEMORY, THOUGHT, ACTION |
-| **Cognitive / Planning** | ✅ Stable | DECIDE, PLAN |
-| **Capability** | ✅ Stable | TOOL, MCP |
-| **Autonomy** | ✅ Stable | AGENT, ReactAgent, ReflectAgent, PlanActAgent |
+| **Foundational Primitives** | ✅ Stable | LLM (`call` + `chat`), EMBED, DM, MEMORY, THOUGHT, ACTION |
+| **Cognitive / Planning** | ✅ Stable | DECIDE (`LLM` + `DM`, `noul`, `score`, `multi`), PLAN |
+| **Capability** | ✅ Stable | TOOL (`needs_context`, `ReplayTOOL`), MCP (`prefix=`, `shell=False`) |
+| **Autonomy** | ✅ Stable | Governed write-ahead AGENT, `tool_loop`, ReactAgent, ReflectAgent, PlanActAgent |
 | **Coordination** | ✅ Stable | DELEGATE, CHAT |
-| **Orchestration** | ✅ Stable | WORKFLOW, CHRON |
-| **Action Subclasses** | ✅ Stable | 16 elemental operations (SEARCH, SCRAPE, FETCH, etc.) |
-| **Record/Replay** | ✅ Shipped | LLM/EMBED recording, deterministic replay, eval harness |
-| **Lifecycle emits & RAG augments** | ✅ Shipped | `emit()`/`get_emits()`, `add_augment()`/`get_llm_msgs(merge_augments=)` |
-| **Provider convenience classes** | ✅ Shipped (0.2.2) | GroqLLM, CerebrasLLM, OpenRouterLLM, prompt caching |
+| **Orchestration** | ✅ Stable | WORKFLOW (`ok=`, `while_`, suspend/resume), CHRON (`@daily` aliases) |
+| **Action Subclasses** | ✅ Stable | 14 elemental operations (SEARCH, SCRAPE, FETCH, etc.) |
+| **Hermetic Record/Replay** | ✅ Shipped | LLM, EMBED, DM, and TOOL recording + strict eval `Harness` |
+| **Memory Scopes & Compaction** | ✅ Shipped | `memory.scope()`, `budget_tokens=`, `compact()`, `suspend()`/`resolve_suspension()` |
+| **Provider convenience classes** | ✅ Shipped | GroqLLM, CerebrasLLM, OpenRouterLLM, OpenAICompatibleLLM, prompt caching |
 | **API Stability** | 🟡 Alpha | May evolve based on feedback |
-| **Documentation** | ✅ Per-primitive docs | `primitives/` folder with Markdown per class |
-| **Test Coverage** | ✅ ~870 unit tests | Plus optional integration smoke tests (API keys) |
+| **Documentation** | ✅ Multi-level | Root, subpackage READMEs, `primitives/` specs, `docs/`, and `developer/` |
+| **Test Coverage** | ✅ ~984 unit tests | Plus optional live integration smoke tests (API keys) |
 | **Serverless Ready** | ✅ Yes | Zero deps, deployable example in `examples/serverless/` |
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.

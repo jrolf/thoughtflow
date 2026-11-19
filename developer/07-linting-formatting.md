@@ -6,24 +6,18 @@ This guide explains how to format code and fix linting errors using Ruff.
 
 ## Overview
 
-ThoughtFlow uses [Ruff](https://docs.astral.sh/ruff/) for both linting and formatting. Ruff is fast and replaces multiple tools (Black, isort, Flake8, etc.).
+> **Important policy note (v0.1.0+):** ThoughtFlow uses [Ruff](https://docs.astral.sh/ruff/) **strictly as a Pyflakes (`F`) bug-catcher** (`ruff check src/ tests/`), configured in `ruff.toml`. We deliberately **do not run `ruff format` or style/modernization linters** in CI so intentional readable alignment is preserved and diffs stay minimal.
 
 ---
 
 ## Quick Commands
 
 ```bash
-# Format all code
-ruff format src/ tests/
-
-# Check for lint errors
+# Check for bug-level lint errors (CI & pre-commit gate)
 ruff check src/ tests/
 
-# Fix auto-fixable lint errors
+# Fix auto-fixable unused imports
 ruff check --fix src/ tests/
-
-# Check formatting without changing files
-ruff format --check src/ tests/
 ```
 
 ---

@@ -137,7 +137,7 @@ decode_num = EventStamp.decode_num
 # (what is being asked). Excluded from exchange keys so a session recorded
 # against one endpoint replays cleanly against any other.
 TRANSPORT_PARAM_KEYS = frozenset({
-    'base_url', 'extra_headers', 'ollama_url', 'referer', 'title',
+    'account_id', 'base_url', 'extra_headers', 'ollama_url', 'referer', 'title',
 })
 
 
@@ -207,13 +207,18 @@ def substitute_placeholders(text, ctx):
     return pattern.sub(replacer, text)
 
 
+class TemplateRenderError(ValueError):
+    """Raised when a configured prompt template cannot be rendered safely."""
+
+
 def render_template(template, ctx, mode="format"):
     """
     Render a prompt template using the selected template mode.
 
-    ``format`` uses ``str.format(**ctx)`` with the legacy silent fallback that
-    returns the raw template when formatting fails. ``substitute`` replaces
-    only explicit ``{key}`` placeholders for keys present in ``ctx``.
+    ``format`` uses ``str.format(**ctx)`` and raises ``TemplateRenderError`` when
+    formatting fails (missing placeholders, malformed braces, or type/index
+    errors). ``substitute`` replaces only explicit ``{key}`` placeholders for
+    keys present in ``ctx``.
 
     Args:
         template (str): Prompt template string.
@@ -225,6 +230,7 @@ def render_template(template, ctx, mode="format"):
 
     Raises:
         ValueError: When ``mode`` is not ``format`` or ``substitute``.
+        TemplateRenderError: When ``mode`` is ``format`` and ``str.format`` fails.
     """
     if mode not in ("format", "substitute"):
         raise ValueError(
@@ -239,8 +245,10 @@ def render_template(template, ctx, mode="format"):
 
     try:
         return template.format(**ctx)
-    except Exception:
-        return template
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
+        raise TemplateRenderError(
+            "Prompt template could not be rendered: {}".format(exc)
+        ) from exc
 
 
 def construct_prompt(
@@ -248,6 +256,21 @@ def construct_prompt(
     order = [],
     header = '',
     ):
+    """
+    Assemble a multi-section dict prompt into a stamped XML-like prompt string.
+
+    Each section key in ``prompt_obj`` is wrapped with a unique per-call random
+    stamp (``<start section_name a12bc> ... </end section_name a12bc>``) so
+    untrusted content inside a section cannot spoof closing delimiters.
+
+    Args:
+        prompt_obj (dict): Mapping of section names to text blocks.
+        order (list, optional): Explicit ordering of section keys.
+        header (str, optional): Optional preamble text (or ``'default'``).
+
+    Returns:
+        str: Assembled prompt string with stamped section boundaries.
+    """
     if order: sections = list(order) 
     else: sections = [a for a in prompt_obj]
     rnum = str(randint(1,9))
@@ -277,6 +300,23 @@ def construct_msgs(
     sys_prompt = '',
     msgs       = [],
     ):
+    """
+    Build an LLM-ready message list from optional system prompt, history, and user prompt.
+
+    Prepends ``sys_prompt`` as ``role='system'``, preserves middle ``msgs``
+    (converting dict prompts via ``construct_prompt``), appends ``usr_prompt``
+    as ``role='user'``, and applies literal key replacements from ``vars`` on a
+    shallow copy of each message dict so caller lists are not mutated in place.
+
+    Args:
+        usr_prompt (str | dict): Final user prompt text or section dict.
+        vars (dict): Optional literal placeholder replacements (e.g. ``{'{k}': 'v'}``).
+        sys_prompt (str | dict): Optional system prompt text or section dict.
+        msgs (list[dict]): Prior conversation messages.
+
+    Returns:
+        list[dict]: Ordered list of ``{'role', 'content', ...}`` message dicts.
+    """
     if sys_prompt:
         if type(sys_prompt)==dict:
             sys_prompt = construct_prompt(sys_prompt) 
@@ -287,14 +327,6 @@ def construct_msgs(
             usr_prompt = construct_prompt(usr_prompt) 
         m = {'role':'user','content':usr_prompt} 
         msgs.append(m) 
-    #msgs2 = [] 
-    #for m in msgs:
-    #    m_copy = m.copy()
-    #    if isinstance(m_copy, dict) and 'content' in m_copy and isinstance(m_copy['content'], str):
-    #        for k, v in vars.items():
-    #            m_copy['content'] = m_copy['content'].replace(k, str(v))
-    #    msgs2.append(m_copy) 
-    #return msgs2
     msgs2 = []
     for m in msgs:
         m_copy = dict(m)
@@ -405,6 +437,12 @@ def valid_extract(raw_text: str, parsing_rules: Mapping[str, Any]) -> Any:
             humanize_schema_error("Validation failed for candidate: {}".format(msg), schema)
         )
 
+    # Bare-word answers for a top-level enum (e.g. reply was just: positive).
+    if _is_enum_schema(schema):
+        bare = str(raw_text).strip().strip("`\"'.").strip()
+        if bare in list(schema["enum"]):
+            return bare
+
     # If we got here, nothing parsed+validated.
     if last_err:
         raise ValidExtractError(str(last_err))
@@ -469,6 +507,42 @@ def _parse_segment(segment: str, kind: str = "python") -> Any:
 
     raise ValidExtractError("Unsupported kind: {!r}".format(kind))
 
+_TYPE_NAMES = {
+    "str": str, "string": str,
+    "int": int, "integer": int,
+    "float": float, "number": (int, float),
+    "bool": bool, "boolean": bool,
+    "null": type(None), "none": type(None),
+    "list": list, "array": list,
+    "dict": dict, "object": dict,
+}
+
+
+def _is_enum_schema(schema: Any) -> bool:
+    """Return True for the ``{"enum": [...]}`` literal-set dialect."""
+    return isinstance(schema, dict) and set(schema.keys()) == {"enum"} and isinstance(schema["enum"], (list, tuple))
+
+
+def _typename_union(schema: Any) -> Optional[Tuple[type, ...]]:
+    """
+    Parse a type-name string such as ``"int"`` or ``"str|null"``.
+
+    Returns a flat tuple of Python types when every pipe-separated part is a
+    known type name, else None (so ordinary exemplar strings like ``'hello'``
+    keep their old meaning: any str).
+    """
+    if not isinstance(schema, str) or not schema.strip():
+        return None
+    parts = [part.strip().lower() for part in schema.split("|")]
+    types: list = []
+    for part in parts:
+        if part not in _TYPE_NAMES:
+            return None
+        mapped = _TYPE_NAMES[part]
+        types.extend(mapped if isinstance(mapped, tuple) else (mapped,))
+    return tuple(types)
+
+
 def _is_oneof_schema(schema: Any) -> bool:
     """Return True when schema uses the optional oneOf dialect."""
     return isinstance(schema, dict) and "oneOf" in schema and isinstance(schema["oneOf"], list)
@@ -485,6 +559,8 @@ def _delims_for_schema(schema: Any) -> Tuple[Optional[str], Optional[str]]:
     """
     if _is_oneof_schema(schema):
         return "{", "}"
+    if _is_enum_schema(schema):
+        return None, None
     # list
     if isinstance(schema, list):
         return "[", "]"
@@ -589,13 +665,19 @@ def format_schema_annotation(schema: Any) -> str:
         for i, branch in enumerate(schema["oneOf"]):
             branches.append("branch {}: {}".format(i, format_schema_annotation(branch)))
         return "oneOf [{}]".format("; ".join(branches))
+    if _is_enum_schema(schema):
+        return "one of {}".format(list(schema["enum"]))
+    if _typename_union(schema) is not None:
+        return str(schema)
     if isinstance(schema, dict):
         parts = []
         for key, subschema in schema.items():
             base_key, optional = _is_optional_key(key)
             label = base_key + ("?" if optional else "")
             t = _schema_type(subschema)
-            if t is not None and t not in (list, dict, tuple):
+            if _is_enum_schema(subschema) or _typename_union(subschema) is not None:
+                parts.append("{}: {}".format(label, format_schema_annotation(subschema)))
+            elif t is not None and t not in (list, dict, tuple):
                 parts.append("{}: {}".format(label, t.__name__))
             elif isinstance(subschema, dict):
                 parts.append("{}: {{...}}".format(label))
@@ -636,7 +718,7 @@ def humanize_schema_error(message: str, schema: Any = None) -> str:
     Returns:
         str: Human-oriented message suitable for logs and repair suffixes.
     """
-    text = message
+    text = re.sub(r" at 0x[0-9a-fA-F]+", "", message)
     if text.startswith("$."):
         text = text[2:]
     elif text.startswith("$:"):
@@ -646,7 +728,7 @@ def humanize_schema_error(message: str, schema: Any = None) -> str:
     text = re.sub(r"^([^:]+): expected null, got dict", r"Field '\1' must be null but received an object. If the field is optional, use a '?' suffix on the key (e.g. '\1?') or omit it from the format dict. A bare None exemplar means the value must be null, not that the field is optional.", text)
     text = re.sub(r"^([^:]+): expected null, got (\w+)", r"Field '\1' must be null but got \2", text)
 
-    if "missing required key" in text:
+    if "missing required key" in text and "Mark optional keys" not in text:
         key_match = re.search(r"missing required key '([^']+)'", text)
         if key_match:
             key = key_match.group(1)
@@ -655,7 +737,7 @@ def humanize_schema_error(message: str, schema: Any = None) -> str:
                 "(e.g. '{}?'). {}".format(key, key, text)
             )
 
-    if schema is not None:
+    if schema is not None and "Expected schema:" not in text:
         text = "{}. Expected schema: {}".format(text, format_schema_annotation(schema))
 
     return text
@@ -789,6 +871,21 @@ def _validate_schema(obj: Any, schema: Any, path: str = "$") -> Tuple[bool, str]
                 return True, "ok"
             errors.append("branch {}: {}".format(i, msg))
         return False, "no oneOf branch matched ({})".format("; ".join(errors))
+
+    # Literal-set dialect: {"enum": ["a", "b"]}
+    if _is_enum_schema(schema):
+        if obj in list(schema["enum"]):
+            return True, "ok"
+        return False, "{}: expected one of {!r}, got {!r}".format(path, list(schema["enum"]), obj)
+
+    # Type-name strings and pipe unions: "int", "str|null"
+    union = _typename_union(schema)
+    if union is not None:
+        if isinstance(obj, bool) and bool not in union:
+            return False, "{}: expected {}, got bool".format(path, schema)
+        if isinstance(obj, union):
+            return True, "ok"
+        return False, "{}: expected {}, got {}".format(path, schema, type(obj).__name__)
 
     # 1) Primitive types via exemplar or type
     t = _schema_type(schema)

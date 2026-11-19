@@ -33,7 +33,27 @@ from thoughtflow._util import (
     estimate_size,
     is_obj_ref,
     truncate_content,
+    TemplateRenderError,
+    render_template,
 )
+
+
+def test_render_template_reports_missing_placeholder():
+    with pytest.raises(TemplateRenderError, match="'goal'"):
+        render_template("Plan for {goal}", {})
+
+
+def test_render_template_reports_malformed_brace():
+    with pytest.raises(TemplateRenderError):
+        render_template("Plan for {goal", {"goal": "x"})
+
+
+def test_render_template_reports_type_error_and_exports_exception():
+    from thoughtflow import TemplateRenderError as PublicTemplateRenderError
+
+    assert PublicTemplateRenderError is TemplateRenderError
+    with pytest.raises(TemplateRenderError):
+        render_template("First: {items[0]}", {"items": 123})
 
 
 # ============================================================================
@@ -888,3 +908,16 @@ class TestVarDeleted:
         """
         assert '<DELETED>' in repr(VAR_DELETED)
         assert '<DELETED>' in str(VAR_DELETED)
+
+
+def test_humanize_schema_error_strips_runtime_heap_addresses():
+    """humanize_schema_error must scrub 'at 0x...' object addresses so repair prompts replay deterministically."""
+    from thoughtflow._util import humanize_schema_error
+
+    raw = "malformed node or string on line 1: <ast.Name object at 0x108300e50>"
+    cleaned = humanize_schema_error(raw, {"count": 0})
+
+    assert "0x108300e50" not in cleaned
+    assert "<ast.Name object>" in cleaned
+    assert "Expected schema: {count: int}" in cleaned
+

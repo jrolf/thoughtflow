@@ -8,6 +8,8 @@ cycle continues until the critique passes or max revisions are exhausted.
 
 from __future__ import annotations
 
+import re
+
 from thoughtflow.agent import AGENT
 
 
@@ -46,7 +48,15 @@ class ReflectAgent(AGENT):
         "Review the following response and identify any issues with accuracy, "
         "completeness, clarity, or quality. If the response is good, say "
         "'APPROVED'. If it needs improvement, explain what should be changed.\n\n"
+        "Task:\n{task}\n\n"
         "Response to review:\n{response}"
+    )
+
+    # Phrases that mean "do not approve" even when they contain an approval word.
+    REJECT_SIGNALS = (
+        "not approved", "do not approve", "don't approve", "cannot approve",
+        "can't approve", "not approve", "needs improvement", "need improvement",
+        "needs revision", "revise", "not good", "unacceptable",
     )
 
     def __init__(self, critique_prompt=None, max_revisions=2, **kwargs):
@@ -55,7 +65,9 @@ class ReflectAgent(AGENT):
 
         Args:
             critique_prompt (str, optional): Prompt for the self-critique step.
-                Must contain {response} placeholder. Uses a sensible default.
+                May contain ``{response}`` (required in practice), ``{task}`` (the
+                latest user message), and ``{system_prompt}``. Prompts that only
+                use ``{response}`` keep working. Uses a sensible default.
             max_revisions (int): Max critique/revision cycles. Defaults to 2.
             **kwargs: All other arguments passed to AGENT.__init__.
         """
@@ -63,21 +75,30 @@ class ReflectAgent(AGENT):
         self.critique_prompt = critique_prompt or self.DEFAULT_CRITIQUE_PROMPT
         self.max_revisions = max_revisions
         self.revision_history = []
+        self.final_critique = None
 
-    def __call__(self, memory):
+    def __call__(self, memory, decision=None):
         """
         Run the REFLECT loop: generate, critique, revise.
 
         Args:
             memory: A MEMORY instance.
+            decision (dict, optional): Forwarded to the base loop to resume a
+                suspended native tool run.
 
         Returns:
             MEMORY: Updated memory with the (possibly revised) response.
         """
         self.revision_history = []
+        self.final_critique = None
 
         # Step 1: Generate initial response using the base agent loop
-        memory = super().__call__(memory)
+        memory = super().__call__(memory, decision=decision)
+
+        if hasattr(memory, "is_suspended") and memory.is_suspended():
+            return memory
+
+        task = self._task_text(memory)
 
         # Get the initial response
         result_key = "{}_result".format(self.name)
@@ -89,8 +110,9 @@ class ReflectAgent(AGENT):
             return memory
 
         # Step 2: Critique and revise loop
+        approved = False
         for revision_num in range(self.max_revisions):
-            critique = self._critique(current_response)
+            critique = self._critique(current_response, task)
 
             self.revision_history.append({
                 "revision": revision_num + 1,
@@ -99,6 +121,7 @@ class ReflectAgent(AGENT):
             })
 
             if self._should_approve(critique):
+                approved = True
                 break
 
             # Revise based on the critique
@@ -110,10 +133,36 @@ class ReflectAgent(AGENT):
                     result_key, current_response,
                     desc="Revised response (revision {})".format(revision_num + 1)
                 )
+            if hasattr(memory, "add_msg"):
+                memory.add_msg("assistant", current_response)
+
+        # Final verification: when revisions ran out, judge the last revision
+        # so the outcome says whether the delivered answer was ever approved.
+        if not approved and len(self.revision_history) > 0 and self.max_revisions > 0:
+            critique = self._critique(current_response, task)
+            approved = self._should_approve(critique)
+            self.final_critique = critique
+
+        if hasattr(memory, "set_var"):
+            outcome = dict(memory.get_var("{}_outcome".format(self.name)) or {})
+            outcome["approved"] = approved
+            outcome["revisions"] = len(self.revision_history)
+            outcome["final_critique"] = self.final_critique
+            memory.set_var(
+                "{}_outcome".format(self.name), outcome,
+                desc="Structured outcome for agent: {}".format(self.name),
+            )
 
         return memory
 
-    def _critique(self, response):
+    @staticmethod
+    def _task_text(memory):
+        """The latest user message, used to tell the critic what was asked."""
+        if hasattr(memory, "last_user_msg"):
+            return memory.last_user_msg(content_only=True) or ""
+        return ""
+
+    def _critique(self, response, task=""):
         """
         Run the self-critique step on a response.
 
@@ -121,11 +170,18 @@ class ReflectAgent(AGENT):
 
         Args:
             response (str): The response to critique.
+            task (str): The user's request the response is answering.
 
         Returns:
             str: The critique text.
         """
-        prompt = self.critique_prompt.format(response=response)
+        prompt = self.critique_prompt
+        for token, value in (
+            ("{task}", task),
+            ("{system_prompt}", self.system_prompt or ""),
+            ("{response}", response),
+        ):
+            prompt = prompt.replace(token, value)
         messages = [{"role": "user", "content": prompt}]
         result = self.llm.call(messages)
         return result[0] if result else ""
@@ -143,8 +199,13 @@ class ReflectAgent(AGENT):
             bool: True if the response is approved.
         """
         critique_lower = critique.lower().strip()
-        approval_signals = ["approved", "looks good", "no issues", "no changes needed"]
-        return any(signal in critique_lower for signal in approval_signals)
+        if any(signal in critique_lower for signal in self.REJECT_SIGNALS):
+            return False
+        # Word boundaries keep "unapproved" and "disapproved" from counting.
+        return re.search(
+            r"\bapproved\b|\blooks good\b|\bno issues\b|\bno changes needed\b",
+            critique_lower,
+        ) is not None
 
     def _revise(self, memory, current_response, critique):
         """

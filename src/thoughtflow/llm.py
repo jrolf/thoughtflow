@@ -18,6 +18,7 @@ trace machinery is needed: the memory IS the recording.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.request
 import urllib.error
@@ -36,6 +37,21 @@ from thoughtflow.llm_cache import (
     strip_cache_markers,
     format_anthropic_system,
 )
+from thoughtflow.llm_chat import (
+    CHAT_SERVICES,
+    ChatError,
+    build_chat_payload,
+    build_message,
+    chat_endpoint,
+    feed_stream_chunk,
+    finish_stream_state,
+    iter_stream_chunks,
+    message_to_events,
+    new_stream_state,
+    open_chat_request,
+    read_chat_response,
+    shutdown_connection,
+)
 
 
 class ReplayMissError(KeyError):
@@ -48,9 +64,9 @@ class ReplayMissError(KeyError):
 PROVIDER_ROLE_MAP = {
     "openai":     {"action": "tool",      "result": "tool"},
     "groq":       {"action": "tool",      "result": "tool"},
-    "anthropic":  {"action": "assistant", "result": "assistant"},
+    "anthropic":  {"action": "assistant", "result": "assistant", "tool": "user"},
     "ollama":     {"action": "tool",      "result": "tool"},
-    "gemini":     {"action": "model",     "result": "model",
+    "gemini":     {"action": "model",     "result": "model",     "tool": "user",
                    "assistant": "model",  "system": "user"},
     "openrouter": {"action": "tool",      "result": "tool"},
 }
@@ -106,7 +122,20 @@ class LLM:
             Helper function to send HTTP requests to the specified URL with data and headers.
     """
     def __init__(self, model_id='', key='API_KEY', secret='API_SECRET', **kwargs):
-        # Parse model ID and initialize service and model name
+        """
+        Initialize an LLM client with a ``service:model`` identifier, credentials, and defaults.
+
+        Args:
+            model_id (str): Provider and model slug (e.g. ``'openai:gpt-4o'``,
+                ``'anthropic:claude-3-5-sonnet-20241022'``, ``'ollama:llama3.2'``).
+            key (str): Provider API key (not required for local ``ollama``).
+            secret (str): Optional secondary credential.
+            **kwargs: Reserved client options (``request_timeout=120``, ``on_usage``,
+                ``record``, ``allow_reasoning_fallback=False``), transport options
+                (``base_url``, ``extra_headers``, ``referer``, ``title``, ``ollama_url``),
+                and default wire model parameters (``temperature``, ``max_tokens``, etc.).
+        """
+        # Parse model ID on the first colon so local tags like "ollama:mistral:7b" survive intact
         if ':' not in model_id: model_id = 'openai:gpt-4-turbo'
         
         service, model = model_id.split(':', 1)
@@ -118,8 +147,10 @@ class LLM:
         self.default_params = {}
         self.last_error = None
         self.last_usage = None
-        self.request_timeout = None
+        self.last_finish_reason = None
+        self.request_timeout = 120
         self.on_usage = None
+        self.allow_reasoning_fallback = False
 
         # Reserved client keys — never stored in default_params or sent on wire
         self._record_memory = kwargs.pop('record', None)
@@ -127,6 +158,8 @@ class LLM:
             self.request_timeout = kwargs.pop('request_timeout')
         if 'on_usage' in kwargs:
             self.on_usage = kwargs.pop('on_usage')
+        if 'allow_reasoning_fallback' in kwargs:
+            self.allow_reasoning_fallback = bool(kwargs.pop('allow_reasoning_fallback'))
 
         # Model + transport kwargs (transport split out at call time via split_call_params)
         for k, v in kwargs.items():
@@ -242,7 +275,15 @@ class LLM:
             if isinstance(m, dict):
                 role = m.get("role", "user")
                 content = m.get("content", "")
+                if content is None:
+                    content = ""
                 entry = {"role": role, "content": content}
+                if m.get("tool_calls"):
+                    entry["tool_calls"] = list(m["tool_calls"])
+                if m.get("tool_call_id"):
+                    entry["tool_call_id"] = m["tool_call_id"]
+                if m.get("name"):
+                    entry["name"] = m["name"]
                 if m.get("cache"):
                     entry["cache"] = True
                 norm.append(entry)
@@ -303,14 +344,17 @@ class LLM:
         mapped = self._prepare_messages(msg_list)
         return apply_cache_markers(mapped, self.service)
 
-    @staticmethod
-    def _extract_message_text(message):
+    def _extract_message_text(self, message, allow_reasoning=None):
         """
-        Prefer message content; fall back to reasoning when content is empty.
+        Extract user-visible assistant content from a provider message dict.
 
-        Several OpenAI-compatible hosts (Cerebras gpt-oss, etc.) place the
-        user-visible answer in message.reasoning when max_tokens is tight.
+        By default, chain-of-thought ``reasoning`` / ``reasoning_content`` is NOT
+        returned when ``content`` is empty so truncated replies do not masquerade
+        as valid answers. Set ``allow_reasoning_fallback=True`` on the LLM (or
+        per call) when targeting hosts that place final answers in ``reasoning``.
         """
+        if allow_reasoning is None:
+            allow_reasoning = self.allow_reasoning_fallback
         if not isinstance(message, dict):
             return str(message or "").strip()
         content = message.get("content")
@@ -321,8 +365,25 @@ class LLM:
                     return text
             else:
                 return str(content).strip()
-        reasoning = str(message.get("reasoning") or "").strip()
-        return reasoning
+        if allow_reasoning:
+            reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+            return str(reasoning).strip()
+        return ""
+
+    @staticmethod
+    def _normalize_finish_reason(raw_reason):
+        """Map provider-specific stop reasons onto canonical strings."""
+        if not raw_reason:
+            return None
+        r = str(raw_reason)
+        low = r.lower()
+        if low in ("end_turn", "stop_sequence", "stop"):
+            return "stop"
+        if low in ("max_tokens", "max_output_tokens", "length"):
+            return "length"
+        if low in ("tool_use", "tool_calls", "function_call"):
+            return "tool_calls"
+        return low
 
     def _resolve_openai_transport(self, transport):
         """
@@ -389,7 +450,23 @@ class LLM:
         """
         merged = merge_call_params(self.default_params, params)
         self.last_params = dict(merged)
+        allow_reasoning = merged.pop("allow_reasoning_fallback", self.allow_reasoning_fallback)
         wire_params, transport = split_call_params(merged)
+        self.last_finish_reason = None
+
+        requested_n = wire_params.get("n")
+        if requested_n is not None:
+            if isinstance(requested_n, bool) or not isinstance(requested_n, int) or requested_n < 1:
+                raise ValueError("Parameter 'n' must be a positive integer, got {!r}.".format(requested_n))
+            if requested_n > 1:
+                if stream:
+                    raise ValueError("Streaming does not support params={'n': > 1}.")
+                if self.service in ("anthropic", "ollama", "groq"):
+                    raise ValueError(
+                        "Service '{}' does not support multiple completions (n={}).".format(
+                            self.service, requested_n
+                        )
+                    )
 
         # Compute the exchange signature up front (params are mutated by the
         # provider methods) so recording sees the canonical request.
@@ -404,6 +481,7 @@ class LLM:
             return gen
 
         call_params = dict(wire_params)
+        call_params["_allow_reasoning_fallback"] = bool(allow_reasoning)
         if output_schema:
             call_params['_output_schema'] = output_schema
 
@@ -426,9 +504,174 @@ class LLM:
             self._record_exchange(key, request, choices)
         return choices
 
+    # ------------------------------------------------------------------
+    # Structured chat (see thoughtflow/llm_chat.py for the full contract)
+    # ------------------------------------------------------------------
+
+    def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
+        """
+        Structured chat completion: native tool calls, separate reasoning, usage.
+
+        ``call`` returns a list of strings. ``chat`` returns the whole assistant
+        message as one dict, which is what an agent loop needs. Messages are
+        OpenAI-format dicts passed through verbatim (assistant ``tool_calls`` and
+        ``tool`` results included), and ``tools`` is the OpenAI function-calling
+        list (``TOOL.to_schema()`` produces one entry).
+
+        Args:
+            messages (list[dict]): OpenAI-format messages.
+            tools (list[dict], optional): Tool declarations.
+            params (dict, optional): Per-call model and transport params, merged
+                over the constructor defaults exactly like ``call``.
+            stream (bool): If True, return a generator of event dicts that ends
+                with a ``done`` event carrying the final message.
+            cancel (threading.Event, optional): Set it from another thread to
+                abort. The socket is shut down at once. A stream ends with a
+                ``done`` event whose ``finish_reason`` is ``"aborted"``; a
+                non-streaming call returns an aborted message.
+
+        Returns:
+            dict or generator: The message dict (``stream=False``) or the event
+            generator (``stream=True``). See ``thoughtflow.llm_chat``.
+
+        Raises:
+            ValueError: Service not supported by ``chat``.
+            ChatError: Failed request. ``retryable`` says whether to try again.
+
+        Example:
+            >>> message = llm.chat([{"role": "user", "content": "Read a.py"}], tools=[tool.to_schema()])
+            >>> message["tool_calls"][0]["name"]
+            'read'
+        """
+        if self.service not in CHAT_SERVICES:
+            raise ValueError(
+                "LLM.chat supports the openai, openrouter and groq services, not '{}'.".format(self.service)
+            )
+        merged = merge_call_params(self.default_params, params or {})
+        self.last_params = dict(merged)
+        wire_params, transport = split_call_params(merged)
+
+        key = request = None
+        if self._record_memory is not None:
+            key, request = self._chat_signature(messages, tools, merged)
+
+        url, headers = chat_endpoint(self.service, self.api_key, transport)
+        payload = build_chat_payload(self.model, messages, tools, wire_params, stream)
+        body = json.dumps(payload).encode("utf-8")
+
+        if stream:
+            events = self._chat_stream(url, headers, body, cancel)
+            if key is not None:
+                return self._record_chat_stream(events, key, request)
+            return events
+        message = self._chat_once(url, headers, body, cancel)
+        if key is not None:
+            self._record_chat_message(key, request, message)
+        return message
+
+    def _chat_signature(self, messages, tools, merged):
+        """Canonical (key, request) pair for a structured chat exchange."""
+        clean_params = {k: v for k, v in merged.items() if k not in TRANSPORT_PARAM_KEYS}
+        request = {"chat": True, "messages": messages, "tools": tools, "params": clean_params}
+        return exchange_key(self.service, self.model, request), request
+
+    def _record_chat_message(self, key, request, message):
+        """Record one structured exchange; the response is ``[message]``."""
+        self._record_memory.add_exchange(
+            kind='chat', key=key, service=self.service, model=self.model,
+            request=request, response=[message],
+        )
+
+    def _record_chat_stream(self, events, key, request):
+        """Pass events through and record the final message when ``done`` arrives."""
+        for event in events:
+            if event["type"] == "done":
+                self._record_chat_message(key, request, event["message"])
+            yield event
+
+    def _note_chat_message(self, message):
+        """Update ``last_error``, ``last_usage``, ``last_finish_reason`` and fire ``on_usage`` after a chat."""
+        self.last_error = None
+        self.last_usage = message.get("usage")
+        self.last_finish_reason = message.get("finish_reason")
+        if self.on_usage and callable(self.on_usage) and self.last_usage:
+            self.on_usage(self.last_usage)
+
+    def _chat_once(self, url, headers, body, cancel):
+        """One non-streaming chat request. Returns the message dict."""
+        try:
+            connection, response, finished = open_chat_request(
+                url, headers, body, self.request_timeout, cancel)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            self.last_usage = None
+            if exc.status == "aborted":
+                return build_message(self.service, self.model, "", "", [], "aborted", None)
+            raise
+        try:
+            message = read_chat_response(self.service, self.model, response)
+        except (OSError, http.client.HTTPException) as exc:
+            if cancel is not None and cancel.is_set():
+                return build_message(self.service, self.model, "", "", [], "aborted", None)
+            self.last_error = str(exc)[:500]
+            raise ChatError("Network error: {}".format(exc), retryable=True)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            raise
+        finally:
+            finished.set()
+            shutdown_connection(connection)
+        self._note_chat_message(message)
+        return message
+
+    def _chat_stream(self, url, headers, body, cancel):
+        """Generator behind ``chat(stream=True)``. Yields events, ends with ``done``."""
+        state = new_stream_state()
+        try:
+            connection, response, finished = open_chat_request(
+                url, headers, body, self.request_timeout, cancel)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            if exc.status == "aborted":
+                yield {"type": "done", "message": finish_stream_state(self.service, self.model, state, aborted=True)}
+                return
+            raise
+        aborted = False
+        try:
+            for chunk in iter_stream_chunks(response):
+                for event in feed_stream_chunk(state, chunk):
+                    yield event
+                if cancel is not None and cancel.is_set():
+                    aborted = True
+                    break
+        except (OSError, http.client.HTTPException) as exc:
+            if cancel is not None and cancel.is_set():
+                aborted = True
+            else:
+                self.last_error = str(exc)[:500]
+                raise ChatError("Network error: {}".format(exc), retryable=True)
+        except ChatError as exc:
+            self.last_error = str(exc)[:500]
+            raise
+        finally:
+            finished.set()
+            shutdown_connection(connection)
+        if cancel is not None and cancel.is_set():
+            aborted = True
+        empty = not state["content"] and not state["reasoning"] and not state["tool_calls"]
+        if empty and not aborted and state["finish_reason"] is None:
+            self.last_error = "Stream ended with no content"
+            raise ChatError("Stream ended with no content", retryable=True)
+        message = finish_stream_state(self.service, self.model, state, aborted=aborted)
+        if message["finish_reason"] is None:
+            message["finish_reason"] = "tool_calls" if message["tool_calls"] else "stop"
+        self._note_chat_message(message)
+        yield {"type": "done", "message": message}
+
     def _call_openai(self, msg_list, params, transport=None):
         url, headers, is_local = self._resolve_openai_transport(transport)
         output_schema = params.pop('_output_schema', None)
+        allow_reasoning = params.pop('_allow_reasoning_fallback', self.allow_reasoning_fallback)
 
         messages = self._prepare_messages_for_provider(msg_list)
         if output_schema and is_local:
@@ -451,9 +694,14 @@ class LLM:
 
         data = json.dumps(payload).encode("utf-8")
         res = self._send_request(url, data, headers)
+        raw_choices = res.get("choices", [])
+        if raw_choices:
+            self.last_finish_reason = self._normalize_finish_reason(
+                raw_choices[0].get("finish_reason")
+            )
         choices = [
-            self._extract_message_text(a.get("message", {}))
-            for a in res.get("choices", [])
+            self._extract_message_text(a.get("message", {}), allow_reasoning=allow_reasoning)
+            for a in raw_choices
         ]
         return choices
 
@@ -461,6 +709,7 @@ class LLM:
         url = "https://api.groq.com/openai/v1/chat/completions"
 
         output_schema = params.pop('_output_schema', None)
+        allow_reasoning = params.pop('_allow_reasoning_fallback', self.allow_reasoning_fallback)
         payload = {
             "model": self.model,
             "messages": self._prepare_messages_for_provider(msg_list),
@@ -483,9 +732,14 @@ class LLM:
             "User-Agent": "Groq/Python 0.9.0",
         }
         res = self._send_request(url, data, headers)
+        raw_choices = res.get("choices", [])
+        if raw_choices:
+            self.last_finish_reason = self._normalize_finish_reason(
+                raw_choices[0].get("finish_reason")
+            )
         choices = [
-            self._extract_message_text(a.get("message", {}))
-            for a in res.get("choices", [])
+            self._extract_message_text(a.get("message", {}), allow_reasoning=allow_reasoning)
+            for a in raw_choices
         ]
         return choices
 
@@ -511,6 +765,7 @@ class LLM:
         url = "https://api.anthropic.com/v1/messages"
 
         output_schema = params.pop('_output_schema', None)
+        params.pop('_allow_reasoning_fallback', None)
         system_parts, system_messages, messages = self._split_system_messages(msg_list)
         messages = apply_cache_markers(messages, "anthropic")
 
@@ -547,6 +802,7 @@ class LLM:
             "Content-Type": "application/json",
         }
         res = self._send_request(url, data, headers)
+        self.last_finish_reason = self._normalize_finish_reason(res.get("stop_reason"))
 
         # When structured output is used, the response is in tool_use blocks
         if output_schema:
@@ -568,6 +824,7 @@ class LLM:
         """
         call_params = dict(params)
         call_params.pop('_output_schema', None)
+        call_params.pop('_allow_reasoning_fallback', None)
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
         gemini_msgs = []
         for m in self._prepare_messages_for_provider(msg_list):
@@ -584,8 +841,13 @@ class LLM:
             "Content-Type": "application/json",
         }
         res = self._send_request(url, data, headers)
+        candidates = res.get("candidates", [])
+        if candidates:
+            self.last_finish_reason = self._normalize_finish_reason(
+                candidates[0].get("finishReason")
+            )
         choices = []
-        for cand in res.get("candidates", []):
+        for cand in candidates:
             parts = cand.get("content", {}).get("parts", [])
             text = "".join([p.get("text", "") for p in parts])
             choices.append(text)
@@ -599,6 +861,7 @@ class LLM:
         """
         transport = transport or {}
         output_schema = params.pop('_output_schema', None)
+        allow_reasoning = params.pop('_allow_reasoning_fallback', self.allow_reasoning_fallback)
         url = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": self.model,
@@ -622,9 +885,14 @@ class LLM:
             "X-Title": transport.get("title", "ThoughtFlow"),
         }
         res = self._send_request(url, data, headers)
+        raw_choices = res.get("choices", [])
+        if raw_choices:
+            self.last_finish_reason = self._normalize_finish_reason(
+                raw_choices[0].get("finish_reason")
+            )
         choices = [
-            self._extract_message_text(a.get("message", {}))
-            for a in res.get("choices", [])
+            self._extract_message_text(a.get("message", {}), allow_reasoning=allow_reasoning)
+            for a in raw_choices
         ]
         return choices
 
@@ -634,6 +902,7 @@ class LLM:
         Expects no authentication. Ollama messages format is like OpenAI's.
         """
         output_schema = params.pop('_output_schema', None)
+        params.pop('_allow_reasoning_fallback', None)
         base_url = params.get("ollama_url", "http://localhost:11434")
         url = base_url.rstrip('/') + "/api/chat"
         payload = {
@@ -677,6 +946,7 @@ class LLM:
             choices = [_message_to_choice(a["message"]) for a in res.get("choices", [])]
         elif "message" in res:
             # single result
+            self.last_finish_reason = self._normalize_finish_reason(res.get("done_reason") or ("stop" if res.get("done") else None))
             choices = [_message_to_choice(res["message"])]
         elif "response" in res:
             # streaming/fallback
@@ -804,6 +1074,9 @@ class LLM:
                     if content:
                         yield content
                     if chunk.get("done"):
+                        self.last_finish_reason = self._normalize_finish_reason(
+                            chunk.get("done_reason") or "stop"
+                        )
                         break
             else:
                 # OpenAI-compatible SSE format
@@ -818,7 +1091,12 @@ class LLM:
                         chunk = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    choice0 = chunk.get("choices", [{}])[0] if chunk.get("choices") else {}
+                    if choice0.get("finish_reason"):
+                        self.last_finish_reason = self._normalize_finish_reason(
+                            choice0.get("finish_reason")
+                        )
+                    delta = choice0.get("delta", {})
                     content = delta.get("content", "")
                     if content:
                         yield content
@@ -884,9 +1162,8 @@ class LLM:
                 return parsed
 
         except urllib.error.HTTPError as e:
-            error_msg = e.read().decode("utf-8")
-            print("HTTP Error:", error_msg)
-            self.last_error = error_msg[:500]
+            error_msg = e.read().decode("utf-8", errors="replace")
+            self.last_error = (error_msg or "HTTP {}".format(e.code))[:500]
             self.last_usage = None
             try:
                 return {"error": json.loads(error_msg) if error_msg else "Unknown HTTP error"}
@@ -992,6 +1269,8 @@ class ReplayLLM(LLM):
         idx = min(self._cursor[key], len(recorded) - 1)
         self._cursor[key] += 1
         choices = list(recorded[idx])
+        self.last_error = None
+        self.last_finish_reason = "stop"
 
         if stream:
             def _single_yield():
@@ -999,6 +1278,36 @@ class ReplayLLM(LLM):
                     yield text
             return _single_yield()
         return choices
+
+
+    def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
+        """
+        Serve a recorded structured chat exchange (see ``LLM.chat``).
+
+        Matches by content hash of (messages, tools, params). With ``stream=True``
+        the recorded message is replayed as the events a live stream produces,
+        so streaming consumers run unchanged against recordings.
+        """
+        merged = merge_call_params(self.default_params, params or {})
+        self.last_params = dict(merged)
+        key, _request = self._chat_signature(messages, tools, merged)
+        recorded = self._responses.get(key)
+        if recorded is None:
+            if self.on_miss == 'raise' or self.on_miss is None:
+                raise ReplayMissError(
+                    "No recorded chat response for this request (key={}). The flow "
+                    "has drifted from the recording. Re-record the session, or "
+                    "construct the ReplayLLM with on_miss=<live LLM> to fall "
+                    "back.".format(key)
+                )
+            return self.on_miss.chat(messages, tools=tools, params=params, stream=stream, cancel=cancel)
+        idx = min(self._cursor[key], len(recorded) - 1)
+        self._cursor[key] += 1
+        message = recorded[idx][0]
+        self._note_chat_message(message)
+        if stream:
+            return iter(message_to_events(message))
+        return message
 
 
 class OpenAICompatibleLLM(LLM):
@@ -1020,6 +1329,7 @@ class OpenAICompatibleLLM(LLM):
     """
 
     def __init__(self, model, base_url, key="dummy", **kwargs):
+        """Initialize an OpenAI-compatible client pointed at ``base_url``."""
         super().__init__(
             model_id="openai:{}".format(model),
             key=key,

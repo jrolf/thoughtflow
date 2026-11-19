@@ -14,7 +14,11 @@ TOOL wraps a callable with metadata: name, description, and parameters. Paramete
 
 When called with an arguments dict, TOOL unpacks it as keyword arguments and invokes the wrapped function. Execution is tracked: `execution_count`, `execution_history`, `last_result`, and `last_error` are updated on each call. Unlike ACTION, TOOL does not catch exceptions; it re-raises them for the agent loop to handle.
 
-`from_action(action)` bridges ACTION to TOOL. It wraps the ACTION's function, passing `None` for the memory argument (ACTION fns expect `memory, **kwargs`; TOOL fns receive only `**kwargs` from the LLM). The agent loop is responsible for memory integration if needed. TOOL supports `to_dict()` and `from_dict()` for serialization; the function itself cannot be serialized, so a function registry is required for reconstruction.
+`from_action(action)` bridges ACTION to TOOL. The resulting TOOL declares `needs_context=True`, so when an agent loop calls `tool(arguments, context={'memory': memory, ...})` the ACTION's function receives that memory (it receives `None` when the tool is called directly).
+
+`TOOL(..., needs_context=True)` makes `fn` receive a `context` keyword argument: AGENT passes `{'call_id', 'memory', 'agent'}`. Context never appears in the schema or in the record/replay signature, and `to_dict()` / `from_dict()` preserve the flag. TOOL supports `to_dict()` and `from_dict()` for serialization; the function itself cannot be serialized, so a function registry is required for reconstruction.
+
+`tool.record(memory)` and `tool.replay(memory, on_miss='raise')` (`ReplayTOOL`, plus `TOOL.replay_all(tools, memory)`) mirror `LLM` and `EMBED` record/replay: each tool invocation is deep-copied and recorded as a `kind='tool'` exchange in `MEMORY` (automatically compressing payloads above `memory.object_threshold` into `memory.objects`), allowing offline tests to replay stateful tool outputs without touching external systems or mutating cached replay state. Pass `on_miss='live'` for time-travel splice debugging where recorded prefix calls replay offline and diverged calls fall through to the live tool.
 
 ## Inputs & Configuration
 
@@ -70,5 +74,4 @@ TOOL is the schema layer for LLM tool use. AGENT consumes TOOL instances, format
 
 - Add adapter methods for provider-specific schema formats (Anthropic, Gemini) if they diverge from OpenAI.
 - Consider structured error handling (e.g., tool-specific error types) for richer agent loop behavior.
-- Evaluate whether `from_action()` should support passing memory at execution time for ACTIONs that need it.
 - Document function registry patterns for `from_dict()` in multi-process or distributed settings.

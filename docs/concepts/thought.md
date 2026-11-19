@@ -31,10 +31,12 @@ Template rendering and history inclusion are separate opt-in controls on THOUGHT
 
 | Flag | Default | Behavior |
 |------|---------|----------|
-| `template_mode='format'` | yes | Render configured prompts with `str.format(**ctx)`; legacy silent fallback on format errors |
+| `template_mode='format'` | yes | Render configured prompts with `str.format(**ctx)`; raises `TemplateRenderError` (`failure_kind='template'`) before calling the LLM if placeholders are missing or braces are malformed |
 | `template_mode='substitute'` | no | Replace only `{key}` placeholders for keys present in context; leave literal JSON braces and unknown placeholders untouched |
-| `include_history=True` | yes | Forward prior turns from `MEMORY.get_llm_msgs()` without rewriting their content |
+| `include_history=True` | yes | Forward prior turns from `MEMORY.get_llm_msgs()` without rewriting their content (automatically deduplicating the latest user message when the template references `{last_user_msg}`) |
 | `include_history=False` | no | Send only configured system prompt plus one rendered user prompt |
+| `visibility='public'` | yes | Write the final assistant reply to `MEMORY` (`'internal'` and `'silent'` store `{name}_result` without writing to the chat transcript) |
+| `record_prompt=False` | yes | When `True`, save the rendered prompt string to `{name}_prompt` |
 
 Historical message content is never template-substituted. Both user and system prompt strings use the selected rendering mode. Dict-shaped prompts retain their legacy unrendered sections in format mode; substitute mode renders each string section before assembly. MEMORY variables enter template context as their latest values rather than internal event histories. `include_history=False` disables automatic history messages, but explicit placeholders such as `{messages}` or `{last_user_msg}` can still place MEMORY content in the configured prompt. JSON-heavy prompts should use `template_mode='substitute'`.
 
@@ -89,13 +91,17 @@ When the model picks one of several answer shapes (found vs absent, continue vs 
 
 Flat `format` dicts remain first-class. `oneOf` is opt-in vocabulary for classification-style thoughts.
 
+### Type-name strings, pipe unions, and `enum` literals
+
+Inside `parsing_rules["format"]`, strings naming known types (`"str"`, `"int"`, `"float"`, `"number"`, `"bool"`, `"null"`, `"list"`, `"dict"`), pipe-separated unions (`"int|null"`), and `{"enum": ["pos", "neg"]}` literals are supported natively alongside exemplar values (`"Ada"` still means any `str`). On Attempt 1, `THOUGHT` appends `Expected format: ...` so the model sees the target shape upfront (`instruct_schema=False` opts out).
+
 ---
 
 ## Validation
 
-### Built-in strings
+### Built-in strings & declarative JSON rule lists
 
-`validation='any'`, `'has_keys:k1,k2'`, `'list_min_len:N'`, `'summary_v1'`. The config alias `validator=` behaves identically.
+`validation=` (alias `validator=`) accepts built-in strings (`'any'`, `'has_keys:k1,k2'`, `'list_min_len:N'`, `'summary_v1'`), callables, or pure-JSON declarative rule lists (`in`, `non_empty`, `range`, `regex`, `has_keys`) that survive `json.dumps(thought.to_dict())` without a function registry.
 
 ### Callable validators
 
@@ -126,12 +132,14 @@ Every failed parse or validation attempt writes a structured JSON event to MEMOR
 {"event": "thought_failure", "thought_name": "locator", "attempt": 1, "failure_kind": "schema", "reason": "..."}
 ```
 
-`failure_kind` is one of: `schema`, `validation`, `extract`, `contract`, `exception`.
+`failure_kind` / `error_class` is one of: `template`, `length`, `empty`, `http`, `replay_miss`, `schema`, `validation`, `extract`, `contract`, `exception` (plus `refusal` on `DECIDE`).
 
-MEMORY also receives:
+MEMORY receives on **every** run (success or failure):
 
-- `{name}_last_error` — dict with `reason`, `failure_kind`, and full `attempts` list
-- `{name}_attempts` — integer count for the current run
+- `{name}_outcome` — uniform dict (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`, plus `used_fallback_llm` when applicable)
+- `{name}_attempts` — total integer attempts executed
+- `{name}_last_error` — dict with `reason`, `failure_kind`, and full `attempts` list (written when any attempt fails)
+- `thought_completed` / `thought_failed` — typed `MEMORY.emit()` lifecycle events
 
 Optional production hook:
 
@@ -152,9 +160,11 @@ When validation or parsing fails, THOUGHT appends a **repair suffix** to the pro
 
 For dict-shaped prompts, `repair_target='section_key'` controls which section receives repair text (default: last key).
 
-### `hold_msg` — clean MEMORY on retries
+### `hold_msg` and smart `retry` policies
 
-By default (`hold_msg=False`), failed attempts still write assistant messages to MEMORY — backward-compatible with earlier ThoughtFlow behavior. Set `hold_msg=True` to hold the assistant turn until parse+validate succeed, so retry pollution does not reach downstream context staging.
+`hold_msg` defaults to `True` so failed or rejected attempts never pollute conversation history (pass `hold_msg=False` if you explicitly want failed drafts stored as assistant messages).
+
+Opt-in `retry={"on": {"length": "double_budget", "http": "backoff"}, "backoff_base": 0.5, "max_backoff": 8.0, "fallback_llm": backup_llm}` doubles `max_tokens` when `finish_reason == "length"`, applies exponential backoff on transport/HTTP failures, and runs one final rescue attempt on `fallback_llm` after primary exhaustion.
 
 ---
 

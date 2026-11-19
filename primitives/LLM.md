@@ -25,7 +25,7 @@ Record/replay exchange keys use messages with cache markers stripped — semanti
 | `model_id` | `service:model` format |
 | `key` | API key |
 | `secret` | Optional API secret |
-| `request_timeout` | Opt-in socket timeout in seconds (default None = blocking) |
+| `request_timeout` | Socket timeout in seconds (default 120; pass `None` for no timeout) |
 | `on_usage` | Optional callback `fn(record)` after successful calls with usage |
 | `record` | Optional MEMORY to record exchanges into |
 | `**kwargs` | Default model + transport params (see buckets below) |
@@ -67,6 +67,9 @@ Anthropic: transforms to `cache_control: {type: ephemeral}`. OpenAI-compatible: 
 | `last_params` | Full merged default + per-call params |
 | `last_error` | str or None — API/transport failure |
 | `last_usage` | Normalized usage dict or None |
+| `last_finish_reason` | Canonical stop reason (`stop`, `length`, `tool_calls`, etc.) or None |
+
+By default, `LLM.call()` does not fall back to `message.reasoning` when `content` is empty so truncated reasoning traces do not pass as valid answers. Pass `allow_reasoning_fallback=True` when targeting a server that intentionally places final answers in `reasoning`.
 
 ### Native provider classes
 
@@ -109,6 +112,35 @@ from thoughtflow import CerebrasLLM
 
 llm = CerebrasLLM("gpt-oss-120b", key=CEREBRAS_KEY, reasoning_effort="low")
 ```
+
+## Structured chat (`LLM.chat`)
+
+`call` returns strings. `chat` returns the whole assistant message, which is what an agent loop needs: native tool calls, reasoning kept apart from the answer, `finish_reason`, and usage.
+
+```python
+message = llm.chat(
+    [{"role": "user", "content": "Read a.py"}],
+    tools=[tool.to_schema()],
+)
+message["tool_calls"][0]["name"]       # "read"
+message["tool_calls"][0]["arguments"]  # {"path": "a.py"}, already parsed
+message["finish_reason"]               # "tool_calls"
+message["usage"]                       # normalized, includes provider "cost" when reported
+```
+
+Streaming and abort:
+
+```python
+import threading
+cancel = threading.Event()
+for event in llm.chat(messages, tools=tools, stream=True, cancel=cancel):
+    if event["type"] == "text_delta":
+        print(event["delta"], end="")
+    elif event["type"] == "done":
+        message = event["message"]   # finish_reason is "aborted" if cancel was set
+```
+
+A tool call whose arguments are not valid JSON keeps `arguments` as `{}`, preserves `raw_arguments`, and sets `arguments_error`; the caller decides what to do. Failures raise `ChatError` (`status`, `body`, `retryable`). Supported services: `openai` (any `base_url`), `openrouter`, `groq`. HTTP uses `http.client`, so environment proxy variables are not honored. See `src/thoughtflow/llm_chat.py` for the full contract.
 
 ## Relationship to Other Primitives
 

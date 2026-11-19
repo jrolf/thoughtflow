@@ -21,6 +21,7 @@ LLM_RESERVED_KEYS = frozenset({
     "record",
     "request_timeout",
     "on_usage",
+    "allow_reasoning_fallback",
 })
 
 # OpenAI-compatible services pass wire params through unchanged.
@@ -99,10 +100,16 @@ def normalize_usage(response, service, model):
         "model": model,
     }
 
-    prompt_details = usage.get("prompt_tokens_details") or {}
+    prompt_details = (
+        usage.get("prompt_tokens_details")
+        or usage.get("input_tokens_details")
+        or {}
+    )
     cached = prompt_details.get("cached_tokens")
     if cached:
         record["cached_tokens"] = cached
+    if prompt_details.get("cache_write_tokens"):
+        record["cache_write_tokens"] = prompt_details["cache_write_tokens"]
 
     if usage.get("cache_read_input_tokens"):
         record["cache_read_input_tokens"] = usage["cache_read_input_tokens"]
@@ -113,6 +120,9 @@ def normalize_usage(response, service, model):
     reasoning = completion_details.get("reasoning_tokens")
     if reasoning:
         record["reasoning_tokens"] = reasoning
+
+    if "cost" in usage and usage["cost"] is not None:
+        record["cost"] = usage["cost"]
 
     return record
 
@@ -137,6 +147,8 @@ def build_gemini_generation_config(wire_params):
         generation_config["temperature"] = wire_params.pop("temperature")
     if "top_p" in wire_params:
         generation_config["topP"] = wire_params.pop("top_p")
+    if "n" in wire_params:
+        generation_config["candidateCount"] = wire_params.pop("n")
     return generation_config
 
 

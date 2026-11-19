@@ -361,6 +361,50 @@ class TestReactAgent:
         system_msg = llm.calls[0]['msgs'][0]['content']
         assert "echo" in system_msg.lower()
 
+    def test_react_preserves_multiline_final_answer(self):
+        """Issue #25: ReactAgent must keep lines after the first in Final Answer."""
+        multiline = (
+            "Thought: Ready.\n"
+            "Final Answer: Line one\n"
+            "- bullet a\n"
+            "- bullet b"
+        )
+        llm = MockLLM(responses=[multiline])
+        agent = ReactAgent(llm=llm, name="react_ml")
+        memory = MEMORY()
+        memory.add_msg("user", "List two bullets")
+        memory = agent(memory)
+
+        expected = "Line one\n- bullet a\n- bullet b"
+        assert memory.get_var("react_ml_result") == expected
+        assert memory.last_asst_msg(content_only=True) == expected
+
+    def test_react_reports_vetoed_tool_observation_to_model(self):
+        """Issue #25: vetoed tool calls must append an Observation so the model adapts."""
+        step1 = (
+            "Thought: Try echo.\n"
+            "Action: echo\n"
+            'Action Input: {"text": "secret"}'
+        )
+        step2 = "Thought: Tool was blocked.\nFinal Answer: Cannot run echo."
+        llm = MockLLM(responses=[step1, step2])
+        agent = ReactAgent(
+            llm=llm,
+            tools=[make_echo_tool()],
+            name="react_veto",
+            on_tool_call=lambda name, args: False,
+        )
+        memory = MEMORY()
+        memory.add_msg("user", "Run echo")
+        memory = agent(memory)
+
+        assert memory.get_var("react_veto_result") == "Cannot run echo."
+        second_call_msgs = llm.calls[1]["msgs"]
+        assert any(
+            "blocked by policy" in m.get("content", "")
+            for m in second_call_msgs
+        )
+
 
 # ============================================================================
 # ReflectAgent Tests
@@ -517,3 +561,347 @@ class TestAgentRepr:
         """PlanActAgent __str__ must identify itself."""
         agent = PlanActAgent(llm=MockLLM(), name="planact")
         assert "PlanActAgent" in str(agent)
+
+
+# ============================================================================
+# Native, governed, write-ahead tool loop (#22, #43) and ReflectAgent (#23)
+# ============================================================================
+
+import pytest  # noqa: E402
+
+from thoughtflow import tool_loop  # noqa: E402
+
+
+class ChatScript:
+    """Scripted ``llm.chat``: each step is a dict message; records every request."""
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.requests = []
+
+    def chat(self, messages, tools=None, params=None, stream=False, cancel=None):
+        self.requests.append({"messages": [dict(m) for m in messages], "tools": tools})
+        step = self.steps[min(len(self.requests), len(self.steps)) - 1]
+        return dict(step)
+
+
+def calls_msg(*calls, usage=None):
+    """Assistant message asking for tool calls: each call is (id, name, arguments)."""
+    return {
+        "content": "",
+        "tool_calls": [
+            {"id": cid, "name": name, "arguments": args,
+             "raw_arguments": json.dumps(args), "arguments_error": None}
+            for cid, name, args in calls
+        ],
+        "finish_reason": "tool_calls",
+        "usage": usage or {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+
+def final_msg(text):
+    return {"content": text, "tool_calls": [], "finish_reason": "stop",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+
+
+def make_counting_tool(name="refund", log=None):
+    log = log if log is not None else []
+
+    def fn(amount=0):
+        log.append(amount)
+        return {"refunded": amount}
+
+    tool = TOOL(name, "Refund money", {"amount": {"type": "number"}}, fn)
+    return tool, log
+
+
+def user_memory(text="Refund me"):
+    memory = MEMORY()
+    memory.add_msg("user", text)
+    return memory
+
+
+class TestNativeToolLoop:
+    def test_runs_tool_and_finishes_with_valid_transcript(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 5})), final_msg("Done")])
+        memory = AGENT(llm=llm, tools=[tool], name="a")(user_memory())
+        assert log == [5]
+        assert memory.get_var("a_status") == "final"
+        assert memory.get_var("a_result") == "Done"
+        roles = [m["role"] for m in memory.get_msgs(include=["user", "assistant", "tool"])]
+        assert roles == ["user", "assistant", "tool", "assistant"]
+        second = llm.requests[1]["messages"]
+        assert second[-1]["role"] == "tool" and second[-1]["tool_call_id"] == "c1"
+        assert second[-2]["tool_calls"][0]["function"]["name"] == "refund"
+
+    def test_write_ahead_and_checkpoint_order(self):
+        seen = []
+
+        def checkpoint(mem):
+            seen.append([m["role"] for m in mem.get_msgs(include=["assistant", "tool"])])
+
+        tool, _ = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 1})), final_msg("ok")])
+        AGENT(llm=llm, tools=[tool], checkpoint=checkpoint)(user_memory())
+        assert seen[0] == ["assistant"]
+        assert seen[1] == ["assistant", "tool"]
+
+    def test_crash_mid_tools_resumes_without_rerunning_answered_calls(self):
+        tool, log = make_counting_tool()
+        memory = user_memory()
+        memory.add_msg("assistant", "", tool_calls=[
+            {"id": "c1", "name": "refund", "arguments": {"amount": 1}},
+            {"id": "c2", "name": "refund", "arguments": {"amount": 2}},
+        ])
+        memory.add_msg("tool", "{}", tool_call_id="c1", name="refund")
+        llm = ChatScript([final_msg("done")])
+        AGENT(llm=llm, tools=[tool], name="r")(memory)
+        assert log == [2]
+
+    def test_unknown_tool_allow_list_and_bad_arguments_get_answers(self):
+        tool, log = make_counting_tool()
+        bad = calls_msg(("c3", "refund", {}))
+        bad["tool_calls"][0]["arguments_error"] = "bad json"
+        llm = ChatScript([
+            calls_msg(("c1", "ghost", {}), ("c2", "refund", {"amount": 1})),
+            bad,
+            final_msg("ok"),
+        ])
+        memory = AGENT(llm=llm, tools=[tool], allow=["other"], name="g")(user_memory())
+        answers = {m["tool_call_id"]: m["content"] for m in memory.get_msgs(include=["tool"])}
+        assert set(answers) == {"c1", "c2", "c3"}
+        assert "not available" in answers["c1"] and "not available" in answers["c2"]
+        assert "invalid arguments" in answers["c3"]
+        assert log == []
+
+    def test_max_iterations_status(self):
+        tool, _ = make_counting_tool()
+        # Id-less calls get fresh ids each turn, so the loop keeps asking for tools.
+        step = calls_msg(("x", "refund", {"amount": 1}))
+        step["tool_calls"][0]["id"] = ""
+        llm = ChatScript([step])
+        memory = AGENT(llm=llm, tools=[tool], max_iterations=2, name="m")(user_memory())
+        assert memory.get_var("m_status") == "max_iterations"
+
+
+class TestGovernance:
+    def test_deny_policy_answers_call_and_model_recovers(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 9})), final_msg("sorry")])
+        memory = AGENT(llm=llm, tools=[tool], policy={"refund": "deny"}, name="d")(user_memory())
+        assert log == []
+        assert memory.get_msgs(include=["tool"])[0]["content"].startswith("Denied")
+        assert memory.get_var("d_outcome")["vetoed"] == 1
+        assert memory.get_var("d_status") == "final"
+
+    def test_halting_deny_ends_as_vetoed(self):
+        tool, _ = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {}), ("c2", "refund", {}))])
+        memory = AGENT(
+            llm=llm, tools=[tool], name="h",
+            policy={"refund": {"mode": "deny", "halt": True}},
+        )(user_memory())
+        assert memory.get_var("h_status") == "vetoed"
+        assert {m["tool_call_id"] for m in memory.get_msgs(include=["tool"])} == {"c1", "c2"}
+
+    def test_approve_over_suspends_then_resumes_after_rehydrate(self):
+        tool, log = make_counting_tool()
+        policy = {"refund": {"mode": "approve_over", "field": "amount", "limit": 100}}
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 500})), final_msg("Refunded")])
+        memory = AGENT(llm=llm, tools=[tool], policy=policy, name="s")(user_memory())
+        assert memory.get_var("s_status") == "suspended"
+        assert memory.is_suspended() and log == []
+
+        restored = MEMORY.from_json(memory.to_json())
+        agent = AGENT(llm=llm, tools=[tool], policy=policy, name="s")
+        assert agent(restored).get_var("s_status") == "suspended"  # no decision: still waiting
+        restored = agent(restored, decision={"approve": True})
+        assert log == [500]
+        assert restored.get_var("s_status") == "final"
+        assert not restored.is_suspended()
+
+    def test_small_amount_runs_without_approval(self):
+        tool, log = make_counting_tool()
+        policy = {"refund": {"mode": "approve_over", "field": "amount", "limit": 100}}
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 5})), final_msg("ok")])
+        AGENT(llm=llm, tools=[tool], policy=policy, name="p")(user_memory())
+        assert log == [5]
+
+    def test_rejected_approval_answers_call_without_running(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 1})), final_msg("understood")])
+        agent = AGENT(llm=llm, tools=[tool], policy={"refund": "approve"}, name="r")
+        memory = agent(user_memory())
+        memory = agent(memory, decision={"approve": False})
+        assert log == []
+        assert memory.get_msgs(include=["tool"])[0]["content"].startswith("Denied")
+        assert memory.get_var("r_status") == "final"
+
+    def test_duplicate_decision_does_not_double_execute(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 1})), final_msg("ok")])
+        agent = AGENT(llm=llm, tools=[tool], policy={"refund": "approve"}, name="i")
+        memory = agent(user_memory())
+        agent(memory, decision={"approve": True})
+        agent(memory, decision={"approve": True})
+        assert log == [1]
+
+    def test_tool_budget_answers_every_call_and_stops(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 1}), ("c2", "refund", {"amount": 2}))])
+        memory = AGENT(llm=llm, tools=[tool], budget={"max_tool_calls": 1}, name="b")(user_memory())
+        assert log == [1]
+        assert memory.get_var("b_status") == "budget_exhausted"
+        assert {m["tool_call_id"] for m in memory.get_msgs(include=["tool"])} == {"c1", "c2"}
+
+    def test_model_call_budget(self):
+        tool, _ = make_counting_tool()
+        step = calls_msg(("x", "refund", {"amount": 1}))
+        step["tool_calls"][0]["id"] = ""
+        memory = AGENT(
+            llm=ChatScript([step]), tools=[tool], budget={"max_model_calls": 2}, name="mb"
+        )(user_memory())
+        assert memory.get_var("mb_status") == "budget_exhausted"
+        assert memory.get_var("mb_outcome")["model_calls"] == 2
+
+    def test_token_budget_stops_at_limit(self):
+        tool, _ = make_counting_tool()
+        step = calls_msg(("x", "refund", {"amount": 1}), usage={"prompt_tokens": 40, "completion_tokens": 10})
+        step["tool_calls"][0]["id"] = ""
+        memory = AGENT(
+            llm=ChatScript([step]), tools=[tool], budget={"max_tokens": 100}, name="tb"
+        )(user_memory())
+        assert memory.get_var("tb_status") == "budget_exhausted"
+        assert memory.get_var("tb_outcome")["model_calls"] == 2
+
+    def test_counters_survive_resolved_suspension_then_interrupted_run(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 1})), final_msg("ok")])
+        agent = AGENT(llm=llm, tools=[tool], policy={"refund": "approve"}, name="cs")
+        memory = agent(user_memory())
+        memory.resolve_suspension({"approve": True})  # resolved, then the process died
+        assert memory.get_var("cs_outcome")["status"] == "suspended"
+        memory = agent(memory, decision={"approve": True})
+        assert log == [1]
+        assert memory.get_var("cs_outcome")["model_calls"] == 2
+
+    def test_wire_format_pending_calls_resume(self):
+        tool, log = make_counting_tool()
+        memory = user_memory()
+        memory.add_msg("assistant", "", tool_calls=[{
+            "id": "w1", "type": "function",
+            "function": {"name": "refund", "arguments": "{\"amount\": 7}"},
+        }])
+        AGENT(llm=ChatScript([final_msg("done")]), tools=[tool], name="wf")(memory)
+        assert log == [7]
+
+    def test_governance_without_chat_is_rejected(self):
+        with pytest.raises(ValueError):
+            AGENT(llm=MockLLM(), policy={"x": "deny"})(user_memory())
+
+    def test_tool_loop_helper_delegates(self):
+        tool, log = make_counting_tool()
+        llm = ChatScript([calls_msg(("c1", "refund", {"amount": 3})), final_msg("ok")])
+        memory = tool_loop(user_memory(), llm, [tool], name="t")
+        assert log == [3] and memory.get_var("t_status") == "final"
+
+    def test_text_protocol_still_default_for_call_only_llms(self):
+        llm = MockLLM(responses=["plain answer"])
+        memory = AGENT(llm=llm, name="legacy")(user_memory("hi"))
+        assert memory.get_var("legacy_result") == "plain answer"
+
+
+class TestToolContext:
+    def test_needs_context_tool_receives_call_context(self):
+        seen = {}
+
+        def fn(path, context=None):
+            seen.update(context)
+            return "ok"
+
+        tool = TOOL("read", "Read", {"path": {"type": "string"}}, fn, needs_context=True)
+        llm = ChatScript([calls_msg(("c9", "read", {"path": "a"})), final_msg("done")])
+        memory = AGENT(llm=llm, tools=[tool], name="cx")(user_memory())
+        assert seen["call_id"] == "c9" and seen["memory"] is memory
+        assert "context" not in json.dumps(tool.to_schema())
+
+    def test_direct_call_passes_none_context(self):
+        tool = TOOL("t", "T", {}, lambda context=None: context, needs_context=True)
+        assert tool({}) is None
+
+    def test_from_action_receives_memory(self):
+        from thoughtflow import ACTION
+
+        action = ACTION(name="note", fn=lambda memory, text="": memory.add_log(text) or "logged")
+        tool = TOOL.from_action(action, parameters={"text": {"type": "string"}})
+        memory = MEMORY()
+        assert tool({"text": "hi"}, context={"memory": memory}) == "logged"
+        assert any("hi" in log["content"] for log in memory.get_logs())
+
+    def test_needs_context_round_trips_to_dict(self):
+        tool = TOOL("t", "T", {}, lambda context=None: 1, needs_context=True)
+        data = tool.to_dict()
+        clone = TOOL.from_dict(data, {data["fn_name"]: tool.fn})
+        assert clone.needs_context is True
+
+
+class TestReflectFixes:
+    def test_critic_sees_task_and_negation_is_not_approval(self):
+        llm = MockLLM(responses=["Draft.", "This is not approved: too vague.", "Better.", "APPROVED"])
+        agent = ReflectAgent(llm=llm, name="rf", max_revisions=2)
+        memory = user_memory("Explain gravity")
+        memory = agent(memory)
+        assert "Explain gravity" in llm.calls[1]["msgs"][0]["content"]
+        assert memory.get_var("rf_result") == "Better."
+        assert memory.last_asst_msg(content_only=True) == "Better."
+        assert memory.get_var("rf_outcome")["approved"] is True
+
+    def test_custom_prompt_with_only_response_still_works(self):
+        llm = MockLLM(responses=["Draft.", "APPROVED"])
+        agent = ReflectAgent(llm=llm, critique_prompt="Judge: {response}", name="rc")
+        agent(user_memory("q"))
+        assert llm.calls[1]["msgs"][0]["content"] == "Judge: Draft."
+
+    def test_final_verification_recorded_when_revisions_exhausted(self):
+        llm = MockLLM(responses=["Draft.", "needs improvement", "Second.", "APPROVED"])
+        agent = ReflectAgent(llm=llm, name="fv", max_revisions=1)
+        memory = agent(user_memory("q"))
+        outcome = memory.get_var("fv_outcome")
+        assert outcome["approved"] is True and outcome["revisions"] == 1
+        assert len(agent.revision_history) == 1
+
+    def test_should_approve_negation_safe(self):
+        agent = ReflectAgent(llm=MockLLM(), name="n")
+        assert agent._should_approve("APPROVED")
+        assert not agent._should_approve("Not approved yet")
+        assert not agent._should_approve("I cannot approve this; revise it")
+        assert agent._should_approve("Looks good to me")
+        assert not agent._should_approve("This is unapproved")
+        assert not agent._should_approve("Disapproved.")
+
+
+class TestProtocolAutoUnsupportedService:
+    def test_llm_with_unsupported_service_uses_text_loop(self):
+        class AnthropicLike:
+            service = "anthropic"
+            model = "m"
+
+            def chat(self, *args, **kwargs):
+                raise ValueError("LLM.chat supports the openai, openrouter and groq services")
+
+            def call(self, msgs, params=None):
+                return ["plain text answer"]
+
+        memory = AGENT(llm=AnthropicLike(), name="an")(user_memory("hi"))
+        assert memory.get_var("an_result") == "plain text answer"
+
+    def test_governance_with_unsupported_service_is_rejected(self):
+        class OllamaLike:
+            service = "ollama"
+
+            def chat(self, *args, **kwargs):
+                raise ValueError("unsupported")
+
+        with pytest.raises(ValueError):
+            AGENT(llm=OllamaLike(), policy={"x": "deny"})(user_memory())

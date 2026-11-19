@@ -88,7 +88,25 @@ search_tool = TOOL.from_action(
 )
 ```
 
-One subtlety: ACTION functions receive `(memory, **kwargs)`, but a TOOL's function receives only the keyword arguments the LLM generated. `from_action()` bridges this by passing `None` for the memory argument — the agent loop owns memory integration, not the tool. If your ACTION function genuinely needs the memory, keep it as an ACTION and call it from your own code.
+`TOOL.from_action()` marks the resulting `TOOL` with `needs_context=True`. When an `AGENT` loop invokes the tool (`tool(arguments, context={"call_id": ..., "memory": memory, "agent": agent})`), the underlying `ACTION` function automatically receives the live `MEMORY` as its first argument (`None` when invoked directly without context).
+
+You can also set `needs_context=True` directly on any `TOOL(..., needs_context=True)` so your function receives `context={"call_id", "memory", "agent"}` as a keyword argument without exposing `context` in `tool.to_schema()` or in replay keys.
+
+---
+
+## Hermetic Tool Record, Replay, and Splice (`ReplayTOOL`)
+
+Just like `LLM`, `EMBED`, and `DM`, any `TOOL` (including tools discovered from a remote `MCP` server) can record its executions into `MEMORY` and replay them offline:
+
+```python
+ticket_tool.record(memory)
+# ... run live agent; stateful outputs (e.g. TKT-101) are recorded in memory ...
+memory.to_json("session.json")
+
+# Offline CI test: zero external side effects!
+recorded = MEMORY.from_json("session.json")
+offline_tools = TOOL.replay_all([ticket_tool], recorded)  # or on_miss="live" for splice debugging
+```
 
 ---
 

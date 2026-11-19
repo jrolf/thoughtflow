@@ -209,14 +209,32 @@ class CHAT:
         if self._custom_extractor:
             return self._custom_extractor(self.memory)
 
-        # Default: find new assistant messages by diffing event stamps.
+        # Walk assistant messages in reverse chronological order so multi-step
+        # turns (e.g. an internal router thought followed by a user-facing
+        # responder) deterministically return the final non-internal reply
+        # rather than an arbitrary hash-ordered entry from a Python set diff.
         new_stamps = set(self.memory.events.keys()) - stamps_before
-        for stamp in new_stamps:
-            event = self.memory.events[stamp]
-            if event.get("type") == "msg" and event.get("role") == "assistant":
-                return event["content"]
+        if hasattr(self.memory, "get_msgs") and callable(getattr(self.memory, "get_msgs", None)):
+            asst_msgs = self.memory.get_msgs(include=["assistant"])
+            for event in reversed(asst_msgs):
+                if event.get("stamp") in new_stamps:
+                    if (event.get("metadata") or {}).get("internal"):
+                        continue
+                    return event["content"]
+        else:
+            for stamp in new_stamps:
+                event = self.memory.events[stamp]
+                if event.get("type") == "msg" and event.get("role") == "assistant":
+                    return event["content"]
 
-        # Fallback if the agent didn't add an explicit assistant message.
+        # Fallback if the agent didn't add an explicit assistant message during
+        # the turn (never surfacing internal=True scratchpad messages).
+        if hasattr(self.memory, "get_msgs") and callable(getattr(self.memory, "get_msgs", None)):
+            visible_asst = self.memory.get_msgs(
+                include=["assistant"],
+                exclude_metadata={"internal": True},
+            )
+            return visible_asst[-1]["content"] if visible_asst else None
         return self.memory.last_asst_msg(content_only=True)
 
     def turn(self, user_input):

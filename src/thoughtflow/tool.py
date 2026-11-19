@@ -15,9 +15,11 @@ be formatted into the JSON structure expected by LLM provider tool-calling APIs.
 
 from __future__ import annotations
 
+import copy
+import threading
 import time as time_module
 
-from thoughtflow._util import event_stamp
+from thoughtflow._util import estimate_size, event_stamp, exchange_key
 
 
 class TOOL:
@@ -67,7 +69,7 @@ class TOOL:
         >>> result = tool({"query": "latest news"})
     """
 
-    def __init__(self, name, description, parameters, fn):
+    def __init__(self, name, description, parameters, fn, needs_context=False):
         """
         Initialize a TOOL with a name, description, parameter schema, and function.
 
@@ -82,8 +84,14 @@ class TOOL:
                 definitions is passed, it will be wrapped automatically.
             fn (callable): The function to execute. It receives keyword arguments
                 matching the parameter names the LLM provides.
+            needs_context (bool): When True, ``fn`` also receives a ``context``
+                keyword argument (a dict such as ``{"call_id", "memory",
+                "agent"}`` supplied by the agent loop; ``None`` when called
+                directly). Context never appears in the schema and is not part
+                of the recorded request signature.
         """
         self.name = name
+        self.needs_context = needs_context
         self.id = event_stamp()
         self.description = description
         self.parameters = self._normalize_parameters(parameters)
@@ -92,6 +100,56 @@ class TOOL:
         self.last_error = None
         self.execution_count = 0
         self.execution_history = []
+        self._record_memory = None
+        self._record_lock = threading.Lock()
+
+    def record(self, memory):
+        """
+        Start recording every execution of this tool into ``memory``.
+
+        Mirrors ``LLM.record(memory)`` and ``EMBED.record(memory)``: each call
+        appends an exchange event (``kind='tool'``) keyed by a deterministic
+        hash of ``(tool.name, arguments)``. Pair with ``tool.replay(memory)``
+        so offline tests never re-fire external side effects (tickets, refunds,
+        MCP calls) or drift on stateful IDs.
+
+        Args:
+            memory: A MEMORY instance, or ``None`` to stop recording.
+
+        Returns:
+            TOOL: ``self`` (for chaining).
+        """
+        self._record_memory = memory
+        return self
+
+    def _request_signature(self, arguments):
+        """Build the canonical ``(key, request)`` pair for a tool exchange."""
+        clean_args = dict(arguments or {})
+        request = {"tool": self.name, "arguments": clean_args}
+        return exchange_key("tool", self.name, request), request
+
+    def replay(self, memory, on_miss="raise"):
+        """
+        Build a ``ReplayTOOL`` that serves outputs recorded in ``memory``.
+
+        Args:
+            memory: A MEMORY containing recorded ``kind='tool'`` exchanges.
+            on_miss: ``'raise'`` (default) to raise ``ReplayMissError`` on an
+                unrecorded call, ``'live'`` to fall through to ``self`` (time-
+                travel splice mode), or any callable ``fn(arguments)``.
+
+        Returns:
+            ReplayTOOL: A drop-in ``TOOL`` with identical name and schema.
+        """
+        return ReplayTOOL(self, memory, on_miss=on_miss)
+
+    @classmethod
+    def replay_all(cls, tools, memory, on_miss="raise"):
+        """
+        Wrap an iterable of ``TOOL`` instances into ``ReplayTOOL`` instances
+        backed by ``memory``.
+        """
+        return [t.replay(memory, on_miss=on_miss) for t in tools]
 
     def _normalize_parameters(self, parameters):
         """
@@ -129,7 +187,7 @@ class TOOL:
 
         return {"type": "object", "properties": parameters}
 
-    def __call__(self, arguments=None):
+    def __call__(self, arguments=None, context=None):
         """
         Execute the tool with the given arguments.
 
@@ -140,6 +198,9 @@ class TOOL:
         Args:
             arguments (dict, optional): Keyword arguments for the function,
                 as provided by the LLM. Defaults to {}.
+            context (dict, optional): Runtime context forwarded to ``fn`` as
+                ``context=`` only when the tool was built with
+                ``needs_context=True``.
 
         Returns:
             The result of executing the wrapped function.
@@ -152,9 +213,16 @@ class TOOL:
         arguments = arguments or {}
         start_time = time_module.time()
         self.execution_count += 1
+        rec_mem = self._record_memory
+        rec_key = rec_request = None
+        if rec_mem is not None:
+            rec_key, rec_request = self._request_signature(arguments)
 
         try:
-            result = self.fn(**arguments)
+            if self.needs_context:
+                result = self.fn(context=context, **arguments)
+            else:
+                result = self.fn(**arguments)
             self.last_result = result
             self.last_error = None
 
@@ -165,6 +233,26 @@ class TOOL:
                 'success': True,
                 'error': None,
             })
+            if rec_mem is not None:
+                with self._record_lock:
+                    threshold = getattr(rec_mem, "object_threshold", 10000)
+                    if (
+                        threshold is not None
+                        and hasattr(rec_mem, "set_obj")
+                        and estimate_size(result) > threshold
+                    ):
+                        obj_stamp = rec_mem.set_obj(copy.deepcopy(result))
+                        rec_entry = {"ok": True, "result_obj_ref": obj_stamp}
+                    else:
+                        rec_entry = {"ok": True, "result": copy.deepcopy(result)}
+                    rec_mem.add_exchange(
+                        kind="tool",
+                        key=rec_key,
+                        service="tool",
+                        model=self.name,
+                        request=copy.deepcopy(rec_request),
+                        response=[rec_entry],
+                    )
             return result
 
         except Exception as e:
@@ -176,6 +264,22 @@ class TOOL:
                 'success': False,
                 'error': str(e),
             })
+            if rec_mem is not None:
+                with self._record_lock:
+                    rec_mem.add_exchange(
+                        kind="tool",
+                        key=rec_key,
+                        service="tool",
+                        model=self.name,
+                        request=rec_request,
+                        response=[
+                            {
+                                "ok": False,
+                                "error_type": type(e).__name__,
+                                "error": str(e),
+                            }
+                        ],
+                    )
             raise
 
     def to_schema(self):
@@ -219,9 +323,9 @@ class TOOL:
         wrapped so that it can be called without a memory object — the TOOL
         receives keyword arguments from the LLM, not a memory.
 
-        The resulting TOOL's function does NOT receive a memory object. If the
-        underlying ACTION function requires memory, the agent loop is
-        responsible for providing it at execution time.
+        The resulting TOOL declares ``needs_context=True``: when an agent loop
+        passes ``context={"memory": memory, ...}`` the ACTION's function
+        receives that memory; when called directly it receives ``None``.
 
         Args:
             action (ACTION): The ACTION instance to promote.
@@ -253,16 +357,19 @@ class TOOL:
         # agent loop is responsible for memory integration.
         raw_fn = action.fn
 
-        def tool_fn(**kwargs):
-            """Wrapper that calls the ACTION's fn with None for memory."""
-            return raw_fn(None, **kwargs)
+        def tool_fn(context=None, **kwargs):
+            """Wrapper that calls the ACTION's fn with the context memory (or None)."""
+            memory = (context or {}).get("memory")
+            return raw_fn(memory, **kwargs)
 
         # Preserve the original function name for debugging
         tool_fn.__name__ = getattr(raw_fn, '__name__', name)
         tool_fn.__qualname__ = getattr(raw_fn, '__qualname__', name)
         tool_fn._source_action = action
 
-        return cls(name=name, description=desc, parameters=params, fn=tool_fn)
+        return cls(
+            name=name, description=desc, parameters=params, fn=tool_fn, needs_context=True
+        )
 
     def to_dict(self):
         """
@@ -281,6 +388,7 @@ class TOOL:
             "parameters": self.parameters,
             "fn_name": getattr(self.fn, '__name__', self.name),
             "execution_count": self.execution_count,
+            "needs_context": self.needs_context,
         }
 
     @classmethod
@@ -307,6 +415,7 @@ class TOOL:
             description=data["description"],
             parameters=data["parameters"],
             fn=fn_registry[fn_name],
+            needs_context=data.get("needs_context", False),
         )
         if data.get("id"):
             tool.id = data["id"]
@@ -324,3 +433,120 @@ class TOOL:
         return "TOOL(name='{}', description='{}', params={})".format(
             self.name, self.description[:50], param_keys
         )
+
+
+class ReplayTOOL(TOOL):
+    """
+    Drop-in ``TOOL`` that serves recorded outputs from a ``MEMORY`` instance.
+
+    Completes ThoughtFlow's hermetic replay triad alongside ``ReplayLLM`` and
+    ``ReplayEMBED``: offline tests reproduce exact stateful tool outputs (such
+    as created ticket IDs or remote MCP responses) without touching external
+    systems. Pass ``on_miss='live'`` (or a callable) for time-travel splice
+    debugging where recorded prefix calls replay offline and diverged calls
+    fall through to the live tool.
+    """
+
+    def __init__(self, source_tool, memory, on_miss="raise"):
+        """
+        Initialize a ReplayTOOL over ``source_tool`` and recorded ``memory`` exchanges.
+
+        Args:
+            source_tool (TOOL): Live tool providing ``name``, ``description``,
+                ``parameters``, ``needs_context``, and optional live fallback.
+            memory (MEMORY): Memory containing recorded ``kind='tool'`` exchanges.
+            on_miss (str | callable): ``'raise'`` (default), ``'live'`` (time-travel
+                splice fallback to ``source_tool``), or a custom ``fn(arguments)``.
+        """
+        super().__init__(
+            name=source_tool.name,
+            description=source_tool.description,
+            parameters=source_tool.parameters,
+            fn=source_tool.fn,
+            needs_context=source_tool.needs_context,
+        )
+        self._source_tool = source_tool
+        self._memory = memory
+        self.on_miss = on_miss
+        self._lock = threading.Lock()
+        self._responses = {}
+        self._cursor = {}
+
+        for ex in memory.get_exchanges(kind="tool"):
+            if ex.get("model") != self.name:
+                continue
+            key = ex.get("key")
+            payload = ex.get("response") or []
+            if key and payload:
+                self._responses.setdefault(key, []).append(payload[0])
+                self._cursor.setdefault(key, 0)
+
+    def __call__(self, arguments=None, context=None):
+        """
+        Serve the next recorded output (or recorded exception) matching ``arguments``.
+
+        Advances a thread-safe per-signature cursor and returns a deep copy of
+        the recorded result (decompressing ``result_obj_ref`` blobs from
+        ``memory.objects`` when needed) so caller mutations never corrupt the tape.
+        """
+        arguments = arguments or {}
+        key, _request = self._request_signature(arguments)
+
+        entry = None
+        with self._lock:
+            bucket = self._responses.get(key)
+            if bucket:
+                idx = min(self._cursor[key], len(bucket) - 1)
+                self._cursor[key] += 1
+                entry = bucket[idx]
+
+        if entry is None:
+            if self.on_miss == "raise" or self.on_miss is None:
+                from thoughtflow.llm import ReplayMissError
+
+                raise ReplayMissError(
+                    "No recorded output for tool '{}' (key={}). The flow has "
+                    "drifted from the recording. Re-record the session, or "
+                    "pass on_miss='live' to fall back to the live tool.".format(
+                        self.name, key
+                    )
+                )
+            if self.on_miss == "live":
+                return self._source_tool(arguments, context=context)
+            if callable(self.on_miss):
+                return self.on_miss(arguments)
+            raise ValueError("Unsupported on_miss policy: {!r}".format(self.on_miss))
+
+        self.execution_count += 1
+        if not entry.get("ok", True):
+            err = RuntimeError(
+                "{}: {}".format(entry.get("error_type", "Error"), entry.get("error", ""))
+            )
+            self.last_error = err
+            self.execution_history.append({
+                "stamp": event_stamp(),
+                "duration_ms": 0.0,
+                "success": False,
+                "error": str(err),
+            })
+            raise err
+
+        if "result_obj_ref" in entry and hasattr(self._memory, "get_obj"):
+            result = copy.deepcopy(self._memory.get_obj(entry["result_obj_ref"]))
+        else:
+            result = copy.deepcopy(entry.get("result"))
+        self.last_result = result
+        self.last_error = None
+        self.execution_history.append({
+            "stamp": event_stamp(),
+            "duration_ms": 0.0,
+            "success": True,
+            "error": None,
+        })
+        return result
+
+
+__all__ = [
+    "TOOL",
+    "ReplayTOOL",
+]

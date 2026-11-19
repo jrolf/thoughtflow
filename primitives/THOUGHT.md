@@ -34,7 +34,7 @@ Schema validation and callable validation are **not** parallel gates. A `validat
 
 Template rendering and history inclusion are separate concerns:
 
-- **`template_mode='format'`** (default): renders the configured prompt with `str.format(**ctx)` and keeps the legacy silent fallback when formatting fails.
+- **`template_mode='format'`** (default): renders the configured prompt with `str.format(**ctx)` and raises `TemplateRenderError` before calling the LLM if formatting fails (missing placeholders, malformed braces, or type/index errors). Use `template_mode='substitute'` (or `{{...}}`) when a prompt contains literal JSON braces.
 - **`template_mode='substitute'`**: replaces only explicit `{key}` placeholders for keys present in context. Literal JSON braces and unknown placeholders stay untouched; bare words such as `messages` are not replaced unless the template contains `{messages}`.
 - **`include_history=True`** (default): prior turns come from `MEMORY.get_llm_msgs()` and are forwarded without template substitution.
 - **`include_history=False`**: sends only the configured system prompt plus one rendered user prompt.
@@ -74,15 +74,41 @@ parsing_rules={
 }
 ```
 
+### Schema dialect additions
+
+Inside `parsing_rules['format']`, a string that names a type is treated as that type: `"int"`, `"str"`, `"float"`, `"bool"`, `"null"`, `"list"`, `"dict"` (plus `"number"`). Join names with a pipe for a union, such as `"int|null"`. `{"enum": ["pos", "neg"]}` accepts only those literals, inline or at the top level (a bare word reply like `pos` is accepted for a top-level enum). Ordinary exemplar strings such as `"Ada"` still mean "any str". On the first attempt THOUGHT appends `Expected format: ...` to the final user message so the model sees the schema before it fails; pass `instruct_schema=False` to turn that off.
+
+### Retry policy
+
+`retry={"on": {"length": "double_budget", "http": "backoff"}, "backoff_base": 0.5, "max_backoff": 8.0, "fallback_llm": other_llm}` is opt-in. On `finish_reason == "length"` the next attempt doubles `max_tokens`; on transport errors it sleeps with exponential backoff; after retries are exhausted one final attempt runs on `fallback_llm` and `{name}_outcome` gains `"used_fallback_llm": True`. Without `retry`, behavior is unchanged.
+
+### Visibility
+
+`visibility="public"` (default) writes the assistant reply to MEMORY. `"internal"` and `"silent"` keep the result in `output_var` but skip the transcript write, so classifier or router thoughts do not leak into chat history. `record_prompt=True` stores the rendered prompt at `{name}_prompt`. When the template references `{last_user_msg}`, the history copy of that message is dropped so the model does not see it twice.
+
 ## Validation
 
-Validation is configured via the canonical `validation=` parameter (config alias `validator=`). Accepts built-in strings (`any`, `has_keys:k1,k2`, `list_min_len:N`, `summary_v1`) or a callable. Callable return shape is `(bool, why)`; bare `bool` is coerced automatically.
+Validation is configured via the canonical `validation=` parameter (config alias `validator=`). Accepts built-in strings (`any`, `has_keys:k1,k2`, `list_min_len:N`, `summary_v1`), a callable returning `(bool, why)` or bare `bool`, or a JSON-serializable list of declarative rule dicts (`in`, `non_empty`, `range`, `regex`, `has_keys`):
+
+```python
+validation=[
+    {"op": "in", "field": "decision", "allowed": ["approve", "deny", "escalate"]},
+    {"op": "range", "field": "confidence", "min": 1, "max": 100},
+    {"op": "non_empty", "field": "rationale"},
+]
+```
+
+Declarative rule lists survive `json.dumps(thought.to_dict())` and `THOUGHT.from_dict(...)` with no external function registry. Callable hooks and validators are stripped from `to_dict()["config"]` so JSON export always succeeds. Compressed large objects (`_obj_ref`) stored in `MEMORY` are resolved lazily only when referenced by the prompt or explicit var lists.
 
 `validation_mode='strict'` (default) — schema must pass before callable runs. `validation_mode='rescue'` — on schema miss, structurally parsed payload may be accepted by callable validator.
 
-## Failure visibility
+## Outcomes & Failure Visibility
 
-Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`). Vars `{name}_last_error` and `{name}_attempts` are set on failure. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` values: `schema`, `validation`, `contract`, `exception`.
+Every `THOUGHT` (as well as `DECIDE` and `PLAN`) writes a uniform, JSON-safe `{name}_outcome` dict to `MEMORY` on both success and failure (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`), emits `thought_completed` / `thought_failed` via `MEMORY.emit()`, and sets `{name}_attempts` to the total number of attempts executed.
+
+Failed attempts write structured JSON to MEMORY logs (`event: thought_failure`) and update `{name}_last_error`. Optional `on_failure(thought, attempt, failure_kind, reason, raw_response=None)` hook fires per attempt. `failure_kind` / `error_class` values: `template`, `length`, `empty`, `http`, `replay_miss`, `schema`, `validation`, `contract`, `exception`. Prompt rendering errors and `ReplayMissError` fail fast before burning retries.
+
+`hold_msg` defaults to `True` so failed or rejected LLM drafts do not pollute conversation history (pass `hold_msg=False` to record failed assistant messages), and `add_reflection` defaults to `False` so successful runs do not write a duplicate truncated copy of the assistant reply into `MEMORY` reflections.
 
 After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY without raising. Execution events include `failed: true` when retries were exhausted with an error.
 
@@ -102,7 +128,7 @@ After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY wit
 | strict_schema | Opt-in: raise at construction if format uses bare None exemplars |
 | validator | Config-style alias for `validation`; behaves identically |
 | on_failure | Hook: fn(thought, attempt, failure_kind, reason, raw_response=None) |
-| hold_msg | Opt-in: hold assistant messages until successful parse+validate |
+| hold_msg | Hold failed assistant messages out of history until success (default: True) |
 | repair_target | For dict prompts, which section key receives repair suffix text |
 | template_mode | Opt-in prompt rendering: `format` (default, str.format) or `substitute` ({key} only) |
 | include_history | Opt-in history control: True (default) forwards MEMORY turns via get_llm_msgs; False sends system + user only |
@@ -114,7 +140,7 @@ After retry exhaustion, `{name}_result` is `None` and THOUGHT returns MEMORY wit
 | pre_hook, post_hook | Callables for custom processing |
 | on_token | Callable receiving each streamed text chunk: fn(chunk) |
 | channel | Channel for message tracking |
-| add_reflection | Whether to add reflection on success |
+| add_reflection | Whether to add reflection on success (default: False) |
 
 ## Usage
 

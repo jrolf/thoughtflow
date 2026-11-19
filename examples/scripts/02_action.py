@@ -193,7 +193,7 @@ def main():
     # Use from_dict() with a function registry to restore
     print("\nNote: Use from_dict(data, fn_registry) to restore ACTIONs")
     
-    fn_registry = {"get_weather": fetch_weather}
+    fn_registry = {"fetch_weather": fetch_weather}
     restored_action = ACTION.from_dict(action_dict, fn_registry)
     print(f"Restored ACTION: {restored_action.name}")
 

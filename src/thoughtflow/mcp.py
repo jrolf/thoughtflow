@@ -58,23 +58,38 @@ class MCP:
         ...     tools = mcp.list_tools()
     """
 
-    def __init__(self, server, env=None):
+    def __init__(self, server, env=None, headers=None, timeout=60, prefix=None):
         """
         Initialize an MCP client and connect to the server.
 
         Args:
-            server (str): Either a shell command to launch a local MCP server
-                (stdio transport) or an HTTP(S) URL for a remote server.
+            server (str | list[str]): Either a shell command string or argv
+                list (``shell=False``) to launch a local MCP server over stdio,
+                or an HTTP(S) URL for a remote server.
             env (dict, optional): Additional environment variables to set when
                 launching a stdio subprocess. Merged with the current env.
+            headers (dict, optional): Extra HTTP headers sent with every request
+                to an HTTP server (for example an Authorization header). Ignored
+                for stdio servers.
+            timeout (float, optional): Seconds to wait for each HTTP request
+                (default 60). Ignored for stdio servers.
+            prefix (str, optional): Optional namespace prefix prepended to
+                discovered ``TOOL.name`` values (e.g. ``'metrics__'``) so tools
+                from multiple federated MCP servers do not collide, while still
+                routing calls to the server's unprefixed tool name.
         """
         self.server = server
+        self.prefix = prefix
         self.tools = []
         self._request_id = 0
         self._env = env
+        self._headers = dict(headers or {})
+        self._timeout = timeout
 
         # Auto-detect transport
-        if server.startswith("http://") or server.startswith("https://"):
+        if isinstance(server, str) and (
+            server.startswith("http://") or server.startswith("https://")
+        ):
             self.transport = "http"
             self._base_url = server.rstrip("/")
             self._process = None
@@ -88,17 +103,20 @@ class MCP:
         """
         Launch the MCP server as a subprocess and establish JSON-RPC communication.
 
-        The server is launched with the command from self.server. Communication
-        happens via stdin (requests) and stdout (responses). Stderr is captured
-        separately to avoid polluting the JSON-RPC stream.
+        Accepts either a shell string (legacy default ``shell=True``) or an
+        explicit argv ``list[str]`` (``shell=False`` so dynamic paths/args are
+        not interpreted by ``/bin/sh``).
         """
         env = dict(os.environ)
         if self._env:
             env.update(self._env)
 
+        use_shell = isinstance(self.server, str)
+        cmd = self.server if use_shell else list(self.server)
+
         self._process = subprocess.Popen(
-            self.server,
-            shell=True,
+            cmd,
+            shell=use_shell,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -106,10 +124,15 @@ class MCP:
         )
 
         # Send the initialize handshake
+        try:
+            from importlib.metadata import version as _pkg_version
+            tf_version = _pkg_version("thoughtflow")
+        except Exception:
+            tf_version = "0.3.0"
         self._jsonrpc_call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "thoughtflow", "version": "0.1.2"},
+            "clientInfo": {"name": "thoughtflow", "version": tf_version},
         })
 
         # Send initialized notification (no response expected)
@@ -247,10 +270,11 @@ class MCP:
 
         data = json.dumps(msg).encode("utf-8")
         headers = {"Content-Type": "application/json"}
+        headers.update(self._headers)
 
         req = urllib.request.Request(self._base_url, data=data, headers=headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode("utf-8")
                 response = json.loads(body)
         except urllib.error.HTTPError as e:
@@ -266,12 +290,17 @@ class MCP:
             ))
         return response.get("result", {})
 
-    def list_tools(self):
+    def list_tools(self, prefix=None):
         """
         Discover available tools from the MCP server.
 
         Sends a 'tools/list' JSON-RPC call and converts each tool definition
         into a ThoughtFlow TOOL instance. Results are cached in self.tools.
+
+        Args:
+            prefix (str, optional): Overrides ``self.prefix`` for this call,
+                prepending ``prefix`` to each returned ``TOOL.name`` while
+                preserving the unprefixed name on wire ``tools/call`` requests.
 
         Returns:
             list[TOOL]: The tools available on this MCP server.
@@ -284,19 +313,21 @@ class MCP:
         """
         result = self._jsonrpc_call("tools/list", {})
         raw_tools = result.get("tools", [])
+        eff_prefix = self.prefix if prefix is None else prefix
 
         self.tools = []
         for raw in raw_tools:
-            name = raw.get("name", "")
+            raw_name = raw.get("name", "")
+            exposed_name = "{}{}".format(eff_prefix, raw_name) if eff_prefix else raw_name
             description = raw.get("description", "")
             input_schema = raw.get("inputSchema", {"type": "object", "properties": {}})
 
-            # Create a TOOL whose fn calls back to this MCP server
+            # Create a TOOL whose fn calls back to this MCP server using raw_name
             tool = TOOL(
-                name=name,
+                name=exposed_name,
                 description=description,
                 parameters=input_schema,
-                fn=self._make_tool_caller(name),
+                fn=self._make_tool_caller(raw_name),
             )
             self.tools.append(tool)
 
@@ -343,8 +374,14 @@ class MCP:
             "arguments": arguments or {},
         })
 
-        # MCP tool results come as {"content": [{"type": "text", "text": "..."}]}
+        # MCP tool results come as {"content": [...], "isError": bool?}
         content = result.get("content", [])
+        if result.get("isError"):
+            if len(content) == 1 and content[0].get("type") == "text":
+                detail = content[0].get("text", "Unknown error")
+            else:
+                detail = str(content)
+            raise RuntimeError("MCP tool '{}' error: {}".format(name, detail))
         if len(content) == 1 and content[0].get("type") == "text":
             return content[0].get("text", "")
         return content
@@ -416,12 +453,13 @@ class MCP:
     def __str__(self):
         """Return a concise string representation."""
         tool_count = len(self.tools)
+        srv = " ".join(self.server) if isinstance(self.server, (list, tuple)) else str(self.server)
         return "MCP({}, transport={}, tools={})".format(
-            self.server[:40], self.transport, tool_count
+            srv[:40], self.transport, tool_count
         )
 
     def __repr__(self):
         """Return a detailed string representation."""
-        return "MCP(server='{}', transport='{}', tools={})".format(
+        return "MCP(server={!r}, transport='{}', tools={})".format(
             self.server, self.transport, len(self.tools)
         )

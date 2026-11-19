@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-19
+
+Major feature, governance, decision-model, and reliability release: adds System-One decision models (`DM` + 4-mode `DECIDE`), structured native tool completions (`LLM.chat`), governed write-ahead `AGENT` & `WORKFLOW` suspend/resume, zero-copy `MEMORY` scopes & token budgets, hermetic `TOOL` record/replay, structured `{name}_outcome` telemetry, and multi-level package documentation.
+
+### Added
+- `LLM.chat()`: structured chat completion for OpenAI-compatible services (`openai` with any `base_url`, `openrouter`, `groq`). Returns the whole assistant message as one dict: `content`, `reasoning` (kept separate from the answer), native `tool_calls` with parsed `arguments`, `finish_reason`, normalized `usage` (including provider-reported `cost`), and `model`. Messages and tools pass through verbatim.
+- `LLM.chat(stream=True)`: generator of typed events (`text_delta`, `reasoning_delta`, `tool_call_delta`, `done`) including tool-call deltas.
+- `LLM.chat(cancel=threading.Event())`: abort from another thread; the socket is shut down at once, including while waiting for the first byte. A stream ends with a `done` event whose `finish_reason` is `aborted`.
+- `ChatError` (exported) with `status`, `body`, and `retryable`. `chat` raises instead of printing, so hosts that use stdout as a protocol channel are safe.
+- Record and replay support for `chat`: `LLM.record` captures structured exchanges and `ReplayLLM.chat` serves them, replaying streams as events.
+- `MCP(url, headers=None, timeout=60)`: extra HTTP headers (for example `Authorization`) and a per-request timeout for HTTP servers. Stdio servers ignore both.
+- `parse_cron` accepts the aliases `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
+- `TemplateRenderError` (exported) raised when prompt template rendering fails or configured `required_vars` are missing.
+- `THOUGHT` / `DECIDE` / `PLAN` structured `{name}_outcome` variable (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`) and `thought_completed` / `thought_failed` lifecycle emits on `MEMORY`.
+- `LLM.last_finish_reason` normalized across providers and `allow_reasoning_fallback=False` default so truncated chain-of-thought replies do not pass as valid completions.
+- `Harness.run(..., strict=False)` absorbed-error tracking (`TestResult.absorbed_errors`, `reason`, `observed`, preserved partial `memory`, and `summary()['cases_with_absorbed_errors']`).
+- `MEMORY` native tool-turn support: `'tool'` role, structured `tool_calls` on assistant messages, `tool_call_id` and `name` on tool messages, and `MEMORY.get_llm_msgs(format='openai')` for provider-valid `LLM.chat()` message histories (`Message.assistant(tool_calls=...)` and `Message.tool(...)` updated to match).
+- `MEMORY.scope(actor, read_rooms=None, write_room=None, public_keys=(), export_keys=())`: zero-copy scoped perspective over a shared `MEMORY` isolating room/channel visibility and `{actor}__{key}` scratchpad variables for multi-party and parallel flows; `get_llm_msgs` also gains `channel`, `metadata_filter`, and `exclude_metadata` passthrough.
+- `TOOL.record(memory)`, `tool.replay(memory, on_miss='raise')` (`ReplayTOOL`, exported), and `TOOL.replay_all(...)`: hermetic tool and MCP record/replay/splice (`on_miss='live'`) backed by `MEMORY` exchanges.
+- Declarative JSON-serializable rule lists on `THOUGHT(validation=[...])` (`in`, `non_empty`, `range`, `regex`, `has_keys`) that round-trip cleanly through `to_dict()` / `from_dict()`.
+- `MCP(..., prefix=None)` / `list_tools(prefix=None)` for multi-server tool namespacing and `list[str]` stdio argv support (`shell=False`).
+- `AGENT` native tool-call protocol with `allow`, `policy` (`allow`/`deny`/`approve`/`approve_over`), `budget`, `checkpoint`, and `protocol="auto"|"native"|"text"`: write-ahead assistant `tool_calls`, every `tool_call_id` answered, transcript-derived resume, `{name}_status` / `{name}_outcome`, and `agent(memory, decision=...)` to resume after approval. `tool_loop(...)` (exported) is a one-call helper. LLMs without `chat()` keep the text-JSON loop.
+- `TOOL(..., needs_context=True)` and `tool(arguments, context=...)`; `TOOL.from_action` now hands the ACTION the context memory.
+- `MEMORY.get_llm_msgs(budget_tokens=, pinned=, summarizer=, token_counter=)`, `MEMORY.compact(keep=, summarizer=)`, and `MEMORY.suspend` / `resolve_suspension` / `is_suspended` / `get_suspension` (idempotent resolution, JSON round trip).
+- `THOUGHT` schema dialect: type-name strings, pipe unions (`"int|null"`), `{"enum": [...]}` literals, and a first-attempt `Expected format:` line (`instruct_schema=False` to disable).
+- `THOUGHT(retry={"on": {"length": "double_budget", "http": "backoff"}, "fallback_llm": ...})` and `visibility="public"|"internal"|"silent"`, `record_prompt=True`; the history copy of the user message is dropped when the template references `{last_user_msg}`.
+- `WORKFLOW.step(ok=...)`, `branch(on="previous_status"|"previous_failed")`, `while_(...)`, persisted `{name}_log`, and suspend/resume with `workflow(memory, decision=...)`.
+- `ReflectAgent` critic sees the task (`{task}`, `{system_prompt}` placeholders), negation-safe approval, revisions synced into `MEMORY`, and a final verification recorded in `{name}_outcome`.
+- `DM`, `ReplayDM`, and `DecisionError` (exported): zero-dependency Intelligence-layer client for structured System-One decision models (`choice`, `noul`, `score`, `box`), normalizing wire dialects across OpenRouter (`/api/alpha/decisions`), TypeSafe (`jev`), OpenAI (`/v1/decisions`), Liquid (`d1`), Cloudflare Workers AI (`clef`), Perplexity, Inception, Upstage, local Ollama (`d3`, `clef`), vLLM, and `DM.from_llm(llm)` generative fallback, with cross-vendor normalized `confidence` / `margin` metrics and `MEMORY`-backed `record`/`replay`.
+- `DECIDE` support for `DM` (via `llm=` or `model=` alias), binary `choices=bool` (`noul` with `threshold=`), ordered rubric `levels=[...]` (`score`), single-pass multi-question `questions={...}`, automatic `{var}` `state` vs `instructions` separation (`state=`), uncertainty gating (`min_confidence=`, `min_margin=`), and enriched `{name}_outcome` decision provenance (`kind`, `value`, `raw_value`, `source`, `probability`, `probabilities`, `confidence`, `provider_confidence`, `margin`).
+- `normalize_usage()` preserves provider `cost` and `input_tokens_details` cache token counts across `LLM` and `DM`.
+
+### Changed
+- `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
+- `LLM` now defaults `request_timeout` to `120` seconds (pass `request_timeout=None` for blocking), rejects unsupported `n > 1` on providers/streaming that cannot honor it, and stops printing HTTP errors to stdout in `call()`.
+- `THOUGHT` now defaults `hold_msg=True` (keeping failed retry drafts out of chat history), defaults `add_reflection=False` (avoiding duplicate answer events), sets `{name}_attempts` to total attempts on both success and failure, and treats `finish_reason='length'`, empty replies, HTTP errors, and `ReplayMissError` as explicit failed attempts.
+- `THOUGHT.get_context()` resolves compressed `_obj_ref` variables lazily only when referenced by the prompt or explicit var lists, avoiding eager decompression of unrelated large objects.
+
+### Fixed
+- `DELEGATE._copy_memory` now uses `memory.copy()` so delegated agents receive actual variable values, descriptions, and tombstones instead of nested `[stamp, value]` history lists.
+- `DECIDE.parse_response` requires an exact, leading, or single non-negated word-boundary choice match so negated replies such as `"I do not approve this. Revise."` trigger repair retries instead of matching `"approve"`.
+- `ReactAgent` preserves multi-line `Final Answer:` responses and appends a policy-veto `Observation:` when `on_tool_call` returns `False`.
+- `WORKFLOW` treats exceptions raised inside `condition` callables as step errors honoring `on_error` rather than silently skipping as `condition_false`.
+- `CHRON` captures returned `MEMORY` objects from job actions, writes `state_file` atomically, and surfaces corrupt/failed state I/O via `RuntimeWarning` + `last_state_error` (or raises with `on_state_error='raise'`).
+- `MEMORY.from_events()` now persists and sorts by monotonic per-event `_seq` on sub-millisecond timestamp ties so unordered event rehydration preserves variable write order and deletion tombstones.
+- `THOUGHT.to_dict()` strips non-JSON-serializable callables from `config` and `THOUGHT.from_dict()` pops explicit constructor keys from `config` instead of raising `TypeError` on `max_retries`.
+- `CHAT._extract_response()` walks new assistant messages in reverse chronological order (skipping `metadata={'internal': True}`) instead of iterating an unordered `set` diff.
+- `MCP.call_tool()` raises `RuntimeError` when an MCP server returns `isError=True` instead of returning error text as a normal tool result.
+- `humanize_schema_error()` scrubs runtime `at 0x...` heap addresses so `ast.literal_eval` repair suffixes remain deterministic for replay.
 ## [0.2.5] - 2026-07-17
 
 Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.
@@ -225,7 +274,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jrolf/thoughtflow/compare/v0.2.2...v0.2.3

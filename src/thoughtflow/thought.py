@@ -22,7 +22,22 @@ from thoughtflow._util import (
     humanize_schema_error,
     format_schema_annotation,
     scan_none_exemplars,
+    TemplateRenderError,
+    is_obj_ref,
 )
+from thoughtflow.llm import ReplayMissError
+from thoughtflow.llm_chat import ChatError
+
+
+_TEMPLATE_FIELD_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)")
+
+
+class _PrebuiltContext(dict):
+    """
+    Internal dict marker passed from ``build_msgs`` to ``build_prompt`` so
+    ``build_prompt`` skips a second ``get_context(memory)`` pass without
+    mutating any shared instance attribute across concurrent threads.
+    """
 
 
 class THOUGHT:
@@ -256,6 +271,7 @@ class THOUGHT:
         # Internal state for tracking last result, errors, etc.
         self.last_result = None
         self.last_error = None
+        self.last_outcome = None
         self.last_prompt = None
         self.last_msgs = None
         self.last_response = None
@@ -265,10 +281,26 @@ class THOUGHT:
         self.post_hook = kwargs.get("post_hook", None)
         self.on_failure = kwargs.get("on_failure", None)
 
-        # Opt-in production-lane settings (defaults preserve backward compat)
+        # Opt-in production-lane settings (hold_msg defaults True so failed drafts
+        # do not pollute conversation history unless explicitly requested)
         self.validation_mode = kwargs.get("validation_mode", "strict")
         self.strict_schema = kwargs.get("strict_schema", False)
-        self.hold_msg = kwargs.get("hold_msg", False)
+        self.hold_msg = kwargs.get("hold_msg", True)
+        self.instruct_schema = kwargs.get("instruct_schema", True)
+        self.record_prompt = kwargs.get("record_prompt", False)
+        visibility = kwargs.get("visibility", "public")
+        if visibility not in ("public", "internal", "silent"):
+            raise ValueError(
+                "visibility must be 'public', 'internal', or 'silent', got: {!r}".format(visibility)
+            )
+        self.visibility = visibility
+        retry = dict(kwargs.get("retry") or {})
+        retry.setdefault("on", {})
+        retry.setdefault("backoff_base", 0.5)
+        retry.setdefault("max_backoff", 8.0)
+        retry.setdefault("fallback_llm", None)
+        self.retry = retry
+        self._used_fallback_llm = False
 
         template_mode = kwargs.get("template_mode", "format")
         if template_mode not in ("format", "substitute"):
@@ -437,6 +469,8 @@ class THOUGHT:
             event["raw_response_preview"] = preview
 
         self._failure_attempts.append(event)
+        if hasattr(self, "_validation_messages") and isinstance(self._validation_messages, list):
+            self._validation_messages.append(reason)
 
         if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
             memory.add_log(json.dumps(event))
@@ -463,16 +497,72 @@ class THOUGHT:
 
     def _format_repair_reason(self, why):
         """Build model-friendly repair text from an internal failure reason."""
+        text = str(why)
+        if text.startswith("Schema-based parsing failed:"):
+            text = text[len("Schema-based parsing failed:"):].strip()
         parsing_rules = self.config.get("parsing_rules")
         schema = None
         if parsing_rules:
             schema = parsing_rules.get("format")
-        friendly = humanize_schema_error(str(why), schema)
-        if schema is not None:
+        friendly = humanize_schema_error(text, schema)
+        if schema is not None and "Expected schema:" not in friendly:
             return "{} Expected format: {}".format(
                 friendly, format_schema_annotation(schema)
             )
         return friendly
+
+    def _add_assistant_msg(self, memory, response, channel):
+        """Write the assistant turn unless visibility is 'internal' or 'silent'."""
+        if self.visibility != "public":
+            return
+        memory.add_msg("assistant", response, channel=channel)
+
+    def _schema_instruction(self):
+        """Return the first-attempt 'Expected format' line, or '' when not applicable."""
+        parsing_rules = self.config.get("parsing_rules")
+        if not self.instruct_schema or not parsing_rules:
+            return ""
+        schema = parsing_rules.get("format")
+        if schema is None:
+            return ""
+        return "\n\nExpected format: {}".format(format_schema_annotation(schema))
+
+    def _backoff_sleep(self, failure_count):
+        """Sleep with exponential backoff after a transport failure when enabled."""
+        import time as time_module
+
+        if self.retry["on"].get("http") != "backoff":
+            return
+        delay = min(
+            float(self.retry["max_backoff"]),
+            float(self.retry["backoff_base"]) * (2 ** max(0, failure_count - 1)),
+        )
+        if delay > 0:
+            time_module.sleep(delay)
+
+    def _build_outcome(
+        self,
+        ok,
+        attempts,
+        error_class=None,
+        error=None,
+        finish_reason=None,
+        usage=None,
+        validation_messages=None,
+    ):
+        """Construct the plain JSON-safe outcome dict stored at {name}_outcome."""
+        outcome = {
+            "ok": bool(ok),
+            "error_class": None if ok else error_class,
+            "error": None if ok else error,
+            "finish_reason": finish_reason,
+            "usage": dict(usage) if isinstance(usage, dict) else None,
+            "attempts": int(attempts),
+            "validation_messages": list(validation_messages or []),
+        }
+        if self._used_fallback_llm:
+            outcome["used_fallback_llm"] = True
+        return outcome
 
     def __call__(self, memory, vars={}, **kwargs):
         """
@@ -499,6 +589,11 @@ class THOUGHT:
 
         # Determine operation type
         operation = self.operation or 'llm_call'
+        self._failure_attempts = []
+        self._last_finish_reason = None
+        self._last_call_usage = None
+        self._validation_messages = []
+        self._used_fallback_llm = False
         
         # Dispatch to appropriate handler based on operation type
         if operation == 'llm_call':
@@ -515,8 +610,24 @@ class THOUGHT:
         # Calculate execution duration
         duration_ms = (time_module.time() - start_time) * 1000
         
-        # Build execution event for logging
+        # Build execution event and structured outcome
         failed = result is None and last_error is not None
+        failure_kind = (
+            self._failure_attempts[-1]['failure_kind']
+            if (failed and self._failure_attempts)
+            else ('exception' if failed else None)
+        )
+        outcome = self._build_outcome(
+            ok=not failed,
+            attempts=attempts_made,
+            error_class=failure_kind,
+            error=last_error,
+            finish_reason=self._last_finish_reason,
+            usage=self._last_call_usage,
+            validation_messages=self._validation_messages,
+        )
+        self.last_outcome = outcome
+
         execution_event = {
             'thought_name': self.name,
             'thought_id': self.id,
@@ -528,21 +639,42 @@ class THOUGHT:
             'output_var': self.output_var
         }
 
-        # If failed after all retries
         if failed:
             execution_event['error'] = last_error
-            execution_event['failure_kind'] = (
-                self._failure_attempts[-1]['failure_kind']
-                if self._failure_attempts else 'unknown'
-            )
+            execution_event['failure_kind'] = failure_kind or 'unknown'
             if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                 memory.add_log("Thought execution failed: " + json.dumps(execution_event))
-            # Store None as result
             self.update_memory(memory, None)
         else:
             if hasattr(memory, "add_log") and callable(getattr(memory, "add_log", None)):
                 memory.add_log("Thought execution complete: " + json.dumps(execution_event))
             self.update_memory(memory, result)
+
+        # Record total attempts and structured outcome on MEMORY
+        if self.name and hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+            memory.set_var(
+                "{}_attempts".format(self.name),
+                attempts_made,
+                desc="Total attempts for thought: {}".format(self.name),
+            )
+            memory.set_var(
+                "{}_outcome".format(self.name),
+                dict(self.last_outcome),
+                desc="Structured outcome for thought: {}".format(self.name),
+            )
+        if hasattr(memory, "emit") and callable(getattr(memory, "emit", None)):
+            emit_kind = "thought_failed" if failed else "thought_completed"
+            emit_payload = {
+                "thought_name": self.name,
+                "thought_id": self.id,
+                "operation": operation,
+                "ok": bool(self.last_outcome.get("ok")),
+                "error_class": self.last_outcome.get("error_class"),
+                "finish_reason": self.last_outcome.get("finish_reason"),
+                "attempts": attempts_made,
+                "duration_ms": round(duration_ms, 2),
+            }
+            memory.emit(emit_kind, emit_payload)
         
         # Track execution history on the THOUGHT instance
         self.execution_history.append({
@@ -645,26 +777,172 @@ class THOUGHT:
         # Store original prompt to avoid mutation - work with a copy
         original_prompt = copy_module.deepcopy(self.prompt)
         working_prompt = copy_module.deepcopy(self.prompt)
+        # Keep repair text separate for string prompts so format-mode rendering
+        # never tries to .format() braces inside schema annotations on retry.
+        pending_repair = None
 
-        while retries_left > 0:
+        primary_llm = self.llm
+        http_failures = 0
+        attempt_max_tokens = None
+        double_on_length = self.retry["on"].get("length") == "double_budget"
+
+        while True:
+            if retries_left <= 0:
+                fallback = self.retry.get("fallback_llm")
+                if fallback is not None and not self._used_fallback_llm:
+                    self._used_fallback_llm = True
+                    self.llm = fallback
+                    retries_left = 1
+                else:
+                    break
             attempts_made += 1
             self._pending_schema_error = None
             response = None
             try:
-                # Stage 1: prompt + context — working_prompt may carry repair suffix
+                # Stage 1: prompt + context — working_prompt may carry repair suffix (dict prompts)
                 self.prompt = working_prompt
-
-                ctx = self.get_context(memory)
-                ctx.update(vars)
-                msgs = self.build_msgs(memory, ctx)
+                msgs = self.build_msgs(memory, vars)
+                instruction = self._schema_instruction() if attempts_made == 1 else ""
+                if instruction and instruction.strip() not in str(self.last_prompt or ""):
+                    if msgs and msgs[-1].get("role") == "user" and isinstance(msgs[-1].get("content"), str):
+                        msgs[-1]["content"] = msgs[-1]["content"].rstrip() + instruction
+                        if isinstance(self.last_prompt, str):
+                            self.last_prompt = self.last_prompt.rstrip() + instruction
+                        self.last_msgs = msgs
+                if pending_repair and isinstance(original_prompt, str):
+                    if isinstance(self.last_prompt, str) and self.last_prompt:
+                        self.last_prompt = self.last_prompt.rstrip() + pending_repair
+                    else:
+                        self.last_prompt = pending_repair
+                    if msgs and msgs[-1].get("role") == "user":
+                        msgs[-1]["content"] = msgs[-1]["content"].rstrip() + pending_repair
+                    else:
+                        msgs.append({"role": "user", "content": pending_repair})
+                    self.last_msgs = msgs
 
                 # Stage 2: LLM call
-                llm_kwargs = self.config.get("llm_params", {})
+                llm_kwargs = dict(self.config.get("llm_params", {}))
                 llm_kwargs.update(kwargs)
+                if attempt_max_tokens is not None:
+                    llm_kwargs["max_tokens"] = attempt_max_tokens
                 response = self.run_llm(msgs, **llm_kwargs)
                 self.last_response = response
+                self._last_finish_reason = getattr(self.llm, "last_finish_reason", None)
+                llm_usage = getattr(self.llm, "last_usage", None)
+                if isinstance(llm_usage, dict):
+                    if self._last_call_usage is None:
+                        self._last_call_usage = dict(llm_usage)
+                    else:
+                        self._last_call_usage["prompt_tokens"] = (
+                            self._last_call_usage.get("prompt_tokens", 0)
+                            + llm_usage.get("prompt_tokens", 0)
+                        )
+                        self._last_call_usage["completion_tokens"] = (
+                            self._last_call_usage.get("completion_tokens", 0)
+                            + llm_usage.get("completion_tokens", 0)
+                        )
+                        if "cost" in llm_usage and llm_usage["cost"] is not None:
+                            self._last_call_usage["cost"] = (
+                                (self._last_call_usage.get("cost") or 0) + llm_usage["cost"]
+                            )
 
                 channel = self.config.get("channel", "api")
+
+                llm_err = getattr(self.llm, "last_error", None)
+                if llm_err and (response is None or response == ""):
+                    last_error = str(llm_err)
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "http",
+                        last_error,
+                        raw_response=response,
+                    )
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' HTTP/provider error: {}".format(self.name, last_error)
+                        )
+                    retries_left -= 1
+                    http_failures += 1
+                    self._backoff_sleep(http_failures)
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
+
+                if self._last_finish_reason == "length":
+                    if double_on_length:
+                        base_budget = (
+                            attempt_max_tokens
+                            or llm_kwargs.get("max_tokens")
+                            or (getattr(self.llm, "default_params", None) or {}).get("max_tokens")
+                            or getattr(self.llm, "max_tokens", None)
+                            or 1024
+                        )
+                        attempt_max_tokens = int(base_budget) * 2
+                    why_len = "Model output truncated at max_tokens (finish_reason='length')"
+                    last_error = why_len
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "length",
+                        why_len,
+                        raw_response=response,
+                    )
+                    if not self._hold_msg() and response is not None:
+                        if hasattr(memory, "add_msg") and callable(
+                            getattr(memory, "add_msg", None)
+                        ):
+                            self._add_assistant_msg(memory, response, channel)
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' truncated: {}".format(self.name, why_len)
+                        )
+                    repair_suffix = self._build_repair_suffix(why_len)
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
+                    retries_left -= 1
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
+
+                if response is None or (isinstance(response, str) and response.strip() == ""):
+                    why_empty = "Model returned an empty response"
+                    last_error = why_empty
+                    self.last_error = last_error
+                    self._record_failure(
+                        memory,
+                        attempts_made,
+                        "empty",
+                        why_empty,
+                        raw_response=response,
+                    )
+                    if hasattr(memory, "add_log") and callable(
+                        getattr(memory, "add_log", None)
+                    ):
+                        memory.add_log(
+                            "Thought '{}' empty response".format(self.name)
+                        )
+                    repair_suffix = self._build_repair_suffix(why_empty)
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
+                    retries_left -= 1
+                    if self.retry_delay:
+                        time_module.sleep(self.retry_delay)
+                    continue
 
                 # Stage 3: parse — schema validation lives here (valid_extract).
                 # Rescue mode may set _pending_schema_error and return raw object.
@@ -688,11 +966,14 @@ class THOUGHT:
                         if hasattr(memory, "add_msg") and callable(
                             getattr(memory, "add_msg", None)
                         ):
-                            memory.add_msg("assistant", response, channel=channel)
+                            self._add_assistant_msg(memory, response, channel)
                     repair_suffix = self._build_repair_suffix(last_error)
-                    working_prompt = self._append_repair_suffix(
-                        original_prompt, working_prompt, repair_suffix
-                    )
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
                     retries_left -= 1
                     if self.retry_delay:
                         time_module.sleep(self.retry_delay)
@@ -715,24 +996,17 @@ class THOUGHT:
                                 k for k in first_failed_keys if k not in prepared
                             ]
                         memory.add_log(json.dumps(recovery))
-                    # Success path: write assistant turn unless hold_msg withheld earlier failures
+                    # Success path: write assistant turn
                     if hasattr(memory, "add_msg") and callable(
                         getattr(memory, "add_msg", None)
                     ):
-                        memory.add_msg("assistant", response, channel=channel)
-                    # Logging
-                    if hasattr(memory, "add_log") and callable(
-                        getattr(memory, "add_log", None)
-                    ):
-                        memory.add_log(
-                            "Thought '{}' completed successfully".format(self.name)
-                        )
-                    # Add reflection for reasoning trace (if configured)
-                    if self.config.get("add_reflection", True):
+                        self._add_assistant_msg(memory, response, channel)
+                    # Add reflection only when explicitly requested (default False
+                    # to avoid duplicating the assistant reply on every turn, #17)
+                    if self.config.get("add_reflection", False):
                         if hasattr(memory, "add_ref") and callable(
                             getattr(memory, "add_ref", None)
                         ):
-                            # Truncate response for reflection if too long
                             response_preview = str(response)[:300]
                             if len(str(response)) > 300:
                                 response_preview += "..."
@@ -758,26 +1032,69 @@ class THOUGHT:
                             "Thought '{}' validation failed: {}".format(self.name, why)
                         )
                     repair_suffix = self._build_repair_suffix(why)
-                    working_prompt = self._append_repair_suffix(
-                        original_prompt, working_prompt, repair_suffix
-                    )
+                    if isinstance(original_prompt, str):
+                        pending_repair = repair_suffix
+                    else:
+                        working_prompt = self._append_repair_suffix(
+                            original_prompt, working_prompt, repair_suffix
+                        )
                     # Failed attempt: record assistant msg unless hold_msg=True
                     if not self._hold_msg():
                         if hasattr(memory, "add_msg") and callable(
                             getattr(memory, "add_msg", None)
                         ):
-                            memory.add_msg("assistant", response, channel=channel)
+                            self._add_assistant_msg(memory, response, channel)
+            except TemplateRenderError as e:
+                # Deterministic template/variable errors cannot heal across retries;
+                # record once and exit before sleeping or calling the LLM.
+                last_error = str(e)
+                self.last_error = last_error
+                self._record_failure(
+                    memory,
+                    attempts_made,
+                    "template",
+                    last_error,
+                    raw_response=None,
+                )
+                if hasattr(memory, "add_log") and callable(
+                    getattr(memory, "add_log", None)
+                ):
+                    memory.add_log(
+                        "Thought '{}' error: {}".format(self.name, last_error)
+                    )
+                break
+            except ReplayMissError as e:
+                last_error = str(e)
+                self.last_error = last_error
+                self._record_failure(
+                    memory,
+                    attempts_made,
+                    "replay_miss",
+                    last_error,
+                    raw_response=None,
+                )
+                if hasattr(memory, "add_log") and callable(
+                    getattr(memory, "add_log", None)
+                ):
+                    memory.add_log(
+                        "Thought '{}' replay miss: {}".format(self.name, last_error)
+                    )
+                break
             except Exception as e:
                 last_error = str(e)
                 self.last_error = last_error
                 # Parse failures surface as ValueError with "Schema-based parsing failed"
-                failure_kind = (
-                    "schema"
-                    if "Schema-based parsing failed" in last_error
-                    else "exception"
-                )
+                if isinstance(e, ChatError):
+                    failure_kind = "http"
+                elif "Schema-based parsing failed" in last_error:
+                    failure_kind = "schema"
+                else:
+                    failure_kind = "exception"
                 if failure_kind == "schema":
                     had_schema_rejection = True
+                if failure_kind == "http":
+                    http_failures += 1
+                    self._backoff_sleep(http_failures)
                 self._record_failure(
                     memory,
                     attempts_made,
@@ -791,7 +1108,7 @@ class THOUGHT:
                         and hasattr(memory, "add_msg")
                         and callable(getattr(memory, "add_msg", None))
                     ):
-                        memory.add_msg("assistant", response, channel=channel)
+                        self._add_assistant_msg(memory, response, channel)
                 if hasattr(memory, "add_log") and callable(
                     getattr(memory, "add_log", None)
                 ):
@@ -799,15 +1116,27 @@ class THOUGHT:
                         "Thought '{}' error: {}".format(self.name, last_error)
                     )
                 repair_suffix = self._build_repair_suffix(last_error)
-                working_prompt = self._append_repair_suffix(
-                    original_prompt, working_prompt, repair_suffix
-                )
+                if isinstance(original_prompt, str):
+                    pending_repair = repair_suffix
+                else:
+                    working_prompt = self._append_repair_suffix(
+                        original_prompt, working_prompt, repair_suffix
+                    )
             retries_left -= 1
             if self.retry_delay:
                 time_module.sleep(self.retry_delay)
 
-        # Restore original prompt after execution (prevents permanent mutation)
+        # Restore original prompt and primary llm after execution
         self.prompt = original_prompt
+        self.llm = primary_llm
+
+        if self.record_prompt and self.name and result is not None and self.last_prompt is not None:
+            if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+                memory.set_var(
+                    "{}_prompt".format(self.name),
+                    self.last_prompt,
+                    desc="Rendered prompt for thought: {}".format(self.name),
+                )
 
         return result, last_error, attempts_made
 
@@ -950,6 +1279,17 @@ class THOUGHT:
             self.last_error = str(e)
             return None, str(e), 1
 
+    def _validate_required_vars(self, ctx):
+        """Raise TemplateRenderError if any configured required_vars are missing or None."""
+        missing = [
+            var for var in (self.required_vars or [])
+            if var not in ctx or ctx[var] is None
+        ]
+        if missing:
+            raise TemplateRenderError(
+                "Required prompt variables missing: {}".format(", ".join(missing))
+            )
+
     def build_prompt(self, memory, context_vars=None):
         """
         Build the prompt for the LLM from the configured template and context.
@@ -965,9 +1305,13 @@ class THOUGHT:
         Returns:
             str: The constructed prompt string.
         """
-        ctx = self.get_context(memory)
-        if context_vars:
-            ctx.update(context_vars)
+        if isinstance(context_vars, _PrebuiltContext):
+            ctx = dict(context_vars)
+        else:
+            ctx = self.get_context(memory)
+            if context_vars:
+                ctx.update(context_vars)
+        self._validate_required_vars(ctx)
         prompt = self._render_template_value(self.prompt, ctx)
         self.last_prompt = prompt
         return prompt
@@ -993,11 +1337,13 @@ class THOUGHT:
         if context_vars:
             ctx.update(context_vars)
 
+        self._validate_required_vars(ctx)
+
         sys_prompt = self._render_template_value(
             self.config.get("system_prompt", ""),
             ctx,
         )
-        usr_prompt = self.build_prompt(memory, ctx)
+        usr_prompt = self.build_prompt(memory, _PrebuiltContext(ctx))
 
         msgs = []
         if self._include_history():
@@ -1017,6 +1363,19 @@ class THOUGHT:
                     for event in raw_events
                 ]
 
+        # The rendered prompt already carries the latest user message when the
+        # template references {last_user_msg}; drop the history copy so the
+        # model does not see it twice.
+        referenced = self._referenced_template_vars()
+        if (
+            msgs
+            and msgs[-1].get("role") == "user"
+            and referenced is not None
+            and "last_user_msg" in referenced
+            and msgs[-1].get("content") == ctx.get("last_user_msg")
+        ):
+            msgs = msgs[:-1]
+
         msgs_out = construct_msgs(
             usr_prompt=usr_prompt,
             vars={},
@@ -1026,9 +1385,57 @@ class THOUGHT:
         self.last_msgs = msgs_out
         return msgs_out
 
+    def _referenced_template_vars(self):
+        """
+        Return the set of variable identifiers referenced by this thought's
+        templates and explicit var lists, or ``None`` when all variables may be
+        needed (e.g. ``memory_query`` or ``conditional`` operations).
+
+        Used by ``get_context`` so compressed large objects (``{'_obj_ref': ...}``)
+        stored in MEMORY are only decompressed when actually referenced.
+        """
+        op = self.operation or "llm_call"
+        if op in ("memory_query", "conditional") or callable(self.prompt):
+            return None
+
+        referenced = set(self.required_vars or []) | set(self.optional_vars or [])
+        sys_tpl = self.config.get("system_prompt")
+        if isinstance(sys_tpl, str):
+            referenced.update(_TEMPLATE_FIELD_RE.findall(sys_tpl))
+
+        if isinstance(self.prompt, str):
+            referenced.update(_TEMPLATE_FIELD_RE.findall(self.prompt))
+        elif isinstance(self.prompt, dict):
+            for section in self.prompt.values():
+                if isinstance(section, str):
+                    referenced.update(_TEMPLATE_FIELD_RE.findall(section))
+        elif self.prompt is not None:
+            return None
+
+        return referenced
+
+    @staticmethod
+    def _raw_var_is_obj_ref(memory, var_name):
+        """Return True when the latest stored entry for ``var_name`` is a compressed object ref."""
+        vars_map = getattr(memory, "vars", None)
+        if not isinstance(vars_map, dict):
+            return False
+        history = vars_map.get(var_name)
+        if not isinstance(history, list) or not history:
+            return False
+        last_entry = history[-1]
+        if isinstance(last_entry, (list, tuple)) and len(last_entry) >= 2:
+            return is_obj_ref(last_entry[1])
+        return False
+
     def get_context(self, memory):
         """
         Extract relevant context from the MEMORY object for this thought.
+
+        Plain scalar/collection variables are copied into context directly, while
+        compressed large-object references (``_obj_ref``) are decompressed lazily
+        only when referenced by ``prompt``, ``system_prompt``, ``required_vars``,
+        or ``optional_vars``.
 
         Args:
             memory: MEMORY object.
@@ -1037,6 +1444,7 @@ class THOUGHT:
             dict: Context variables for prompt filling.
         """
         ctx = {}
+        needed_vars = self._referenced_template_vars()
         # If required_vars is specified, try to get those from memory
         if hasattr(self, "required_vars") and self.required_vars:
             for var in self.required_vars:
@@ -1049,7 +1457,8 @@ class THOUGHT:
                     val = getattr(memory, var, None)
                 if val is not None:
                     ctx[var] = val
-        # Optionally, add optional_vars if present in memory
+        # Optionally, add optional_vars if present in memory (default to empty
+        # string when unset so {opt} placeholders in format mode still render)
         if hasattr(self, "optional_vars") and self.optional_vars:
             for var in self.optional_vars:
                 if hasattr(memory, "get_var") and callable(
@@ -1058,8 +1467,7 @@ class THOUGHT:
                     val = memory.get_var(var)
                 else:
                     val = getattr(memory, var, None)
-                if val is not None:
-                    ctx[var] = val
+                ctx[var] = val if val is not None else ""
         # Add some common context keys if available (content_only=True for prompt templates)
         if hasattr(memory, "last_user_msg") and callable(
             getattr(memory, "last_user_msg", None)
@@ -1073,6 +1481,14 @@ class THOUGHT:
             ctx["messages"] = memory.get_msgs(repr="list")
         if hasattr(memory, "vars"):
             for var_name in memory.vars:
+                if var_name in ctx:
+                    continue
+                if (
+                    needed_vars is not None
+                    and var_name not in needed_vars
+                    and self._raw_var_is_obj_ref(memory, var_name)
+                ):
+                    continue
                 if hasattr(memory, "get_var") and callable(
                     getattr(memory, "get_var", None)
                 ):
@@ -1222,16 +1638,80 @@ class THOUGHT:
         validator = self.validation if self.validation is not None else self.config.get("validator", None)
         return validator is not None and callable(validator)
 
+    @staticmethod
+    def _evaluate_declarative_rules(parsed_result, rules):
+        """
+        Evaluate a JSON-serializable list of declarative validation rule dicts.
+
+        Supported rule ops:
+          - ``{"op": "in", "field": "k", "allowed": [...]}``
+          - ``{"op": "non_empty", "field": "k"}``
+          - ``{"op": "range", "field": "k", "min": 0, "max": 100}``
+          - ``{"op": "regex", "field": "k", "pattern": "^...$"}``
+          - ``{"op": "has_keys", "keys": ["k1", "k2"]}``
+
+        When ``field`` is omitted on ``in``, ``non_empty``, ``range``, or
+        ``regex``, the rule validates ``parsed_result`` directly rather than a
+        dict field, enabling pure-JSON portable THOUGHT definitions without
+        unserializable Python lambdas.
+        """
+        for rule in rules:
+            if not isinstance(rule, dict) or "op" not in rule:
+                return False, "Invalid declarative validation rule: {!r}".format(rule)
+            op = rule["op"]
+            if op == "has_keys":
+                req_keys = rule.get("keys") or []
+                if not isinstance(parsed_result, dict):
+                    return False, "Result is not a dict"
+                missing = [k for k in req_keys if k not in parsed_result]
+                if missing:
+                    return False, "Missing keys: {}".format(missing)
+                continue
+
+            field = rule.get("field")
+            if field is not None:
+                if not isinstance(parsed_result, dict):
+                    return False, "Expected dict to validate field '{}'".format(field)
+                val = parsed_result.get(field)
+                label = field
+            else:
+                val = parsed_result
+                label = "value"
+
+            if op == "in":
+                allowed = rule.get("allowed") or []
+                if val not in allowed:
+                    return False, "{}={!r} must be one of {}".format(label, val, allowed)
+            elif op == "non_empty":
+                if val is None or (isinstance(val, (str, list, dict)) and len(val.strip() if isinstance(val, str) else val) == 0):
+                    return False, "{} must be non-empty".format(label)
+            elif op == "range":
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    return False, "{}={!r} must be numeric".format(label, val)
+                low = rule.get("min")
+                high = rule.get("max")
+                if low is not None and val < low:
+                    return False, "{}={!r} must be >= {}".format(label, val, low)
+                if high is not None and val > high:
+                    return False, "{}={!r} must be <= {}".format(label, val, high)
+            elif op == "regex":
+                pattern = rule.get("pattern", "")
+                if not isinstance(val, str) or re.search(pattern, val) is None:
+                    return False, "{}={!r} must match pattern {!r}".format(label, val, pattern)
+            else:
+                return False, "Unknown declarative validation op {!r}".format(op)
+        return True, ""
+
     def validate(self, parsed_result):
         """
         Validate the parsed result according to the thought's rules.
 
         The canonical spelling is the ``validation=`` constructor kwarg, which
-        accepts either a callable returning (bool, why) or a bare bool (coerced
-        automatically), or one of the built-in validator strings ('any',
-        'has_keys:k1,k2', 'list_min_len:N', 'summary_v1'). The ``validator=``
-        config key is the equivalent config-style spelling and remains fully
-        supported; both behave identically.
+        accepts a callable returning ``(bool, why)`` or bare ``bool``, one of
+        the built-in validator strings (``'any'``, ``'has_keys:k1,k2'``,
+        ``'list_min_len:N'``, ``'summary_v1'``), or a JSON-serializable list of
+        declarative rule dicts (``in``, ``non_empty``, ``range``, ``regex``,
+        ``has_keys``). The ``validator=`` config key behaves identically.
 
         When validation_mode='rescue' and schema parsing failed but left a
         pending schema error, the callable validator may accept the payload.
@@ -1243,7 +1723,7 @@ class THOUGHT:
             (bool, why): True if valid, False otherwise, and reason string.
         """
         # Resolve the validation spec: validation= kwarg takes precedence,
-        # then the validator= config key. Both accept callables or strings.
+        # then the validator= config key.
         validator = self.validation if self.validation is not None else self.config.get("validator", None)
 
         if validator is not None and callable(validator):
@@ -1263,6 +1743,8 @@ class THOUGHT:
                 return False, "Validation exception: {}".format(e)
         if validator is None or validator == "any":
             return True, ""
+        if isinstance(validator, (list, tuple)):
+            return self._evaluate_declarative_rules(parsed_result, validator)
         elif isinstance(validator, str):
             if validator.startswith("has_keys:"):
                 keys = [k.strip() for k in validator.split(":", 1)[1].split(",")]
@@ -1319,32 +1801,86 @@ class THOUGHT:
             setattr(memory, varname, result)
         return memory
 
+    _TYPE_TO_EXEMPLAR = {
+        str: "",
+        int: 0,
+        float: 0.0,
+        bool: False,
+        list: [],
+        dict: {},
+        type(None): None,
+    }
+
+    @staticmethod
+    def _sanitize_for_json(value):
+        """
+        Recursively strip callables and convert Python schema marker types
+        (``str``, ``int``, ``float``, ``bool``, ``list``, ``dict``) into their
+        equivalent JSON exemplars so ``json.dumps(thought.to_dict())`` succeeds
+        on both exemplar-style and type-style ``parsing_rules`` schemas.
+        """
+        if isinstance(value, type):
+            if value in THOUGHT._TYPE_TO_EXEMPLAR:
+                exemplar = THOUGHT._TYPE_TO_EXEMPLAR[value]
+                return list(exemplar) if isinstance(exemplar, list) else (dict(exemplar) if isinstance(exemplar, dict) else exemplar)
+            return value.__name__
+        if callable(value):
+            return None
+        if isinstance(value, dict):
+            cleaned = {}
+            for k, v in value.items():
+                if callable(v) and not isinstance(v, type):
+                    continue
+                cleaned[k] = THOUGHT._sanitize_for_json(v)
+            return cleaned
+        if isinstance(value, (list, tuple)):
+            return [
+                THOUGHT._sanitize_for_json(item)
+                for item in value
+                if not (callable(item) and not isinstance(item, type))
+            ]
+        return value
+
     def to_dict(self):
         """
-        Return a serializable dictionary representation of this THOUGHT.
+        Return a JSON-serializable dictionary representation of this THOUGHT.
         
-        Note: The LLM instance, parse_fn, validation, and hooks cannot be serialized,
-        so they are represented by type/name only. When deserializing, these must be
-        provided separately.
+        Callables (``llm``, ``parse_fn``, callable ``validation``, ``on_failure``,
+        ``on_token``, ``pre_hook``, ``post_hook``) are omitted from ``config``
+        and summarized via ``has_*`` boolean flags so ``json.dumps(thought.to_dict())``
+        never fails. Declarative ``validation`` rules (lists of rule dicts or
+        built-in validator strings) are preserved in full.
         
         Returns:
             dict: Serializable representation of this thought.
         """
+        config = dict(self.config)
+        if isinstance(config.get("retry"), dict):
+            # LLM objects are never serialized; has_fallback_llm records the fact.
+            config["retry"] = {k: v for k, v in config["retry"].items() if k != "fallback_llm"}
+        clean_config = self._sanitize_for_json(config)
+        serializable_validation = (
+            self.validation
+            if self.validation is not None and not callable(self.validation)
+            else None
+        )
         return {
             "name": self.name,
             "id": self.id,
             "prompt": self.prompt,
             "operation": self.operation,
-            "config": self.config,
+            "config": clean_config,
             "description": self.description,
             "max_retries": self.max_retries,
             "retry_delay": self.retry_delay,
             "output_var": self.output_var,
             "required_vars": self.required_vars,
             "optional_vars": self.optional_vars,
+            "validation": serializable_validation,
             "execution_history": self.execution_history,
             # Store metadata about non-serializable items
             "llm_type": type(self.llm).__name__ if self.llm else None,
+            "has_fallback_llm": self.retry.get("fallback_llm") is not None,
             "has_parse_fn": self.parse_fn is not None,
             "has_validation": self.validation is not None,
             "has_pre_hook": self.pre_hook is not None,
@@ -1352,7 +1888,7 @@ class THOUGHT:
         }
 
     @classmethod
-    def from_dict(cls, data, llm=None, parse_fn=None, validation=None, pre_hook=None, post_hook=None):
+    def from_dict(cls, data, llm=None, parse_fn=None, validation=None, pre_hook=None, post_hook=None, fallback_llm=None):
         """
         Reconstruct a THOUGHT from a dictionary representation.
         
@@ -1360,15 +1896,44 @@ class THOUGHT:
             data (dict): Dictionary representation of a THOUGHT.
             llm: LLM instance to use (required for execution).
             parse_fn: Optional custom parse function.
-            validation: Optional custom validation function.
+            validation: Optional custom validation function (overrides any
+                declarative validation stored in ``data`` when provided).
             pre_hook: Optional pre-execution hook.
             post_hook: Optional post-execution hook.
+            fallback_llm: Optional LLM for ``retry['fallback_llm']`` (LLM objects
+                are not serialized; ``has_fallback_llm`` in the dict says one was set).
             
         Returns:
             THOUGHT: Reconstructed THOUGHT object.
         """
-        # Extract config and merge with explicit kwargs
-        config = data.get("config", {}).copy()
+        # Pop keys passed explicitly below so **config never raises
+        # TypeError: got multiple values for keyword argument '...'.
+        config = dict(data.get("config") or {})
+        explicit_keys = (
+            "name",
+            "llm",
+            "prompt",
+            "operation",
+            "description",
+            "max_retries",
+            "retry_delay",
+            "output_var",
+            "required_vars",
+            "optional_vars",
+            "parse_fn",
+            "validation",
+            "pre_hook",
+            "post_hook",
+        )
+        config_validation = config.pop("validation", None)
+        for key in explicit_keys:
+            config.pop(key, None)
+
+        effective_validation = (
+            validation
+            if validation is not None
+            else (data.get("validation") if data.get("validation") is not None else config_validation)
+        )
         
         thought = cls(
             name=data.get("name"),
@@ -1382,12 +1947,15 @@ class THOUGHT:
             required_vars=data.get("required_vars", []),
             optional_vars=data.get("optional_vars", []),
             parse_fn=parse_fn,
-            validation=validation,
+            validation=effective_validation,
             pre_hook=pre_hook,
             post_hook=post_hook,
             **config
         )
         
+        if fallback_llm is not None:
+            thought.retry["fallback_llm"] = fallback_llm
+
         # Restore ID if provided
         if data.get("id"):
             thought.id = data["id"]
@@ -1396,6 +1964,20 @@ class THOUGHT:
         thought.execution_history = data.get("execution_history", [])
         
         return thought
+
+    def _copy_config(self):
+        """Deep-copy config, sharing (not copying) the fallback LLM object."""
+        import copy as copy_module
+
+        config = dict(self.config)
+        retry = config.pop("retry", None)
+        copied = copy_module.deepcopy(config)
+        if retry is not None:
+            fallback = retry.get("fallback_llm")
+            copied["retry"] = dict(copy_module.deepcopy(
+                {k: v for k, v in retry.items() if k != "fallback_llm"}
+            ), fallback_llm=fallback)
+        return copied
 
     def copy(self):
         """
@@ -1424,9 +2006,14 @@ class THOUGHT:
             validation=self.validation,
             pre_hook=self.pre_hook,
             post_hook=self.post_hook,
-            **copy_module.deepcopy(self.config)
+            **self._copy_config()
         )
         
+        new_thought.visibility = self.visibility
+        new_thought.instruct_schema = self.instruct_schema
+        new_thought.record_prompt = self.record_prompt
+        new_thought.retry = dict(self.retry)
+
         # Copy internal state
         new_thought.id = event_stamp()  # Generate new ID for the copy
         new_thought.execution_history = copy_module.deepcopy(self.execution_history)

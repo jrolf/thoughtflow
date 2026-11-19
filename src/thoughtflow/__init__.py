@@ -8,12 +8,17 @@ Core Philosophy:
     - Deterministic testing: Record/replay workflows, stable sessions
 
 Core Primitives:
-    - LLM: Multi-provider interface for language model calls
-    - MEMORY: Event-sourced state container (messages, logs, reflections, variables)
-    - THOUGHT: Unit of cognition (Prompt + Context + LLM + Parsing + Validation)
-    - DECIDE: Constrained decisions from finite choices (subclass of THOUGHT)
+    - LLM: Multi-provider interface for generative text (`call`) and structured tool chat (`chat`)
+    - DM: Multi-provider System-One decision models (`choice`, `noul`, `score`, `box`)
+    - EMBED: Multi-provider vector embeddings
+    - MEMORY: Event-sourced state container (messages, scopes, budgets, compaction, suspend/resume)
+    - THOUGHT: Unit of cognition (Prompt + Context + LLM + Parsing + Validation + Outcome)
+    - DECIDE: Constrained decisions over `LLM` or `DM` (`choice`, `noul`, `score`, `multi`)
     - PLAN: Structured multi-step execution plans (subclass of THOUGHT)
-    - ACTION: External operation wrapper with consistent logging
+    - ACTION: Imperative external operation wrapper (+ 14 stdlib verbs)
+    - TOOL / MCP: Declarative model-selectable tools, Model Context Protocol client, and `ReplayTOOL`
+    - AGENT / tool_loop: Governed, write-ahead autonomous tool loop (`ReactAgent`, `ReflectAgent`, `PlanActAgent`)
+    - DELEGATE / CHAT / WORKFLOW / CHRON: Coordination and orchestration primitives
 
 Action Primitives (elemental agent verbs):
     - Communication: SAY, ASK, NOTIFY
@@ -43,16 +48,18 @@ from __future__ import annotations
 
 # Core primitives
 from thoughtflow.llm import LLM, OpenAICompatibleLLM, ReplayLLM, ReplayMissError
+from thoughtflow.llm_chat import ChatError
 from thoughtflow.llm_cache import cached_system, cached_message
 from thoughtflow.providers import GroqLLM, CerebrasLLM, OpenRouterLLM
 from thoughtflow.embed import EMBED, ReplayEMBED
+from thoughtflow.dm import DM, ReplayDM, DecisionError
 from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
 from thoughtflow.thoughts import DECIDE, PLAN
 from thoughtflow.action import ACTION
-from thoughtflow.tool import TOOL
+from thoughtflow.tool import TOOL, ReplayTOOL
 from thoughtflow.mcp import MCP
-from thoughtflow.agent import AGENT
+from thoughtflow.agent import AGENT, tool_loop
 from thoughtflow.agents import ReactAgent, ReflectAgent, PlanActAgent
 from thoughtflow.delegate import DELEGATE
 from thoughtflow.workflow import WORKFLOW
@@ -91,6 +98,7 @@ from thoughtflow._util import (
     construct_msgs,
     valid_extract,
     ValidExtractError,
+    TemplateRenderError,
 )
 
 # Keep message types for potential utility
@@ -105,7 +113,7 @@ try:
 
     __version__ = _get_version("thoughtflow")
 except Exception:
-    __version__ = "0.2.5"
+    __version__ = "0.3.0"
 
 # Public API
 __all__ = [
@@ -113,6 +121,7 @@ __all__ = [
     "LLM",
     "OpenAICompatibleLLM",
     "ReplayLLM",
+    "ChatError",
     "ReplayMissError",
     "GroqLLM",
     "CerebrasLLM",
@@ -121,14 +130,19 @@ __all__ = [
     "cached_message",
     "EMBED",
     "ReplayEMBED",
+    "DM",
+    "ReplayDM",
+    "DecisionError",
     "MEMORY",
     "THOUGHT",
     "DECIDE",
     "PLAN",
     "ACTION",
     "TOOL",
+    "ReplayTOOL",
     "MCP",
     "AGENT",
+    "tool_loop",
     "ReactAgent",
     "ReflectAgent",
     "PlanActAgent",
@@ -163,6 +177,7 @@ __all__ = [
     "construct_msgs",
     "valid_extract",
     "ValidExtractError",
+    "TemplateRenderError",
     # Types
     "Message",
     "MessageList",

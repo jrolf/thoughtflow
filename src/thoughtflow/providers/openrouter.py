@@ -31,6 +31,7 @@ class OpenRouterLLM(LLM):
         app_url="https://github.com/jrolf/thoughtflow",
         **kwargs,
     ):
+        """Initialize an OpenRouterLLM with default ``HTTP-Referer`` and ``X-Title`` transport metadata."""
         kwargs.setdefault("referer", app_url)
         kwargs.setdefault("title", app_title)
         super().__init__(model_id="openrouter:" + model, key=key, **kwargs)

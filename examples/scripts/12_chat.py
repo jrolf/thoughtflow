@@ -33,7 +33,7 @@ def mock_agent(memory):
     """
     user_msg = memory.last_user_msg(content_only=True) or ""
     reply = "I heard you say: '{}'".format(user_msg)
-    memory.add_msg("assistant", reply, channel="chat")
+    memory.add_msg("assistant", reply, channel="cli")
     return memory
 
 
@@ -99,8 +99,11 @@ def demo_programmatic():
 # =============================================================================
 
 if __name__ == "__main__":
+    import sys
+
     # Run the programmatic demo first (no user input needed)
     demo_programmatic()
 
-    # Then launch the interactive demo
-    demo_interactive()
+    # Launch the interactive demo when connected to an interactive terminal
+    if sys.stdin.isatty():
+        demo_interactive()

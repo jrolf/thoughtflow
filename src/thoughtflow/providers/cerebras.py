@@ -32,6 +32,7 @@ class CerebrasLLM(OpenAICompatibleLLM):
     """
 
     def __init__(self, model, key, base_url=None, fallback_keys=None, **kwargs):
+        """Initialize a CerebrasLLM with a Cloudflare-safe User-Agent and optional fallback keys."""
         headers = dict(kwargs.pop("extra_headers", None) or {})
         headers.setdefault("User-Agent", DEFAULT_USER_AGENT)
         super().__init__(

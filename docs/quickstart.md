@@ -254,10 +254,12 @@ See [Deterministic Replay](concepts/replay.md) for the full record/save/replay/a
 
 ## Next Steps
 
-- [LLM](concepts/llm.md) -- Multi-provider model interface
-- [Memory](concepts/memory.md) -- Event-sourced state container
-- [Agent](concepts/agent.md) -- Autonomous tool-use loop
-- [Tools](concepts/tools.md) -- LLM-selectable capabilities
-- [Deterministic Replay](concepts/replay.md) -- Record/replay testing
+- [LLM](concepts/llm.md) -- Multi-provider text & structured native tool-call interface (`call` + `chat`)
+- [Decision Models (DM & DECIDE)](concepts/decisions.md) -- Single-pass System-One routing, `noul` gates, and rubric scoring
+- [Memory](concepts/memory.md) -- Event-sourced state, zero-copy scopes, token budgets, and suspend/resume
+- [Thought](concepts/thought.md) -- Schema dialects, `{name}_outcome`, retry policies, and visibility
+- [Agent](concepts/agent.md) -- Governed write-ahead tool loop, policies, budgets, and methodologies
+- [Tools](concepts/tools.md) -- Context-aware `TOOL`s, `MCP` servers, and `ReplayTOOL`
+- [Deterministic Replay](concepts/replay.md) -- Hermetic record/replay across LLM, DM, EMBED, and TOOL + strict `Harness`
 - [Full API reference](https://github.com/jrolf/thoughtflow/tree/main/primitives) -- Canonical docs for every primitive
 - [README](https://github.com/jrolf/thoughtflow/blob/main/README.md) -- Full documentation with all primitives and patterns

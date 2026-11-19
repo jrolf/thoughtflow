@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from thoughtflow import LLM, cached_system, cached_message
 from thoughtflow.llm import OpenAICompatibleLLM
 from thoughtflow.llm_params import split_call_params, normalize_usage
@@ -30,6 +32,9 @@ class MockHTTPResponse:
         return self
 
     def __exit__(self, *args):
+        pass
+
+    def close(self):
         pass
 
 
@@ -102,7 +107,7 @@ class TestLastErrorAndUsage:
     """WP-P01 / WP-P22: error and usage visibility."""
 
     @patch("urllib.request.urlopen")
-    def test_last_error_on_http_failure(self, mock_urlopen):
+    def test_last_error_on_http_failure(self, mock_urlopen, capsys):
         import urllib.error
 
         mock_urlopen.side_effect = urllib.error.HTTPError(
@@ -110,8 +115,30 @@ class TestLastErrorAndUsage:
         )
         llm = LLM(model_id="openai:gpt-4o", key="k")
         choices = llm.call([{"role": "user", "content": "hi"}])
+        captured = capsys.readouterr()
+        assert captured.out == ""
         assert llm.last_error is not None
         assert choices == []
+
+    def test_default_request_timeout_and_unsupported_n_validation(self):
+        """Issue #28: default timeout is 120s (None opt-out) and unsupported n raises."""
+        llm_default = LLM(model_id="openai:gpt-4o", key="k")
+        assert llm_default.request_timeout == 120
+
+        llm_blocking = LLM(model_id="openai:gpt-4o", key="k", request_timeout=None)
+        assert llm_blocking.request_timeout is None
+
+        with pytest.raises(ValueError, match="does not support multiple completions"):
+            LLM(model_id="anthropic:claude-3-5-sonnet", key="k").call(
+                [{"role": "user", "content": "hi"}],
+                params={"n": 3},
+            )
+        with pytest.raises(ValueError, match="Streaming does not support"):
+            llm_default.call(
+                [{"role": "user", "content": "hi"}],
+                params={"n": 2},
+                stream=True,
+            )
 
     @patch("urllib.request.urlopen")
     def test_last_usage_normalized_with_cache_tokens(self, mock_urlopen):
@@ -154,16 +181,37 @@ class TestLastErrorAndUsage:
 
 
 class TestReasoningFieldFallback:
-    """WP-P02: content / reasoning fallback."""
+    """Issue #20: reasoning fallback is opt-in; finish_reason is tracked."""
 
     @patch("urllib.request.urlopen")
-    def test_openai_compat_uses_reasoning_when_content_empty(self, mock_urlopen):
+    def test_openai_compat_does_not_leak_reasoning_by_default(self, mock_urlopen):
         mock_urlopen.return_value = MockHTTPResponse({
-            "choices": [{"message": {"content": "", "reasoning": "the answer"}}]
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning": "internal chain of thought"},
+            }]
         })
         llm = OpenAICompatibleLLM(model="gpt-oss-120b", base_url="https://api.cerebras.ai/v1")
         choices = llm.call([{"role": "user", "content": "hi"}])
+        assert choices == [""]
+        assert llm.last_finish_reason == "length"
+
+    @patch("urllib.request.urlopen")
+    def test_openai_compat_uses_reasoning_when_opted_in(self, mock_urlopen):
+        mock_urlopen.return_value = MockHTTPResponse({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "", "reasoning": "the answer"},
+            }]
+        })
+        llm = OpenAICompatibleLLM(
+            model="gpt-oss-120b",
+            base_url="https://api.cerebras.ai/v1",
+            allow_reasoning_fallback=True,
+        )
+        choices = llm.call([{"role": "user", "content": "hi"}])
         assert choices == ["the answer"]
+        assert llm.last_finish_reason == "stop"
 
 
 class TestPromptCaching:

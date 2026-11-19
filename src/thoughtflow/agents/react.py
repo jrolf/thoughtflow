@@ -14,8 +14,11 @@ an Action, or the iteration limit is reached.
 from __future__ import annotations
 
 import json
+import re
 
 from thoughtflow.agent import AGENT
+
+_FINAL_ANSWER_RE = re.compile(r"(?:^|\n)\s*final answer\s*:\s*", re.IGNORECASE)
 
 
 class ReactAgent(AGENT):
@@ -178,12 +181,12 @@ Available tools: {tool_list}
             tool_calls = self._parse_tool_calls(raw_response)
 
             if not tool_calls:
-                # Final Answer or no action found — extract the answer
+                # Final Answer or no action found — keep everything after the marker,
+                # including multi-line answers (code blocks, lists, paragraphs).
                 final_answer = raw_response
-                for line in raw_response.split("\n"):
-                    if line.strip().lower().startswith("final answer:"):
-                        final_answer = line.strip()[len("Final Answer:"):].strip()
-                        break
+                marker_match = _FINAL_ANSWER_RE.search(raw_response)
+                if marker_match:
+                    final_answer = raw_response[marker_match.end():].strip()
 
                 if hasattr(memory, "add_msg"):
                     memory.add_msg("assistant", final_answer)
@@ -202,6 +205,12 @@ Available tools: {tool_list}
                 if self.on_tool_call:
                     proceed = self.on_tool_call(tool_name, arguments)
                     if proceed is False:
+                        veto_msg = "Tool '{}' was blocked by policy.".format(tool_name)
+                        if hasattr(memory, "add_log"):
+                            memory.add_log(veto_msg)
+                        if hasattr(memory, "add_msg"):
+                            memory.add_msg("assistant", raw_response)
+                            memory.add_msg("user", "Observation: {}".format(veto_msg))
                         continue
 
                 result = self._execute_tool(tool_name, arguments)

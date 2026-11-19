@@ -30,6 +30,7 @@ import copy
 import bisect
 import pickle
 import pprint
+import threading
 import datetime as dtt
 
 from thoughtflow._util import (
@@ -43,6 +44,22 @@ from thoughtflow._util import (
     tz_bog,
     tz_utc,
 )
+
+
+# Module-level lock guarding atomic copy-on-write updates to MEMORY.valid_channels
+# when concurrent worker threads construct scopes with custom room names. Kept off
+# MEMORY instances so copy.deepcopy() and pickle serialization stay unaffected.
+_SCOPE_CHANNEL_LOCK = threading.Lock()
+
+
+def _register_valid_channels(base_memory, channels):
+    """Atomically register custom room/channel names on ``base_memory.valid_channels``."""
+    clean = {ch for ch in channels if ch}
+    if not clean or clean.issubset(base_memory.valid_channels):
+        return
+    with _SCOPE_CHANNEL_LOCK:
+        if not clean.issubset(base_memory.valid_channels):
+            base_memory.valid_channels = base_memory.valid_channels | clean
 
 
 class MEMORY:
@@ -173,6 +190,14 @@ class MEMORY:
     """
 
     def __init__(self):
+        """
+        Initialize an empty event-sourced MEMORY container.
+
+        Sets up four internal layers: ``events`` (stamp-keyed event store),
+        ``idx_*`` (sorted ``[dt_utc, seq, stamp]`` indexes), ``vars`` /
+        ``var_desc_history`` (append-only variable histories with tombstones),
+        and ``objects`` (zlib-compressed large payloads above ``object_threshold``).
+        """
         self.id = event_stamp()
         
         # DATA LAYER: Single source of truth for all events
@@ -187,6 +212,7 @@ class MEMORY:
         self.idx_vars = []          # Variable-change [timestamp, stamp] pairs
         self.idx_all  = []          # Master index (all [timestamp, seq, stamp] triples)
         self._index_seq = 0         # Insertion tie-breaker when dt_utc collides
+        self._event_seq = 0         # Monotonic per-event causal counter persisted on event dicts
         
         # VARIABLE LAYER: Full history with timestamps
         # vars[key] = [[stamp1, value1], [stamp2, value2], ...]
@@ -211,6 +237,7 @@ class MEMORY:
             'system',
             'user',
             'assistant',
+            'tool',
             'reflection',
             'action',
             'query',
@@ -260,6 +287,12 @@ class MEMORY:
         """
         stamp = obj["stamp"]
         timestamp = obj["dt_utc"]
+
+        # Persist a monotonic causal sequence number inside the event dict so
+        # unordered rehydration via from_events() preserves sub-millisecond
+        # write order and variable deletion tombstones across sync/merge.
+        self._event_seq += 1
+        obj.setdefault("_seq", self._event_seq)
 
         # Store in data layer
         self.events[stamp] = obj
@@ -377,17 +410,76 @@ class MEMORY:
                 )
             )
 
-    def add_msg(self, role, content, mode='text', channel='unknown', metadata=None):
+    @staticmethod
+    def _normalize_stored_tool_calls(tool_calls):
+        """Validate and deep-copy assistant tool_calls for storage in MEMORY."""
+        if not isinstance(tool_calls, list):
+            raise ValueError("tool_calls must be a list of dicts or None")
+        normalized = []
+        for idx, tc in enumerate(tool_calls):
+            if not isinstance(tc, dict):
+                raise ValueError("Each tool_call entry must be a dict")
+            item = copy.deepcopy(tc)
+            if not item.get("id"):
+                item["id"] = "call_{}".format(idx)
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _wire_tool_call(tc, idx=0):
+        """Convert a stored tool_call dict into OpenAI wire format."""
+        if "function" in tc and isinstance(tc["function"], dict):
+            fn = dict(tc["function"])
+            args = fn.get("arguments", "")
+            if not isinstance(args, str):
+                fn["arguments"] = json.dumps(args)
+            return {
+                "id": tc.get("id") or "call_{}".format(idx),
+                "type": tc.get("type") or "function",
+                "function": fn,
+            }
+        raw_args = tc.get("raw_arguments")
+        if raw_args is not None and isinstance(raw_args, str):
+            args_str = raw_args
+        else:
+            args_val = tc.get("arguments", {})
+            args_str = args_val if isinstance(args_val, str) else json.dumps(args_val)
+        return {
+            "id": tc.get("id") or "call_{}".format(idx),
+            "type": "function",
+            "function": {
+                "name": tc.get("name", ""),
+                "arguments": args_str,
+            },
+        }
+
+    def add_msg(
+        self,
+        role,
+        content="",
+        mode='text',
+        channel='unknown',
+        metadata=None,
+        tool_calls=None,
+        tool_call_id=None,
+        name=None,
+    ):
         """
-        Add a message event with channel tracking.
-        
+        Add a message event with channel tracking and optional structured tool fields.
+
         Args:
-            role: Message role (user, assistant, system, etc.)
-            content: Message content
+            role: Message role (user, assistant, system, tool, etc.)
+            content: Message content (defaults to ``""``; ``None`` coerced to ``""``)
             mode: Communication mode (text, audio, voice)
             channel: Communication channel (webapp, ios, telegram, etc.)
             metadata: Optional dict of extension metadata (e.g. {'internal': True}
                 for UI-hidden RAG context). Omitted from the stored event when empty.
+            tool_calls: Optional list of tool-call dicts on an ``assistant`` message
+                (either ``LLM.chat()``'s ``{"id", "name", "arguments"}`` shape or
+                OpenAI wire ``{"id", "type", "function": {...}}`` shape).
+            tool_call_id: Optional string ID linking a ``tool`` role message to its
+                preceding assistant tool call. Required when ``role == 'tool'``.
+            name: Optional sender or tool name stored on the message event.
         """
         if role not in self.valid_roles:
             raise ValueError("Invalid role '{}'. Must be one of: {}".format(role, sorted(self.valid_roles)))
@@ -397,8 +489,30 @@ class MEMORY:
             raise ValueError("Invalid channel '{}'. Must be one of: {}".format(channel, sorted(self.valid_channels)))
         if metadata is not None and not isinstance(metadata, dict):
             raise ValueError("metadata must be a dict or None")
-        
-        stamp = event_stamp({'role': role, 'content': content})
+        if tool_calls is not None and role != 'assistant':
+            raise ValueError("tool_calls is only valid on 'assistant' messages, not '{}'".format(role))
+        if role == 'tool':
+            if not tool_call_id or not isinstance(tool_call_id, str):
+                raise ValueError("role='tool' messages require a non-empty string tool_call_id")
+        elif tool_call_id is not None and not isinstance(tool_call_id, str):
+            raise ValueError("tool_call_id must be a string or None")
+
+        if content is None:
+            content = ""
+
+        stored_tool_calls = (
+            self._normalize_stored_tool_calls(tool_calls)
+            if tool_calls is not None
+            else None
+        )
+
+        stamp_seed = {'role': role, 'content': content}
+        if stored_tool_calls is not None:
+            stamp_seed['tool_calls'] = stored_tool_calls
+        if tool_call_id is not None:
+            stamp_seed['tool_call_id'] = tool_call_id
+
+        stamp = event_stamp(stamp_seed)
         msg = {
             'stamp'   : stamp,
             'type'    : 'msg',
@@ -409,6 +523,12 @@ class MEMORY:
             'dt_bog'  : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'  : str(dtt.datetime.now(tz_utc))[:23],
         }
+        if stored_tool_calls is not None:
+            msg['tool_calls'] = stored_tool_calls
+        if tool_call_id is not None:
+            msg['tool_call_id'] = tool_call_id
+        if name is not None:
+            msg['name'] = str(name)
         if metadata:
             msg['metadata'] = metadata
         self._store_event('msg', msg)
@@ -565,15 +685,17 @@ class MEMORY:
 
     def add_exchange(self, kind, key, service, model, request, response):
         """
-        Record a model exchange (LLM or EMBED call) as a memory event.
+        Record a model or tool exchange (LLM, EMBED, DM, or TOOL call) as a memory event.
 
         This is the seam that powers ThoughtFlow's record/replay system:
         because MEMORY is event-sourced, capturing the nondeterministic
         boundary (the model call) as an event makes the whole flow
-        deterministically replayable. See LLM.record() / LLM.replay().
+        deterministically replayable. See LLM.record() / LLM.replay(),
+        EMBED.record() / EMBED.replay(), and DM.record() / DM.replay().
 
         Args:
-            kind: 'chat' for LLM exchanges, 'embed' for EMBED exchanges.
+            kind: 'chat' for LLM exchanges, 'embed' for EMBED exchanges,
+                'decide' for DM exchanges, 'tool' for TOOL exchanges.
             key: Deterministic content hash of the request (exchange_key).
             service: Provider name (e.g. 'openai').
             model: Model name.
@@ -601,7 +723,8 @@ class MEMORY:
         Get recorded model exchanges in chronological order.
 
         Args:
-            kind: Filter by exchange kind ('chat' or 'embed'). None = all.
+            kind: Filter by exchange kind ('chat', 'embed', 'decide', or 'tool').
+                None = all.
 
         Returns:
             List of exchange event dicts.
@@ -673,12 +796,53 @@ class MEMORY:
         else:
             raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
 
-    def get_llm_msgs(self, merge_augments=False, include=None, exclude=None):
+    OPENAI_LLM_ROLES = ('system', 'user', 'assistant', 'tool')
+
+    def _event_to_llm_msg(self, event, format='raw'):
+        """Project one stored message event into an LLM message dict."""
+        role = event.get('role', 'user')
+        content = event.get('content', '')
+        out = {'role': role, 'content': content}
+        if event.get('tool_calls'):
+            if format == 'openai':
+                out['tool_calls'] = [
+                    self._wire_tool_call(tc, idx=i)
+                    for i, tc in enumerate(event['tool_calls'])
+                ]
+            else:
+                out['tool_calls'] = copy.deepcopy(event['tool_calls'])
+        if event.get('tool_call_id'):
+            out['tool_call_id'] = event['tool_call_id']
+        if event.get('name'):
+            out['name'] = event['name']
+        return out
+
+    def get_llm_msgs(
+        self,
+        merge_augments=False,
+        include=None,
+        exclude=None,
+        format='raw',
+        channel=None,
+        metadata_filter=None,
+        exclude_metadata=None,
+        budget_tokens=None,
+        pinned=True,
+        summarizer=None,
+        token_counter=None,
+    ):
         """
         Build LLM-ready message dicts from stored events.
 
-        Default (``merge_augments=False``): one ``{'role', 'content'}`` dict per
-        stored message — the same forwarding semantics AGENT uses today.
+        Default (``format='raw'``, ``merge_augments=False``): one dict per stored
+        message preserving ``role``, ``content``, and any structured ``tool_calls``,
+        ``tool_call_id``, or ``name`` fields.
+
+        When ``format='openai'``, internal non-OpenAI roles (``reflection``,
+        ``logger``, ``query``, ``action``, ``result``) are filtered out unless
+        ``include`` was explicitly passed, and assistant ``tool_calls`` are
+        emitted in OpenAI wire shape (``{"id", "type": "function", "function":
+        {"name", "arguments": "<json>"}}``) ready to pass directly to ``LLM.chat()``.
 
         When ``merge_augments=True``, events tagged ``metadata['augments'] ==
         'last_user'`` are prepended into the most recent preceding user message
@@ -690,17 +854,252 @@ class MEMORY:
                 LLM view only (default False).
             include: Optional list of roles to include (passed to ``get_msgs``).
             exclude: Optional list of roles to exclude (passed to ``get_msgs``).
+            format: ``'raw'`` (default) or ``'openai'`` (provider-valid history).
+            budget_tokens: Optional token budget for the returned view. Oldest
+                unpinned messages are dropped first. Stored events are never
+                modified. ``None`` (default) disables budgeting.
+            pinned: When budgeting, always keep system messages and the most
+                recent user message (default True).
+            summarizer: Optional ``fn(dropped_msgs) -> str``. When messages are
+                dropped for budget, its result is inserted as one system
+                message so the model still sees a digest.
+            token_counter: Optional ``fn(text) -> int``; defaults to a
+                ``len(text) // 4`` estimate.
+
+        Messages covered by a ``compact()`` summary are replaced in the view by
+        that summary (the originals stay in the event log).
 
         Returns:
-            list[dict]: Messages with ``role`` and ``content`` keys.
+            list[dict]: Messages ready for ``LLM.call()`` or ``LLM.chat()``.
         """
-        events = self.get_msgs(include=include, exclude=exclude)
+        if format not in ('raw', 'openai'):
+            raise ValueError("Invalid format '{}'. Choose 'raw' or 'openai'.".format(format))
 
-        if not merge_augments:
-            return [
-                {'role': event.get('role', 'user'), 'content': event.get('content', '')}
-                for event in events
+        effective_include = include
+        if format == 'openai' and effective_include is None:
+            effective_include = list(self.OPENAI_LLM_ROLES)
+
+        events = self.get_msgs(
+            include=effective_include,
+            exclude=exclude,
+            channel=channel,
+            metadata_filter=metadata_filter,
+            exclude_metadata=exclude_metadata,
+        )
+        return self._build_llm_view(
+            events,
+            merge_augments=merge_augments,
+            format=format,
+            budget_tokens=budget_tokens,
+            pinned=pinned,
+            summarizer=summarizer,
+            token_counter=token_counter,
+        )
+
+    @staticmethod
+    def _estimate_tokens(text):
+        """Cheap, dependency-free token estimate (about 4 characters per token)."""
+        return max(1, len(str(text or '')) // 4)
+
+    def _build_llm_view(
+        self,
+        events,
+        merge_augments=False,
+        format='raw',
+        budget_tokens=None,
+        pinned=True,
+        summarizer=None,
+        token_counter=None,
+    ):
+        """Apply compaction summaries, folding, and optional token budgeting."""
+        covered = set()
+        for event in events:
+            meta = event.get('metadata') or {}
+            if meta.get('summary'):
+                covered.update(meta.get('summary_of') or [])
+        if covered:
+            summaries = [e for e in events if (e.get('metadata') or {}).get('summary')]
+            rest = [
+                e for e in events
+                if not (e.get('metadata') or {}).get('summary')
+                and e.get('stamp') not in covered
             ]
+            events = summaries + rest
+
+        msgs = self._fold_llm_events(events, merge_augments=merge_augments, format=format)
+        if budget_tokens is None:
+            return msgs
+
+        count = token_counter or self._estimate_tokens
+
+        def cost(msg):
+            total = count(msg.get('content', ''))
+            if msg.get('tool_calls'):
+                total += count(json.dumps(msg['tool_calls'], default=str))
+            return total
+
+        keep = set()
+        if pinned:
+            for i, msg in enumerate(msgs):
+                if msg.get('role') == 'system':
+                    keep.add(i)
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get('role') == 'user':
+                    keep.add(i)
+                    break
+        used = sum(cost(msgs[i]) for i in keep)
+        for i in range(len(msgs) - 1, -1, -1):
+            if i in keep:
+                continue
+            c = cost(msgs[i])
+            if used + c > budget_tokens:
+                break
+            keep.add(i)
+            used += c
+
+        # Keep tool turns paired: drop an assistant tool_calls message when any of
+        # its results exists but was dropped, then drop results left without a caller.
+        result_idx = {}
+        for i, msg in enumerate(msgs):
+            if msg.get('role') == 'tool':
+                result_idx[msg.get('tool_call_id')] = i
+        for i in sorted(keep):
+            ids = [tc.get('id') for tc in msgs[i].get('tool_calls') or []]
+            if any(cid in result_idx and result_idx[cid] not in keep for cid in ids):
+                keep.discard(i)
+        live_ids = set()
+        for i in sorted(keep):
+            for tc in msgs[i].get('tool_calls') or []:
+                live_ids.add(tc.get('id'))
+        for i in sorted(keep):
+            if msgs[i].get('role') == 'tool' and msgs[i].get('tool_call_id') not in live_ids:
+                keep.discard(i)
+
+        out = [msgs[i] for i in sorted(keep)]
+        dropped = [msgs[i] for i in range(len(msgs)) if i not in keep]
+        if dropped and summarizer is not None:
+            digest = {'role': 'system', 'content': str(summarizer(dropped))}
+            lead = 0
+            while lead < len(out) and out[lead].get('role') == 'system':
+                lead += 1
+            out.insert(lead, digest)
+        return out
+
+    def compact(self, keep=6, summarizer=None, channel='unknown'):
+        """
+        Summarize older conversation turns without deleting them.
+
+        Adds one ``system`` message tagged ``metadata={'summary': True,
+        'internal': True, 'summary_of': [stamps]}`` covering every user,
+        assistant, and tool message except the most recent ``keep``. Original
+        events stay in the log; ``get_llm_msgs`` shows the summary instead of
+        the covered messages. Already-summarized messages are not re-covered.
+
+        Args:
+            keep: Number of most recent conversational messages left untouched.
+            summarizer: Optional ``fn(msgs) -> str`` over the event dicts being
+                covered. Default: one truncated ``role: content`` line each.
+            channel: Channel for the summary message.
+
+        Returns:
+            dict or None: ``{'stamp', 'covered'}`` for the new summary, or
+            ``None`` when there was nothing to compact.
+        """
+        events = self.get_msgs(include=['user', 'assistant', 'tool'])
+        covered = set()
+        for event in self.get_msgs(include=['system']):
+            meta = event.get('metadata') or {}
+            if meta.get('summary'):
+                covered.update(meta.get('summary_of') or [])
+        live = [e for e in events if e.get('stamp') not in covered]
+        cut = max(0, len(live) - keep) if keep > 0 else len(live)
+        # Never split an assistant tool_calls message from its tool results.
+        while 0 < cut < len(live) and live[cut].get('role') == 'tool':
+            cut -= 1
+        older = live[:cut]
+        if not older:
+            return None
+        if summarizer is not None:
+            text = str(summarizer(older))
+        else:
+            text = 'Summary of earlier conversation:\n' + '\n'.join(
+                '{}: {}'.format(e.get('role'), str(e.get('content', ''))[:80])
+                for e in older
+            )
+        stamps = [e['stamp'] for e in older]
+        self.add_msg(
+            'system',
+            text,
+            channel=channel,
+            metadata={'summary': True, 'internal': True, 'summary_of': stamps},
+        )
+        self.emit('memory_compacted', {'covered': len(stamps), 'kept': keep})
+        base = getattr(self, 'base', self)
+        return {'stamp': base.get_msgs(include=['system'])[-1]['stamp'], 'covered': len(stamps)}
+
+    def suspend(self, reason, pending=None, resume_at=None, suspension_id=None):
+        """
+        Mark this run as suspended, waiting for an external decision.
+
+        Stores a ``_suspension`` variable (JSON-safe, survives ``to_dict`` /
+        ``from_dict``) and emits ``run_suspended``. A later
+        ``resolve_suspension`` resumes it exactly once.
+
+        Args:
+            reason: Short string such as ``'approval_required'``.
+            pending: JSON-safe dict describing what is waiting (tool calls, step).
+            resume_at: Optional timestamp or label for scheduled resumes.
+            suspension_id: Optional stable id; defaults to a stamp of the contents.
+
+        Returns:
+            dict: The stored suspension record.
+        """
+        record = {
+            'id': suspension_id or event_stamp({'reason': reason, 'pending': pending, 'n': len(self.get_events())}),
+            'reason': reason,
+            'pending': copy.deepcopy(pending) if pending is not None else {},
+            'resume_at': resume_at,
+            'status': 'suspended',
+            'decision': None,
+        }
+        self.set_var('_suspension', record, desc='Suspended-run marker')
+        self.emit('run_suspended', {'id': record['id'], 'reason': reason})
+        return copy.deepcopy(record)
+
+    def get_suspension(self):
+        """Return the current suspension record, or None if never suspended."""
+        record = self.get_var('_suspension')
+        return copy.deepcopy(record) if record else None
+
+    def is_suspended(self):
+        """True while a suspension is recorded and not yet resolved."""
+        record = self.get_suspension()
+        return bool(record) and record.get('status') == 'suspended'
+
+    def resolve_suspension(self, decision=None):
+        """
+        Resolve the current suspension. Safe to call more than once.
+
+        Returns:
+            dict: ``{'status': 'resolved', 'suspension': record}`` the first
+            time, ``{'status': 'already_resolved', ...}`` on repeats (the stored
+            decision is not overwritten), or ``{'status': 'not_suspended'}``.
+        """
+        record = self.get_suspension()
+        if record is None:
+            return {'status': 'not_suspended', 'suspension': None}
+        if record.get('status') != 'suspended':
+            return {'status': 'already_resolved', 'suspension': record}
+        record['status'] = 'resolved'
+        record['decision'] = copy.deepcopy(decision)
+        self.set_var('_suspension', record, desc='Suspended-run marker')
+        self.emit('run_resumed', {'id': record['id']})
+        return {'status': 'resolved', 'suspension': copy.deepcopy(record)}
+
+    def _fold_llm_events(self, events, merge_augments=False, format='raw'):
+        """Project filtered message events into LLM dicts with optional augment folding."""
+        if not merge_augments:
+            return [self._event_to_llm_msg(event, format=format) for event in events]
 
         result = []
         for event in events:
@@ -710,17 +1109,13 @@ class MEMORY:
                 for i in range(len(result) - 1, -1, -1):
                     if result[i].get('role') == 'user':
                         merged = augment_content + '\n\n' + result[i]['content']
-                        result[i] = {
-                            'role': result[i]['role'],
-                            'content': merged,
-                        }
+                        updated = dict(result[i])
+                        updated['content'] = merged
+                        result[i] = updated
                         break
                 continue
 
-            result.append({
-                'role': event.get('role', 'user'),
-                'content': event.get('content', ''),
-            })
+            result.append(self._event_to_llm_msg(event, format=format))
 
         return result
 
@@ -954,8 +1349,17 @@ class MEMORY:
                 )
             
             if format == 'openai':
-                # OpenAI expects 'user', 'assistant', 'system' roles
-                result.append({'role': role, 'content': content})
+                out_msg = {'role': role, 'content': content}
+                if msg.get('tool_calls'):
+                    out_msg['tool_calls'] = [
+                        self._wire_tool_call(tc, idx=j)
+                        for j, tc in enumerate(msg['tool_calls'])
+                    ]
+                if msg.get('tool_call_id'):
+                    out_msg['tool_call_id'] = msg['tool_call_id']
+                if msg.get('name'):
+                    out_msg['name'] = msg['name']
+                result.append(out_msg)
             else:
                 # List format includes more metadata
                 result.append({
@@ -1355,9 +1759,59 @@ class MEMORY:
         self.idx_vars = mem.idx_vars
         self.idx_all = mem.idx_all
         self._index_seq = mem._index_seq
+        self._event_seq = mem._event_seq
         self.vars = mem.vars
         self.var_desc_history = mem.var_desc_history
         self.objects = mem.objects
+
+    def scope(
+        self,
+        actor,
+        read_rooms=None,
+        write_room=None,
+        public_keys=(),
+        export_keys=(),
+    ):
+        """
+        Return a zero-copy scoped perspective over this MEMORY.
+
+        A scope lets multiple actors, parallel branches, or debate rooms share
+        a single event-sourced MEMORY without copying events, leaking private
+        room messages into another actor's prompt, colliding on scratchpad
+        variables such as ``{name}_result``, or decompressing unrelated large
+        objects stored on the parent memory.
+
+        Args:
+            actor (str): Non-empty identifier for this actor/branch. Scoped
+                variable writes land under ``{actor}__{key}`` unless the key is
+                listed in ``export_keys``.
+            read_rooms (iterable[str], optional): Room or channel names this
+                scope may read. When provided, ``get_msgs``, ``get_llm_msgs``,
+                ``last_user_msg``, and ``last_asst_msg`` see only messages
+                whose ``metadata['room']`` or ``channel`` is in ``read_rooms``.
+                When ``None``, all messages on the parent memory are visible.
+            write_room (str, optional): Room/channel name applied to messages
+                added through this scope. Automatically registered in
+                ``self.valid_channels`` so domain rooms (e.g. ``'public_room'``,
+                ``'alpha_board'``) work alongside built-in channels.
+            public_keys (iterable[str], optional): Shared parent variable names
+                readable (read-only unless also in ``export_keys``) through
+                this scope.
+            export_keys (iterable[str], optional): Shared parent variable names
+                that are both readable and writable directly on the parent
+                memory without actor prefixing.
+
+        Returns:
+            _MemoryScope: A MEMORY-compatible view backed directly by ``self``.
+        """
+        return _MemoryScope(
+            base=self,
+            actor=actor,
+            read_rooms=read_rooms,
+            write_room=write_room,
+            public_keys=public_keys,
+            export_keys=export_keys,
+        )
 
     def copy(self):
         """Return a deep copy of the MEMORY instance."""
@@ -1478,6 +1932,12 @@ class MEMORY:
         mem.idx_vars = data.get('idx_vars', [])
         mem.idx_all = data.get('idx_all', [])
         mem._index_seq = len(mem.idx_all)
+        seq_values = [
+            ev.get('_seq', 0)
+            for ev in mem.events.values()
+            if isinstance(ev.get('_seq'), int)
+        ]
+        mem._event_seq = max(seq_values) if seq_values else len(mem.events)
 
         return mem
 
@@ -1503,14 +1963,31 @@ class MEMORY:
         if objects:
             mem.objects = dict(objects)
         
-        # Sort events by timestamp (dt_utc) for chronological order
-        sorted_events = sorted(event_list, key=lambda e: e.get('dt_utc', ''))
+        # Sort events chronologically by dt_utc, breaking sub-millisecond ties
+        # via the persisted _seq counter and event stamp (so merging forked
+        # branches that share post-fork _seq numbers is order-independent),
+        # while falling back to input order only for legacy events without _seq.
+        indexed_events = list(enumerate(event_list))
+        indexed_events.sort(
+            key=lambda pair: (
+                pair[1].get('dt_utc', ''),
+                0 if isinstance(pair[1].get('_seq'), int) else 1,
+                pair[1]['_seq'] if isinstance(pair[1].get('_seq'), int) else pair[0],
+                pair[1].get('stamp', ''),
+            )
+        )
+        sorted_events = [pair[1] for pair in indexed_events]
+        max_seq = 0
+        seen_stamps = set()
         
         for ev in sorted_events:
             stamp = ev.get('stamp')
             timestamp = ev.get('dt_utc', '')
-            if not stamp:
+            if not stamp or stamp in seen_stamps:
                 continue
+            seen_stamps.add(stamp)
+            if isinstance(ev.get('_seq'), int) and ev['_seq'] > max_seq:
+                max_seq = ev['_seq']
             
             event_type = ev.get('type', 'msg')
             
@@ -1557,7 +2034,9 @@ class MEMORY:
                             desc_hist.append([stamp, var_desc])
             
             mem.idx_all.append(ts_pair)
-        
+
+        mem._index_seq = len(mem.idx_all)
+        mem._event_seq = max(max_seq, len(mem.events))
         return mem
 
     def render(
@@ -2060,6 +2539,513 @@ True
 For more details, see the MEMORY class docstring and method documentation.
 ------------------------------------------------------------
 """
+
+
+class _MemoryScope:
+    """
+    Zero-copy scoped perspective over a shared ``MEMORY`` instance.
+
+    Created via ``memory.scope(actor, ...)`` or nested ``scope.scope(sub, ...)``.
+    Implements the ``MEMORY`` surface consumed by ``THOUGHT``, ``DECIDE``,
+    ``PLAN``, ``ACTION``, ``CHAT``, and ``WORKFLOW`` while isolating message
+    visibility (by room/channel) and variable namespaces (``{actor}__{key}`` vs
+    shared ``public_keys`` / ``export_keys``) on a single root event log.
+    """
+
+    def __init__(
+        self,
+        base,
+        actor,
+        read_rooms=None,
+        write_room=None,
+        public_keys=(),
+        export_keys=(),
+        _ancestor_prefixes=(),
+        _export_prefix="",
+    ):
+        """Initialize a zero-copy scoped perspective unwrapping directly to the root MEMORY."""
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("scope actor must be a non-empty string")
+        sub_actor = actor.strip()
+
+        # Unwrap nested _MemoryScope instances so self.base is always the root
+        # MEMORY (avoiding wrapper-chain discrepancies in vars / is_var_deleted).
+        if isinstance(base, _MemoryScope):
+            parent = base
+            root_base = parent.base
+            full_actor = "{}__{}".format(parent.actor, sub_actor)
+            ancestor_prefixes = parent._ancestor_prefixes + (parent.ns,)
+            eff_read_rooms = (
+                set(read_rooms)
+                if read_rooms is not None
+                else (set(parent.read_rooms) if parent.read_rooms is not None else None)
+            )
+            eff_write_room = parent.write_room if write_room is None else write_room
+            eff_export_prefix = parent.ns
+            parent_root_exports = parent._root_export_keys
+        else:
+            root_base = base
+            full_actor = sub_actor
+            ancestor_prefixes = tuple(_ancestor_prefixes or ())
+            eff_read_rooms = set(read_rooms) if read_rooms is not None else None
+            eff_write_room = write_room
+            eff_export_prefix = _export_prefix
+            parent_root_exports = None
+
+        self.base = root_base
+        self.actor = full_actor
+        self.ns = self.actor + "__"
+        self._ancestor_prefixes = ancestor_prefixes
+        self._export_prefix = eff_export_prefix
+        self.read_rooms = eff_read_rooms
+        self.write_room = eff_write_room
+        self.public_keys = set(public_keys or ()) | set(export_keys or ())
+        self.export_keys = set(export_keys or ())
+        if parent_root_exports is None:
+            self._root_export_keys = set(self.export_keys)
+        else:
+            self._root_export_keys = self.export_keys & parent_root_exports
+
+        rooms_to_register = set()
+        if self.write_room:
+            rooms_to_register.add(self.write_room)
+        if self.read_rooms:
+            rooms_to_register.update(self.read_rooms)
+        _register_valid_channels(self.base, rooms_to_register)
+
+    def scope(
+        self,
+        actor,
+        read_rooms=None,
+        write_room=None,
+        public_keys=None,
+        export_keys=(),
+    ):
+        """
+        Create a child scope nested under this scope against the same root ``MEMORY``.
+
+        Variables reside under ``{parent}__{child}__{key}``. When ``public_keys``
+        is omitted, the child inherits the parent's ``public_keys``; keys in
+        ``export_keys`` write back to the parent scope's namespace (or to the
+        root ``MEMORY`` if also exported by the parent scope).
+        """
+        inherited_public = self.public_keys if public_keys is None else public_keys
+        return _MemoryScope(
+            base=self,
+            actor=actor,
+            read_rooms=read_rooms,
+            write_room=write_room,
+            public_keys=inherited_public,
+            export_keys=export_keys,
+        )
+
+    @property
+    def id(self):
+        """Return a composite scope identifier ``'{root_id}:{actor}'``."""
+        return "{}:{}".format(self.base.id, self.actor)
+
+    def _var_key_visible(self, raw_key):
+        """Return True when ``raw_key`` belongs to this scope or its readable public keys."""
+        if raw_key.startswith(self.ns):
+            return True
+        for key in self.public_keys:
+            if raw_key == key:
+                return True
+            for prefix in self._ancestor_prefixes:
+                if raw_key == prefix + key:
+                    return True
+        return False
+
+    def _event_visible(self, event):
+        """Return True when ``event`` is epistemically visible to this actor scope."""
+        etype = event.get('type', 'msg')
+        if etype == 'msg':
+            return self._msg_in_read_rooms(event)
+        if etype == 'var':
+            return self._var_key_visible(event.get('var_name', ''))
+        if etype == 'emit':
+            actor_tag = str((event.get('payload') or {}).get('actor', ''))
+            return actor_tag == self.actor or actor_tag.startswith(self.ns)
+        if etype in ('log', 'ref'):
+            if self.read_rooms is None:
+                return True
+            content = str(event.get('content', ''))
+            return content.startswith("[{}] ".format(self.actor)) or content.startswith("[{}__".format(self.actor))
+        return True
+
+    @property
+    def events(self):
+        """Return a filtered dict of events visible to this scope."""
+        return {
+            stamp: ev
+            for stamp, ev in self.base.events.items()
+            if self._event_visible(ev)
+        }
+
+    @property
+    def objects(self):
+        """Expose the underlying compressed object store for stamp resolution."""
+        return self.base.objects
+
+    @property
+    def valid_roles(self):
+        """Return the set of valid message roles on the root MEMORY."""
+        return self.base.valid_roles
+
+    @property
+    def valid_modes(self):
+        """Return the set of valid communication modes on the root MEMORY."""
+        return self.base.valid_modes
+
+    @property
+    def valid_channels(self):
+        """Return the set of registered channels/rooms on the root MEMORY."""
+        return self.base.valid_channels
+
+    @property
+    def vars(self):
+        """
+        Expose only visible logical variable names mapped to their raw history
+        lists so ``THOUGHT.get_context`` never touches or decompresses foreign
+        actor variables or unrelated large objects on ``self.base``.
+        """
+        visible = {}
+        for key in self.public_keys:
+            if key in self.base.vars and not self.base.is_var_deleted(key):
+                visible[key] = self.base.vars[key]
+            for prefix in self._ancestor_prefixes:
+                cand = prefix + key
+                if cand in self.base.vars and not self.base.is_var_deleted(cand):
+                    visible[key] = self.base.vars[cand]
+        for raw_key, history in self.base.vars.items():
+            if raw_key.startswith(self.ns) and not self.base.is_var_deleted(raw_key):
+                logical = raw_key[len(self.ns):]
+                visible[logical] = history
+        return visible
+
+    def _resolve_read_key(self, key):
+        scoped = self.ns + key
+        if scoped in self.base.vars and not self.base.is_var_deleted(scoped):
+            return scoped
+        if key in self.public_keys:
+            for prefix in reversed(self._ancestor_prefixes):
+                cand = prefix + key
+                if cand in self.base.vars and not self.base.is_var_deleted(cand):
+                    return cand
+            if key in self.base.vars and not self.base.is_var_deleted(key):
+                return key
+        return None
+
+    def _resolve_write_key(self, key):
+        if key in self.export_keys:
+            if key in self._root_export_keys or not self._export_prefix:
+                return key
+            return self._export_prefix + key
+        return self.ns + key
+
+    def get_var(self, key, resolve_refs=True):
+        """Read ``{actor}__{key}`` first, falling back to ancestor/root ``public_keys``."""
+        real = self._resolve_read_key(key)
+        if real is None:
+            return None
+        return self.base.get_var(real, resolve_refs=resolve_refs)
+
+    def get_all_vars(self, resolve_refs=True):
+        """Return a dict of all non-deleted variables visible to this scope."""
+        return {
+            key: self.get_var(key, resolve_refs=resolve_refs)
+            for key in self.vars
+        }
+
+    def set_var(self, key, value, desc=''):
+        """Write ``key`` into ``{actor}__{key}`` (or export target when in ``export_keys``)."""
+        target = self._resolve_write_key(key)
+        return self.base.set_var(target, value, desc=desc)
+
+    def del_var(self, key):
+        """Append a deletion tombstone on this scope's write target for ``key``."""
+        target = self._resolve_write_key(key)
+        if target not in self.base.vars:
+            return None
+        return self.base.del_var(target)
+
+    def is_var_deleted(self, key):
+        """Return True if ``key`` was tombstoned in this scope or in visible ``public_keys``."""
+        scoped = self.ns + key
+        if scoped in self.base.vars:
+            return self.base.is_var_deleted(scoped)
+        if key in self.public_keys:
+            for prefix in reversed(self._ancestor_prefixes):
+                cand = prefix + key
+                if cand in self.base.vars:
+                    return self.base.is_var_deleted(cand)
+            if key in self.base.vars:
+                return self.base.is_var_deleted(key)
+        return False
+
+    def _msg_in_read_rooms(self, event):
+        """Return True when ``event`` belongs to one of this scope's ``read_rooms``."""
+        if self.read_rooms is None:
+            return True
+        meta = event.get('metadata') or {}
+        if meta.get('room') in self.read_rooms:
+            return True
+        return event.get('channel') in self.read_rooms
+
+    def add_msg(
+        self,
+        role,
+        content="",
+        mode='text',
+        channel=None,
+        metadata=None,
+        tool_calls=None,
+        tool_call_id=None,
+        name=None,
+    ):
+        """Append a message tagged with ``actor`` and routed to ``write_room`` by default."""
+        meta = dict(metadata or {})
+        meta.setdefault('actor', self.actor)
+        if self.write_room:
+            meta.setdefault('room', self.write_room)
+        eff_channel = channel or self.write_room or 'unknown'
+        _register_valid_channels(self.base, (eff_channel,))
+        return self.base.add_msg(
+            role,
+            content,
+            mode=mode,
+            channel=eff_channel,
+            metadata=meta,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            name=name,
+        )
+
+    def add_augment(
+        self,
+        content,
+        target='last_user',
+        role='system',
+        mode='text',
+        channel=None,
+        metadata=None,
+    ):
+        """Append a scoped RAG/context augment message into this scope's ``write_room``."""
+        meta = dict(metadata or {})
+        meta['augments'] = target
+        return self.add_msg(role, content, mode=mode, channel=channel, metadata=meta)
+
+    def get_msgs(
+        self,
+        limit=-1,
+        include=None,
+        exclude=None,
+        repr='list',
+        channel=None,
+        metadata_filter=None,
+        exclude_metadata=None,
+    ):
+        """Return messages visible in ``read_rooms`` matching role/channel/metadata filters."""
+        events = self.base.get_msgs(
+            limit=-1,
+            include=include,
+            exclude=exclude,
+            repr='list',
+            channel=channel,
+            metadata_filter=metadata_filter,
+            exclude_metadata=exclude_metadata,
+        )
+        if self.read_rooms is not None:
+            events = [e for e in events if self._msg_in_read_rooms(e)]
+        if limit > 0:
+            events = events[-limit:]
+        if repr == 'list':
+            return events
+        if repr == 'str':
+            return '\n'.join(["{}: {}".format(e['role'], e['content']) for e in events])
+        if repr == 'pprint1':
+            return pprint.pformat(events, indent=1)
+        raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
+
+    def get_events(self, limit=-1, event_types=None, channel=None):
+        """Return master-index events filtered to those epistemically visible to this scope."""
+        events = [
+            e
+            for e in self.base.get_events(limit=-1, event_types=event_types, channel=channel)
+            if self._event_visible(e)
+        ]
+        return events[-limit:] if limit > 0 else events
+
+    def get_logs(self, limit=-1):
+        """Return log entries visible to this scope."""
+        logs = [e for e in self.base.get_logs(limit=-1) if self._event_visible(e)]
+        return logs[-limit:] if limit > 0 else logs
+
+    def get_refs(self, limit=-1):
+        """Return reflection entries visible to this scope."""
+        refs = [e for e in self.base.get_refs(limit=-1) if self._event_visible(e)]
+        return refs[-limit:] if limit > 0 else refs
+
+    def get_llm_msgs(
+        self,
+        merge_augments=False,
+        include=None,
+        exclude=None,
+        format='raw',
+        channel=None,
+        metadata_filter=None,
+        exclude_metadata=None,
+        budget_tokens=None,
+        pinned=True,
+        summarizer=None,
+        token_counter=None,
+    ):
+        """Build LLM-ready message dicts from this scope's visible room history."""
+        if format not in ('raw', 'openai'):
+            raise ValueError("Invalid format '{}'. Choose 'raw' or 'openai'.".format(format))
+        effective_include = include
+        if format == 'openai' and effective_include is None:
+            effective_include = list(MEMORY.OPENAI_LLM_ROLES)
+        events = self.get_msgs(
+            include=effective_include,
+            exclude=exclude,
+            channel=channel,
+            metadata_filter=metadata_filter,
+            exclude_metadata=exclude_metadata,
+        )
+        return self.base._build_llm_view(
+            events,
+            merge_augments=merge_augments,
+            format=format,
+            budget_tokens=budget_tokens,
+            pinned=pinned,
+            summarizer=summarizer,
+            token_counter=token_counter,
+        )
+
+    def compact(self, keep=6, summarizer=None, channel='unknown'):
+        """Summarize older visible turns in this scope without deleting raw events."""
+        return MEMORY.compact(self, keep=keep, summarizer=summarizer, channel=channel)
+
+    def suspend(self, reason, pending=None, resume_at=None, suspension_id=None):
+        """Record a scoped suspension marker under ``{actor}___suspension``."""
+        return MEMORY.suspend(self, reason, pending, resume_at, suspension_id)
+
+    def get_suspension(self):
+        """Return this scope's current suspension record, or None."""
+        return MEMORY.get_suspension(self)
+
+    def is_suspended(self):
+        """Return True while this scope holds an unresolved suspension."""
+        return MEMORY.is_suspended(self)
+
+    def resolve_suspension(self, decision=None):
+        """Idempotently resolve this scope's suspension with ``decision``."""
+        return MEMORY.resolve_suspension(self, decision)
+
+    def last_user_msg(self, content_only=False):
+        """Return the most recent visible ``user`` message in this scope."""
+        msgs = self.get_msgs(include=['user'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_asst_msg(self, content_only=False):
+        """Return the most recent visible ``assistant`` message in this scope."""
+        msgs = self.get_msgs(include=['assistant'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_sys_msg(self, content_only=False):
+        """Return the most recent visible ``system`` message in this scope."""
+        msgs = self.get_msgs(include=['system'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_result_msg(self, content_only=False):
+        """Return the most recent visible ``result`` message in this scope."""
+        msgs = self.get_msgs(include=['result'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_log_msg(self, content_only=False):
+        """Return the most recent visible log entry in this scope."""
+        logs = self.get_logs()
+        if not logs:
+            return '' if content_only else None
+        return logs[-1]['content'] if content_only else logs[-1]
+
+    def last_ref(self, content_only=False):
+        """Return the most recent visible reflection entry in this scope."""
+        refs = self.get_refs()
+        if not refs:
+            return '' if content_only else None
+        return refs[-1]['content'] if content_only else refs[-1]
+
+    def add_log(self, message):
+        """Append a log entry prefixed with ``[{actor}]``."""
+        return self.base.add_log("[{}] {}".format(self.actor, message))
+
+    def add_ref(self, content):
+        """Append a reflection entry prefixed with ``[{actor}]``."""
+        return self.base.add_ref("[{}] {}".format(self.actor, content))
+
+    def emit(self, kind, payload, schema_version=1):
+        """Emit a typed lifecycle event tagged with ``payload['actor'] = self.actor``."""
+        tagged = dict(payload) if isinstance(payload, dict) else payload
+        if isinstance(tagged, dict):
+            tagged.setdefault('actor', self.actor)
+        return self.base.emit(kind, tagged, schema_version=schema_version)
+
+    def get_emits(self, kind=None, limit=-1):
+        """Return lifecycle emits produced by this actor or its nested child scopes."""
+        emits = self.base.get_emits(kind=kind, limit=-1)
+        scoped = [
+            e
+            for e in emits
+            if (e.get('payload') or {}).get('actor') == self.actor
+            or str((e.get('payload') or {}).get('actor', '')).startswith(self.ns)
+        ]
+        return scoped[-limit:] if limit > 0 else scoped
+
+    def set_obj(self, data, name=None, desc='', content_type='auto'):
+        """Store a compressed object on the root MEMORY, scoping ``name`` when provided."""
+        mapped_name = self._resolve_write_key(name) if name else None
+        return self.base.set_obj(data, name=mapped_name, desc=desc, content_type=content_type)
+
+    def get_obj(self, stamp):
+        """Decompress and return an object by stamp from the root MEMORY."""
+        return self.base.get_obj(stamp)
+
+    def get_obj_info(self, stamp):
+        """Return compressed object size/type metadata without decompressing."""
+        return self.base.get_obj_info(stamp)
+
+    def add_exchange(self, kind, key, service, model, request, response):
+        """Record a model/tool exchange on the root MEMORY."""
+        return self.base.add_exchange(kind, key, service, model, request, response)
+
+    def get_exchanges(self, kind=None):
+        """Retrieve recorded exchanges from the root MEMORY."""
+        return self.base.get_exchanges(kind=kind)
+
+    def copy(self):
+        """Return an independent deep copy of both the root MEMORY and this scope view."""
+        copied = _MemoryScope(
+            base=self.base.copy(),
+            actor=self.actor,
+            read_rooms=self.read_rooms,
+            write_room=self.write_room,
+            public_keys=self.public_keys,
+            export_keys=self.export_keys,
+            _ancestor_prefixes=self._ancestor_prefixes,
+            _export_prefix=self._export_prefix,
+        )
+        copied._root_export_keys = set(self._root_export_keys)
+        return copied
 
 
 __all__ = [

@@ -789,6 +789,30 @@ class TestChronStatePersistence:
         chron = CHRON(state_file="/tmp/nonexistent_chron_state_12345.json")
         assert chron._state == {}
 
+    def test_corrupt_state_file_warns_or_raises_and_returned_memory_captured(self, tmp_path):
+        """Issue #27: CHRON warns/raises on corrupt state and preserves action return MEMORY."""
+        bad_state = tmp_path / "corrupt.json"
+        bad_state.write_text("{not valid json")
+
+        with pytest.warns(RuntimeWarning, match="failed to load state file"):
+            chron = CHRON(name="ops", state_file=str(bad_state))
+        assert chron.last_state_error is not None
+
+        with pytest.raises(ValueError):
+            CHRON(name="ops_strict", state_file=str(bad_state), on_state_error="raise")
+
+        def replace_memory(mem):
+            fresh = mem.copy()
+            fresh.set_var("replaced", "yes")
+            return fresh
+
+        shared = MEMORY()
+        chron_mem = CHRON(name="mem_ops")
+        chron_mem.add("swap", every=60, action=replace_memory, memory=shared)
+        res = chron_mem.fire("swap")
+        assert res["memory"].get_var("replaced") == "yes"
+        assert chron_mem._jobs["swap"]["memory"].get_var("replaced") == "yes"
+
 
 # ============================================================================
 # CHRON: Serialization
@@ -898,3 +922,29 @@ class TestChronStartStop:
         chron = CHRON()
         chron.stop()
         assert chron.running is False
+
+
+class TestCronAliases:
+    """Aliases like @daily expand to the standard five fields."""
+
+    def test_aliases_match_their_expansions(self):
+        """
+        Each alias must parse to the same fields as its expansion.
+
+        Remove this test if: We drop alias support from parse_cron.
+        """
+        assert parse_cron("@hourly") == parse_cron("0 * * * *")
+        assert parse_cron("@daily") == parse_cron("0 0 * * *")
+        assert parse_cron("@weekly") == parse_cron("0 0 * * 0")
+        assert parse_cron("@monthly") == parse_cron("0 0 1 * *")
+        assert parse_cron("  @DAILY ") == parse_cron("0 0 * * *")
+
+    def test_unknown_alias_is_an_error(self):
+        """
+        An unknown alias must raise ValueError like any bad expression.
+
+        Remove this test if: We drop alias support from parse_cron.
+        """
+        import pytest
+        with pytest.raises(ValueError):
+            parse_cron("@sometimes")
