@@ -15,10 +15,11 @@ be formatted into the JSON structure expected by LLM provider tool-calling APIs.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time as time_module
 
-from thoughtflow._util import event_stamp, exchange_key
+from thoughtflow._util import estimate_size, event_stamp, exchange_key
 
 
 class TOOL:
@@ -222,13 +223,23 @@ class TOOL:
             })
             if rec_mem is not None:
                 with self._record_lock:
+                    threshold = getattr(rec_mem, "object_threshold", 10000)
+                    if (
+                        threshold is not None
+                        and hasattr(rec_mem, "set_obj")
+                        and estimate_size(result) > threshold
+                    ):
+                        obj_stamp = rec_mem.set_obj(copy.deepcopy(result))
+                        rec_entry = {"ok": True, "result_obj_ref": obj_stamp}
+                    else:
+                        rec_entry = {"ok": True, "result": copy.deepcopy(result)}
                     rec_mem.add_exchange(
                         kind="tool",
                         key=rec_key,
                         service="tool",
                         model=self.name,
-                        request=rec_request,
-                        response=[{"ok": True, "result": result}],
+                        request=copy.deepcopy(rec_request),
+                        response=[rec_entry],
                     )
             return result
 
@@ -427,6 +438,7 @@ class ReplayTOOL(TOOL):
             fn=source_tool.fn,
         )
         self._source_tool = source_tool
+        self._memory = memory
         self.on_miss = on_miss
         self._lock = threading.Lock()
         self._responses = {}
@@ -484,7 +496,10 @@ class ReplayTOOL(TOOL):
             })
             raise err
 
-        result = entry.get("result")
+        if "result_obj_ref" in entry and hasattr(self._memory, "get_obj"):
+            result = copy.deepcopy(self._memory.get_obj(entry["result_obj_ref"]))
+        else:
+            result = copy.deepcopy(entry.get("result"))
         self.last_result = result
         self.last_error = None
         self.execution_history.append({

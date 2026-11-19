@@ -1671,3 +1671,98 @@ class TestCausalOrderingAndScopes:
         with pytest.raises(ValueError, match="actor"):
             memory.scope("   ")
 
+    def test_from_events_forked_branch_merge_is_order_independent_on_seq_ties(self, memory):
+        """
+        Two branches forked from a common MEMORY share post-fork _seq values;
+        merging their event lists via from_events() must break (dt_utc, _seq)
+        ties deterministically by stamp regardless of argument order.
+        """
+        memory.set_var("shared_seed", "init")
+        branch_a = memory.copy()
+        branch_b = memory.copy()
+
+        # Force identical dt_utc and _seq across the two independent branches.
+        branch_a.set_var("outcome", "from_a")
+        branch_b.set_var("outcome", "from_b")
+        ev_a = [e for s, e in branch_a.events.items() if s not in memory.events][0]
+        ev_b = [e for s, e in branch_b.events.items() if s not in memory.events][0]
+        ev_b["dt_utc"] = ev_a["dt_utc"]
+        assert ev_a["_seq"] == ev_b["_seq"]
+
+        events_a = list(branch_a.snapshot()["events"].values())
+        events_b = list(branch_b.snapshot()["events"].values())
+
+        merged_ab = MEMORY.from_events(events_a + events_b, memory_id=memory.id)
+        merged_ba = MEMORY.from_events(events_b + events_a, memory_id=memory.id)
+
+        assert merged_ab.get_var("outcome") == merged_ba.get_var("outcome")
+        assert [p[-1] for p in merged_ab.idx_all] == [p[-1] for p in merged_ba.idx_all]
+
+    def test_nested_scope_unwraps_root_and_filters_events_and_last_result_msg(self, memory):
+        """
+        Nested scope.scope() must unwrap directly to the root MEMORY (preserving
+        vars/del_var/is_var_deleted), filter scope.events to visible rooms/vars,
+        support concurrent room creation, and expose last_result_msg().
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        memory.set_var("global_cfg", "v1")
+        alpha = memory.scope(
+            "alpha",
+            read_rooms={"public", "alpha_room"},
+            write_room="alpha_room",
+            public_keys={"global_cfg"},
+            export_keys={"final_report"},
+        )
+        beta = memory.scope(
+            "beta",
+            read_rooms={"public", "beta_room"},
+            write_room="beta_room",
+        )
+        beta.add_msg("user", "BETA-PRIVATE-NOTE")
+        beta.set_var("secret_num", 999)
+
+        alpha.set_var("team_brief", "focus on latency")
+        sub = alpha.scope(
+            "worker",
+            public_keys={"global_cfg", "team_brief"},
+            export_keys={"draft", "final_report"},
+        )
+        assert sub.base is memory
+        assert sub.get_var("global_cfg") == "v1"
+        assert sub.get_var("team_brief") == "focus on latency"
+
+        sub.set_var("scratch", "tmp")
+        sub.del_var("scratch")
+        assert sub.is_var_deleted("scratch") is True
+        assert sub.get_var("scratch") is None
+
+        # draft exports to parent scope alpha; final_report exports to root memory
+        sub.set_var("draft", "worker draft")
+        sub.set_var("final_report", "published")
+        assert alpha.get_var("draft") == "worker draft"
+        assert memory.get_var("draft") is None
+        assert memory.get_var("final_report") == "published"
+
+        # scope.events must exclude beta's private room message and secret var
+        visible_contents = [str(ev.get("content", "")) for ev in sub.events.values()]
+        assert all("BETA-PRIVATE-NOTE" not in c for c in visible_contents)
+        assert all(ev.get("var_name") != "beta__secret_num" for ev in sub.events.values())
+
+        # last_result_msg mirrors MEMORY.last_result_msg within visible rooms
+        alpha.add_msg("result", "tool-output-42")
+        beta.add_msg("result", "beta-hidden-result")
+        assert alpha.last_result_msg(content_only=True) == "tool-output-42"
+
+        # Concurrent scope creation across worker threads registers channels atomically
+        def make_worker_scope(i):
+            room = "parallel_room_{}".format(i)
+            sc = memory.scope("w{}".format(i), read_rooms={room}, write_room=room)
+            sc.add_msg("user", "hi {}".format(i))
+            return room
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rooms = list(pool.map(make_worker_scope, range(16)))
+        assert set(rooms).issubset(memory.valid_channels)
+
+

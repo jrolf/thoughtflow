@@ -550,3 +550,48 @@ class TestToolRecordReplay:
         assert spliced({"action": "throttle_tenant"}) == {"applied": "throttle_tenant"}
         assert live_calls == ["inspect", "throttle_tenant"]
 
+    def test_replay_isolates_caller_mutation_and_compresses_large_outputs(self):
+        """
+        Mutating a returned dict/list must not corrupt recorded or replayed
+        entries, and tool outputs exceeding memory.object_threshold must store
+        compressed object refs in memory.objects rather than inline JSON blobs.
+        """
+        from thoughtflow import MEMORY
+
+        def fetch_bundle(doc_id):
+            return {"doc_id": doc_id, "items": ["a", "b"], "body": "Z" * 25000}
+
+        tool = TOOL(
+            name="fetch_bundle",
+            description="Fetch large document bundle",
+            parameters={"doc_id": {"type": "string"}},
+            fn=fetch_bundle,
+        )
+        tape = MEMORY()
+        tool.record(tape)
+
+        live_out = tool({"doc_id": "D-1"})
+        # Mutate returned live object in place to ensure recorded copy is isolated
+        live_out["items"].append("mutated_live")
+
+        exchanges = tape.get_exchanges(kind="tool")
+        assert len(exchanges) == 1
+        assert "result_obj_ref" in exchanges[0]["response"][0]
+        assert "result" not in exchanges[0]["response"][0]
+        # Compressed session JSON stays compact despite 25 KB payload
+        serialized = tape.to_json()
+        assert len(serialized) < 6000
+
+        restored_tape = MEMORY.from_json(serialized)
+        replayed = tool.replay(restored_tape)
+
+        first_replay = replayed({"doc_id": "D-1"})
+        assert first_replay["items"] == ["a", "b"]
+        assert len(first_replay["body"]) == 25000
+
+        # Mutate first replay return in place; second replay must still be pristine
+        first_replay["items"].append("mutated_replay")
+        second_replay = replayed({"doc_id": "D-1"})
+        assert second_replay["items"] == ["a", "b"]
+
+

@@ -30,6 +30,7 @@ import copy
 import bisect
 import pickle
 import pprint
+import threading
 import datetime as dtt
 
 from thoughtflow._util import (
@@ -43,6 +44,22 @@ from thoughtflow._util import (
     tz_bog,
     tz_utc,
 )
+
+
+# Module-level lock guarding atomic copy-on-write updates to MEMORY.valid_channels
+# when concurrent worker threads construct scopes with custom room names. Kept off
+# MEMORY instances so copy.deepcopy() and pickle serialization stay unaffected.
+_SCOPE_CHANNEL_LOCK = threading.Lock()
+
+
+def _register_valid_channels(base_memory, channels):
+    """Atomically register custom room/channel names on ``base_memory.valid_channels``."""
+    clean = {ch for ch in channels if ch}
+    if not clean or clean.issubset(base_memory.valid_channels):
+        return
+    with _SCOPE_CHANNEL_LOCK:
+        if not clean.issubset(base_memory.valid_channels):
+            base_memory.valid_channels = base_memory.valid_channels | clean
 
 
 class MEMORY:
@@ -1711,15 +1728,16 @@ class MEMORY:
             mem.objects = dict(objects)
         
         # Sort events chronologically by dt_utc, breaking sub-millisecond ties
-        # via the persisted _seq counter (or input order for legacy events
-        # created before _seq existed) so unordered batches never invert writes
-        # or resurrect deleted variable tombstones.
+        # via the persisted _seq counter and event stamp (so merging forked
+        # branches that share post-fork _seq numbers is order-independent),
+        # while falling back to input order only for legacy events without _seq.
         indexed_events = list(enumerate(event_list))
         indexed_events.sort(
             key=lambda pair: (
                 pair[1].get('dt_utc', ''),
                 0 if isinstance(pair[1].get('_seq'), int) else 1,
-                pair[1].get('_seq', pair[0]),
+                pair[1]['_seq'] if isinstance(pair[1].get('_seq'), int) else pair[0],
+                pair[1].get('stamp', ''),
             )
         )
         sorted_events = [pair[1] for pair in indexed_events]
@@ -2291,11 +2309,11 @@ class _MemoryScope:
     """
     Zero-copy scoped perspective over a shared ``MEMORY`` instance.
 
-    Created via ``memory.scope(actor, ...)``. Implements the ``MEMORY`` surface
-    consumed by ``THOUGHT``, ``DECIDE``, ``PLAN``, ``ACTION``, ``CHAT``, and
-    ``WORKFLOW`` while isolating message visibility (by room/channel) and
-    variable namespaces (``{actor}__{key}`` vs shared ``public_keys`` /
-    ``export_keys``) on a single underlying event log.
+    Created via ``memory.scope(actor, ...)`` or nested ``scope.scope(sub, ...)``.
+    Implements the ``MEMORY`` surface consumed by ``THOUGHT``, ``DECIDE``,
+    ``PLAN``, ``ACTION``, ``CHAT``, and ``WORKFLOW`` while isolating message
+    visibility (by room/channel) and variable namespaces (``{actor}__{key}`` vs
+    shared ``public_keys`` / ``export_keys``) on a single root event log.
     """
 
     def __init__(
@@ -2306,30 +2324,123 @@ class _MemoryScope:
         write_room=None,
         public_keys=(),
         export_keys=(),
+        _ancestor_prefixes=(),
+        _export_prefix="",
     ):
         if not isinstance(actor, str) or not actor.strip():
             raise ValueError("scope actor must be a non-empty string")
-        self.base = base
-        self.actor = actor.strip()
+        sub_actor = actor.strip()
+
+        # Unwrap nested _MemoryScope instances so self.base is always the root
+        # MEMORY (avoiding wrapper-chain discrepancies in vars / is_var_deleted).
+        if isinstance(base, _MemoryScope):
+            parent = base
+            root_base = parent.base
+            full_actor = "{}__{}".format(parent.actor, sub_actor)
+            ancestor_prefixes = parent._ancestor_prefixes + (parent.ns,)
+            eff_read_rooms = (
+                set(read_rooms)
+                if read_rooms is not None
+                else (set(parent.read_rooms) if parent.read_rooms is not None else None)
+            )
+            eff_write_room = parent.write_room if write_room is None else write_room
+            eff_export_prefix = parent.ns
+            parent_root_exports = parent._root_export_keys
+        else:
+            root_base = base
+            full_actor = sub_actor
+            ancestor_prefixes = tuple(_ancestor_prefixes or ())
+            eff_read_rooms = set(read_rooms) if read_rooms is not None else None
+            eff_write_room = write_room
+            eff_export_prefix = _export_prefix
+            parent_root_exports = None
+
+        self.base = root_base
+        self.actor = full_actor
         self.ns = self.actor + "__"
-        self.read_rooms = set(read_rooms) if read_rooms is not None else None
-        self.write_room = write_room
+        self._ancestor_prefixes = ancestor_prefixes
+        self._export_prefix = eff_export_prefix
+        self.read_rooms = eff_read_rooms
+        self.write_room = eff_write_room
         self.public_keys = set(public_keys or ()) | set(export_keys or ())
         self.export_keys = set(export_keys or ())
+        if parent_root_exports is None:
+            self._root_export_keys = set(self.export_keys)
+        else:
+            self._root_export_keys = self.export_keys & parent_root_exports
 
+        rooms_to_register = set()
         if self.write_room:
-            self.base.valid_channels.add(self.write_room)
+            rooms_to_register.add(self.write_room)
         if self.read_rooms:
-            for room in self.read_rooms:
-                self.base.valid_channels.add(room)
+            rooms_to_register.update(self.read_rooms)
+        _register_valid_channels(self.base, rooms_to_register)
+
+    def scope(
+        self,
+        actor,
+        read_rooms=None,
+        write_room=None,
+        public_keys=None,
+        export_keys=(),
+    ):
+        """
+        Create a child scope nested under this scope against the same root ``MEMORY``.
+
+        Variables reside under ``{parent}__{child}__{key}``. When ``public_keys``
+        is omitted, the child inherits the parent's ``public_keys``; keys in
+        ``export_keys`` write back to the parent scope's namespace (or to the
+        root ``MEMORY`` if also exported by the parent scope).
+        """
+        inherited_public = self.public_keys if public_keys is None else public_keys
+        return _MemoryScope(
+            base=self,
+            actor=actor,
+            read_rooms=read_rooms,
+            write_room=write_room,
+            public_keys=inherited_public,
+            export_keys=export_keys,
+        )
 
     @property
     def id(self):
         return "{}:{}".format(self.base.id, self.actor)
 
+    def _var_key_visible(self, raw_key):
+        if raw_key.startswith(self.ns):
+            return True
+        for key in self.public_keys:
+            if raw_key == key:
+                return True
+            for prefix in self._ancestor_prefixes:
+                if raw_key == prefix + key:
+                    return True
+        return False
+
+    def _event_visible(self, event):
+        etype = event.get('type', 'msg')
+        if etype == 'msg':
+            return self._msg_in_read_rooms(event)
+        if etype == 'var':
+            return self._var_key_visible(event.get('var_name', ''))
+        if etype == 'emit':
+            actor_tag = str((event.get('payload') or {}).get('actor', ''))
+            return actor_tag == self.actor or actor_tag.startswith(self.ns)
+        if etype in ('log', 'ref'):
+            if self.read_rooms is None:
+                return True
+            content = str(event.get('content', ''))
+            return content.startswith("[{}] ".format(self.actor)) or content.startswith("[{}__".format(self.actor))
+        return True
+
     @property
     def events(self):
-        return self.base.events
+        """Return a filtered dict of events visible to this scope."""
+        return {
+            stamp: ev
+            for stamp, ev in self.base.events.items()
+            if self._event_visible(ev)
+        }
 
     @property
     def objects(self):
@@ -2358,6 +2469,10 @@ class _MemoryScope:
         for key in self.public_keys:
             if key in self.base.vars and not self.base.is_var_deleted(key):
                 visible[key] = self.base.vars[key]
+            for prefix in self._ancestor_prefixes:
+                cand = prefix + key
+                if cand in self.base.vars and not self.base.is_var_deleted(cand):
+                    visible[key] = self.base.vars[cand]
         for raw_key, history in self.base.vars.items():
             if raw_key.startswith(self.ns) and not self.base.is_var_deleted(raw_key):
                 logical = raw_key[len(self.ns):]
@@ -2368,12 +2483,21 @@ class _MemoryScope:
         scoped = self.ns + key
         if scoped in self.base.vars and not self.base.is_var_deleted(scoped):
             return scoped
-        if key in self.public_keys and key in self.base.vars and not self.base.is_var_deleted(key):
-            return key
+        if key in self.public_keys:
+            for prefix in reversed(self._ancestor_prefixes):
+                cand = prefix + key
+                if cand in self.base.vars and not self.base.is_var_deleted(cand):
+                    return cand
+            if key in self.base.vars and not self.base.is_var_deleted(key):
+                return key
         return None
 
     def _resolve_write_key(self, key):
-        return key if key in self.export_keys else (self.ns + key)
+        if key in self.export_keys:
+            if key in self._root_export_keys or not self._export_prefix:
+                return key
+            return self._export_prefix + key
+        return self.ns + key
 
     def get_var(self, key, resolve_refs=True):
         real = self._resolve_read_key(key)
@@ -2402,7 +2526,12 @@ class _MemoryScope:
         if scoped in self.base.vars:
             return self.base.is_var_deleted(scoped)
         if key in self.public_keys:
-            return self.base.is_var_deleted(key)
+            for prefix in reversed(self._ancestor_prefixes):
+                cand = prefix + key
+                if cand in self.base.vars:
+                    return self.base.is_var_deleted(cand)
+            if key in self.base.vars:
+                return self.base.is_var_deleted(key)
         return False
 
     def _msg_in_read_rooms(self, event):
@@ -2429,7 +2558,7 @@ class _MemoryScope:
         if self.write_room:
             meta.setdefault('room', self.write_room)
         eff_channel = channel or self.write_room or 'unknown'
-        self.base.valid_channels.add(eff_channel)
+        _register_valid_channels(self.base, (eff_channel,))
         return self.base.add_msg(
             role,
             content,
@@ -2485,6 +2614,22 @@ class _MemoryScope:
             return pprint.pformat(events, indent=1)
         raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
 
+    def get_events(self, limit=-1, event_types=None, channel=None):
+        events = [
+            e
+            for e in self.base.get_events(limit=-1, event_types=event_types, channel=channel)
+            if self._event_visible(e)
+        ]
+        return events[-limit:] if limit > 0 else events
+
+    def get_logs(self, limit=-1):
+        logs = [e for e in self.base.get_logs(limit=-1) if self._event_visible(e)]
+        return logs[-limit:] if limit > 0 else logs
+
+    def get_refs(self, limit=-1):
+        refs = [e for e in self.base.get_refs(limit=-1) if self._event_visible(e)]
+        return refs[-limit:] if limit > 0 else refs
+
     def get_llm_msgs(
         self,
         merge_augments=False,
@@ -2527,6 +2672,24 @@ class _MemoryScope:
             return '' if content_only else None
         return msgs[-1]['content'] if content_only else msgs[-1]
 
+    def last_result_msg(self, content_only=False):
+        msgs = self.get_msgs(include=['result'])
+        if not msgs:
+            return '' if content_only else None
+        return msgs[-1]['content'] if content_only else msgs[-1]
+
+    def last_log_msg(self, content_only=False):
+        logs = self.get_logs()
+        if not logs:
+            return '' if content_only else None
+        return logs[-1]['content'] if content_only else logs[-1]
+
+    def last_ref(self, content_only=False):
+        refs = self.get_refs()
+        if not refs:
+            return '' if content_only else None
+        return refs[-1]['content'] if content_only else refs[-1]
+
     def add_log(self, message):
         return self.base.add_log("[{}] {}".format(self.actor, message))
 
@@ -2541,7 +2704,12 @@ class _MemoryScope:
 
     def get_emits(self, kind=None, limit=-1):
         emits = self.base.get_emits(kind=kind, limit=-1)
-        scoped = [e for e in emits if (e.get('payload') or {}).get('actor') == self.actor]
+        scoped = [
+            e
+            for e in emits
+            if (e.get('payload') or {}).get('actor') == self.actor
+            or str((e.get('payload') or {}).get('actor', '')).startswith(self.ns)
+        ]
         return scoped[-limit:] if limit > 0 else scoped
 
     def set_obj(self, data, name=None, desc='', content_type='auto'):
@@ -2561,14 +2729,18 @@ class _MemoryScope:
         return self.base.get_exchanges(kind=kind)
 
     def copy(self):
-        return _MemoryScope(
+        copied = _MemoryScope(
             base=self.base.copy(),
             actor=self.actor,
             read_rooms=self.read_rooms,
             write_room=self.write_room,
             public_keys=self.public_keys,
             export_keys=self.export_keys,
+            _ancestor_prefixes=self._ancestor_prefixes,
+            _export_prefix=self._export_prefix,
         )
+        copied._root_export_keys = set(self._root_export_keys)
+        return copied
 
 
 __all__ = [

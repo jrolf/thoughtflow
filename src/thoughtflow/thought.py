@@ -32,6 +32,14 @@ from thoughtflow.llm_chat import ChatError
 _TEMPLATE_FIELD_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)")
 
 
+class _PrebuiltContext(dict):
+    """
+    Internal dict marker passed from ``build_msgs`` to ``build_prompt`` so
+    ``build_prompt`` skips a second ``get_context(memory)`` pass without
+    mutating any shared instance attribute across concurrent threads.
+    """
+
+
 class THOUGHT:
     """
     The THOUGHT class represents a single, modular reasoning or action step within an agentic 
@@ -1205,13 +1213,12 @@ class THOUGHT:
         Returns:
             str: The constructed prompt string.
         """
-        active_ctx = getattr(self, "_active_ctx", None)
-        if active_ctx is not None:
-            ctx = dict(active_ctx)
+        if isinstance(context_vars, _PrebuiltContext):
+            ctx = dict(context_vars)
         else:
             ctx = self.get_context(memory)
-        if context_vars:
-            ctx.update(context_vars)
+            if context_vars:
+                ctx.update(context_vars)
         self._validate_required_vars(ctx)
         prompt = self._render_template_value(self.prompt, ctx)
         self.last_prompt = prompt
@@ -1244,11 +1251,7 @@ class THOUGHT:
             self.config.get("system_prompt", ""),
             ctx,
         )
-        self._active_ctx = ctx
-        try:
-            usr_prompt = self.build_prompt(memory, ctx)
-        finally:
-            self._active_ctx = None
+        usr_prompt = self.build_prompt(memory, _PrebuiltContext(ctx))
 
         msgs = []
         if self._include_history():

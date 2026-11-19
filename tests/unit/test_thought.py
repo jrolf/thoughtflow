@@ -2334,3 +2334,33 @@ class TestThoughtObjectLazinessAndPortability:
             "code": "POL-42",
         }
 
+    def test_shared_thought_build_msgs_is_thread_safe_across_scopes(self, memory):
+        """
+        Sharing a single THOUGHT instance across worker threads over distinct
+        memory.scope() views must never mix per-thread context variables.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        class EchoLLM:
+            def call(self, msg_list, params=None):
+                return [msg_list[-1]["content"]]
+
+        shared_step = THOUGHT(
+            name="worker_echo",
+            llm=EchoLLM(),
+            prompt="actor={actor_tag}",
+            include_history=False,
+        )
+
+        def run_scoped(idx):
+            sc = memory.scope("actor_{}".format(idx))
+            sc.set_var("actor_tag", "TAG-{}".format(idx))
+            msgs = shared_step.build_msgs(sc)
+            return idx, msgs[-1]["content"]
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            pairs = list(pool.map(run_scoped, range(24)))
+
+        assert all(text == "actor=TAG-{}".format(idx) for idx, text in pairs)
+
+
