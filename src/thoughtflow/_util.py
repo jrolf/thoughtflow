@@ -178,13 +178,32 @@ Never mix boundaries. Each block is separate.
 This is to improve your ease-of-reading.
 '''
 
+_SUBSTITUTE_TOKEN_RE = re.compile(r"\{\{|\}\}|\{([^{}]+)\}")
+_SUBSTITUTE_ROOT_IDENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:$|[.\[])")
+_FORMATTER = None
+
+
+def _get_formatter():
+    """Lazily construct and reuse one ``string.Formatter`` instance."""
+    global _FORMATTER
+    if _FORMATTER is None:
+        import string as _string_mod
+        _FORMATTER = _string_mod.Formatter()
+    return _FORMATTER
+
+
 def substitute_placeholders(text, ctx):
     """
-    Replace ``{key}`` placeholders only when ``key`` is present in ``ctx``.
+    Replace ``{key}`` placeholders when ``key`` (or its root identifier) is in ``ctx``.
 
-    Unknown placeholders and literal JSON braces are left untouched. Bare words
-    such as ``messages`` are never replaced unless the template contains
-    ``{messages}``.
+    Unifies escape and field-access behavior with ``format`` mode while staying
+    tolerant of raw JSON literals and unknown placeholders:
+      - Doubled braces ``{{`` and ``}}`` unescape to literal ``{`` and ``}``.
+      - Direct keys ``{var}`` present in ``ctx`` render ``str(ctx[var])``.
+      - Dotted/indexed lookups and format specs (``{user[name]}``, ``{items[0]}``,
+        ``{score:.2f}``) render when the root identifier is in ``ctx``.
+      - Unknown placeholders and unescaped JSON braces (``{"status": "ok"}``) are
+        left untouched.
 
     Args:
         text (str): Template string.
@@ -192,19 +211,47 @@ def substitute_placeholders(text, ctx):
 
     Returns:
         str: Rendered string.
+
+    Example:
+        >>> substitute_placeholders('Keep {{"a": 1}} and {"b": 2} for {user[name]}', {"user": {"name": "Ada"}})
+        'Keep {"a": 1} and {"b": 2} for Ada'
     """
     if not isinstance(text, str):
         return str(text)
 
-    pattern = re.compile(r"\{([^}]+)\}")
-
     def replacer(match):
-        key = match.group(1)
-        if key in ctx:
-            return str(ctx[key])
-        return match.group(0)
+        whole = match.group(0)
+        if whole == "{{":
+            return "{"
+        if whole == "}}":
+            return "}"
 
-    return pattern.sub(replacer, text)
+        expr = match.group(1)
+        if expr in ctx:
+            return str(ctx[expr])
+
+        try:
+            formatter = _get_formatter()
+            parsed = list(formatter.parse(whole))
+            if len(parsed) != 1:
+                return whole
+            _, field_name, format_spec, conversion = parsed[0]
+            if not field_name:
+                return whole
+            root_match = _SUBSTITUTE_ROOT_IDENT_RE.match(field_name)
+            if not root_match:
+                return whole
+            root_key = root_match.group(1)
+            if root_key not in ctx:
+                return whole
+            obj, _ = formatter.get_field(field_name, (), ctx)
+            if conversion:
+                obj = formatter.convert_field(obj, conversion)
+            return formatter.format_field(obj, format_spec or "")
+        except (KeyError, IndexError, AttributeError, TypeError, ValueError):
+            return whole
+
+    return _SUBSTITUTE_TOKEN_RE.sub(replacer, text)
 
 
 class TemplateRenderError(ValueError):
@@ -1198,3 +1245,288 @@ def truncate_content(content, stamp, threshold=500, header_len=200, footer_len=2
     footer = content[-footer_len:]
     
     return header + marker + footer
+
+
+#############################################################################
+#############################################################################
+
+### PROMPT VARIABLE RENDERING AND GROUNDED QUOTE VALIDATION
+
+
+def render_vars(source, keys=None, empty="(none)", include_desc=False):
+    """
+    Format a mapping or ``MEMORY`` variable store into clean prompt text lines.
+
+    Accepts either a plain ``dict`` or any object exposing ``get_all_vars()``
+    (such as ``MEMORY`` or ``_MemoryScope``). Scalar values are formatted as
+    strings; nested dicts, lists, and tuples are serialized as compact JSON so
+    the model sees unambiguous structured values.
+
+    Args:
+        source (dict or MEMORY): Mapping of variable names to values, or a
+            ``MEMORY`` / ``_MemoryScope`` instance.
+        keys (list, optional): Explicit ordered list of variable names to
+            include. Missing or ``None`` keys are omitted. Defaults to all
+            present variables in ``source``.
+        empty (str): Fallback string returned when zero variables match
+            (default ``'(none)'``).
+        include_desc (bool): When ``True`` and ``source`` exposes
+            ``get_var_desc(key)``, include non-empty variable descriptions in
+            parentheses next to the variable name.
+
+    Returns:
+        str: Newline-joined ``- key: value`` lines, or ``empty`` when no
+        variables are available.
+
+    Example:
+        >>> render_vars({"topic": "mars", "facts": ["cold", "dry"]})
+        '- topic: mars\\n- facts: ["cold", "dry"]'
+    """
+    if source is None:
+        return empty
+
+    if isinstance(source, Mapping):
+        values_map = dict(source)
+    elif hasattr(source, "get_all_vars") and callable(getattr(source, "get_all_vars", None)):
+        values_map = source.get_all_vars()
+    else:
+        raise TypeError(
+            "render_vars expected a dict or MEMORY-like object, got {}".format(
+                type(source).__name__
+            )
+        )
+
+    ordered_keys = list(keys) if keys is not None else list(values_map.keys())
+    has_desc_fn = include_desc and hasattr(source, "get_var_desc") and callable(
+        getattr(source, "get_var_desc", None)
+    )
+
+    lines = []
+    for key in ordered_keys:
+        if key not in values_map:
+            continue
+        val = values_map[key]
+        if val is None or val is VAR_DELETED:
+            continue
+        if isinstance(val, (dict, list, tuple)):
+            rendered_val = json.dumps(val, ensure_ascii=False, default=str)
+        else:
+            rendered_val = str(val)
+
+        label = str(key)
+        if has_desc_fn:
+            desc = (source.get_var_desc(key) or "").strip()
+            if desc and desc != "No description found.":
+                label = "{} ({})".format(label, desc)
+
+        lines.append("- {}: {}".format(label, rendered_val))
+
+    if not lines:
+        return empty
+    return "\n".join(lines)
+
+
+_QUOTED_SPAN_RE = re.compile(r'"([^"\n]{1,1000})"|\u201c([^\u201d\n]{1,1000})\u201d')
+
+
+def _normalize_quote_ws(text):
+    """Collapse runs of whitespace to single spaces for resilient substring matching."""
+    return " ".join(str(text).split())
+
+
+def _extract_quote_candidates(target, min_length):
+    """Extract candidate quote strings from a string, list of strings, or dict."""
+    if target is None:
+        return []
+
+    if isinstance(target, (list, tuple)):
+        candidates = []
+        for item in target:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip().strip('"').strip("\u201c\u201d").strip()
+            if len(cleaned) >= min_length:
+                candidates.append(cleaned)
+        return candidates
+
+    if isinstance(target, str):
+        candidates = []
+        for match in _QUOTED_SPAN_RE.finditer(target):
+            span = (match.group(1) or match.group(2) or "").strip()
+            if len(span) >= min_length:
+                candidates.append(span)
+        return candidates
+
+    if isinstance(target, dict):
+        if isinstance(target.get("quotes"), (list, tuple)):
+            return _extract_quote_candidates(target["quotes"], min_length)
+        joined_strings = []
+        for val in target.values():
+            if isinstance(val, str):
+                joined_strings.append(val)
+            elif isinstance(val, (list, tuple)):
+                for sub in val:
+                    if isinstance(sub, str):
+                        joined_strings.append('"{}"'.format(sub))
+        return _extract_quote_candidates("\n".join(joined_strings), min_length)
+
+    return []
+
+
+def require_grounded_quotes(
+    source,
+    field=None,
+    min_quotes=1,
+    min_length=8,
+    case_sensitive=False,
+):
+    """
+    Build a ``THOUGHT`` validator requiring verbatim quotes grounded in ``source``.
+
+    Returns a plain ``validator(parsed_result) -> (bool, reason)`` callable
+    suitable for ``THOUGHT(validation=require_grounded_quotes(...))``. Both the
+    source corpus and extracted quotes are whitespace-normalized so line wraps
+    inside source documents do not cause false rejections.
+
+    Args:
+        source (str, list[str], or callable): Ground-truth text corpus, list of
+            passage strings, or a zero-argument callable returning either.
+        field (str, optional): Dict key on ``parsed_result`` holding quotes
+            (either a ``list[str]`` of quote strings or prose containing
+            ``"..."`` spans). When ``None``, inspects ``parsed_result["quotes"]``
+            if present on a dict, or scans ``parsed_result`` directly.
+        min_quotes (int): Minimum number of grounded quotes required (default ``1``).
+        min_length (int): Minimum character length for a span to count as a
+            substantive quote (default ``8``).
+        case_sensitive (bool): Match case strictly when ``True`` (default ``False``).
+
+    Returns:
+        callable: Validator function ``(parsed_result) -> (bool, str)``.
+
+    Example:
+        >>> check = require_grounded_quotes("Mars has a thin CO2 atmosphere.")
+        >>> check('Evidence: "Mars has a thin CO2 atmosphere."')
+        (True, '')
+    """
+    def _resolve_corpus():
+        raw = source() if callable(source) else source
+        if isinstance(raw, (list, tuple)):
+            corpus_text = "\n".join(str(part) for part in raw)
+        else:
+            corpus_text = str(raw or "")
+        normalized = _normalize_quote_ws(corpus_text)
+        return normalized if case_sensitive else normalized.lower()
+
+    def validator(parsed_result):
+        corpus = _resolve_corpus()
+        if not corpus:
+            return False, "Source text for quote verification is empty."
+
+        if field is not None:
+            if not isinstance(parsed_result, dict):
+                return False, "Expected dict output containing field '{}'.".format(field)
+            target = parsed_result.get(field)
+        else:
+            target = parsed_result
+
+        quotes = _extract_quote_candidates(target, min_length=min_length)
+        if len(quotes) < min_quotes:
+            return (
+                False,
+                "Expected at least {} verbatim quote(s) of >= {} chars from the source text, found {}.".format(
+                    min_quotes, min_length, len(quotes)
+                ),
+            )
+
+        for quote in quotes:
+            norm_quote = _normalize_quote_ws(quote)
+            needle = norm_quote if case_sensitive else norm_quote.lower()
+            if needle not in corpus:
+                return (
+                    False,
+                    "Quote is not grounded verbatim in source text: {!r}".format(quote),
+                )
+
+        return True, ""
+
+    return validator
+
+
+_JSON_SCHEMA_TYPES = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def validate_json_schema_basic(obj, schema, path="$"):
+    """
+    Validate ``obj`` against core JSON Schema keywords (``type``, ``required``,
+    ``properties``, ``enum``, ``items``) using only the Python standard library.
+
+    Used by ``THOUGHT(output_schema=...)`` so providers or fallback paths that
+    rely on prompt-guided JSON still enforce schema shape and feed descriptive
+    repair messages into ``THOUGHT``'s retry loop.
+
+    Args:
+        obj: Parsed JSON value.
+        schema (dict): JSON Schema mapping.
+        path (str): JSONPath location for error reporting.
+
+    Returns:
+        tuple: ``(is_valid, reason_string)``.
+    """
+    if not isinstance(schema, Mapping):
+        return True, "ok"
+
+    if "enum" in schema and isinstance(schema["enum"], (list, tuple)):
+        if obj not in schema["enum"]:
+            return False, "{}: expected one of {!r}, got {!r}".format(path, list(schema["enum"]), obj)
+
+    expected_type = schema.get("type")
+    if expected_type is not None:
+        type_list = expected_type if isinstance(expected_type, (list, tuple)) else [expected_type]
+        matched_type = False
+        for tname in type_list:
+            py_type = _JSON_SCHEMA_TYPES.get(tname)
+            if py_type is None:
+                matched_type = True
+                continue
+            if tname in ("integer", "number") and isinstance(obj, bool):
+                continue
+            if isinstance(obj, py_type):
+                matched_type = True
+                break
+        if not matched_type:
+            return False, "{}: expected JSON type {!r}, got {}".format(
+                path, expected_type, type(obj).__name__
+            )
+
+    if isinstance(obj, dict):
+        required = schema.get("required") or []
+        for req_key in required:
+            if req_key not in obj:
+                return False, "{}: missing required key {!r}".format(path, req_key)
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            for prop_key, prop_schema in properties.items():
+                if prop_key in obj:
+                    ok, why = validate_json_schema_basic(
+                        obj[prop_key], prop_schema, "{}.{}".format(path, prop_key)
+                    )
+                    if not ok:
+                        return False, why
+
+    if isinstance(obj, list) and isinstance(schema.get("items"), Mapping):
+        item_schema = schema["items"]
+        for idx, item in enumerate(obj):
+            ok, why = validate_json_schema_basic(item, item_schema, "{}[{}]".format(path, idx))
+            if not ok:
+                return False, why
+
+    return True, "ok"
+
