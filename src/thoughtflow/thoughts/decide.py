@@ -140,6 +140,19 @@ class DECIDE(THOUGHT):
         self.min_margin = kwargs.pop("min_margin", None)
         self.state_spec = kwargs.pop("state", "auto")
 
+        raw_abstain = kwargs.pop("abstain", False)
+        if raw_abstain is False or raw_abstain is None:
+            self.abstain = False
+            self._abstain_token = None
+        elif raw_abstain is True:
+            self.abstain = True
+            self._abstain_token = "none"
+        elif isinstance(raw_abstain, str) and raw_abstain.strip():
+            self.abstain = raw_abstain.strip()
+            self._abstain_token = self.abstain
+        else:
+            raise ValueError("'abstain' must be a bool or non-empty str")
+
         self.levels = None
         self.questions = None
 
@@ -187,7 +200,24 @@ class DECIDE(THOUGHT):
             if not self._choices_list:
                 raise ValueError("'choices' cannot be empty")
             self.decide_mode = "choice"
-            self.choices = choices
+            self.choices = copy.deepcopy(choices)
+            if self._abstain_token is not None:
+                existing_norm = {
+                    (c if self.case_sensitive else str(c).strip().lower())
+                    for c in self._choices_list
+                }
+                token_norm = (
+                    self._abstain_token
+                    if self.case_sensitive
+                    else self._abstain_token.lower()
+                )
+                if token_norm not in existing_norm:
+                    self._choices_list.append(self._abstain_token)
+                if self._choices_descriptions:
+                    self._choices_descriptions.setdefault(
+                        self._abstain_token,
+                        "None of the provided options apply (abstain)",
+                    )
 
         if "max_retries" not in kwargs:
             kwargs["max_retries"] = 5
@@ -232,11 +262,25 @@ class DECIDE(THOUGHT):
     # Generative LLM path (prompt formatting, parsing, validation)
     # ------------------------------------------------------------------ #
 
+    def _is_abstain_value(self, value):
+        """Return ``True`` when ``value`` matches the configured ``abstain`` token."""
+        if self._abstain_token is None or not isinstance(value, str):
+            return False
+        if self.case_sensitive:
+            return value.strip() == self._abstain_token
+        return value.strip().lower() == self._abstain_token.lower()
+
     def build_prompt(self, memory, context_vars=None):
         """Build prompt with formatted choices appended for generative LLMs."""
         base_prompt = super().build_prompt(memory, context_vars)
         choices_section = self._format_choices()
-        instruction = "\n\nRespond with only your choice, nothing else."
+        if self._abstain_token is not None and self.decide_mode == "choice":
+            instruction = (
+                "\n\nIf none of the options apply, respond with '{}'. "
+                "Respond with only your choice, nothing else."
+            ).format(self._abstain_token)
+        else:
+            instruction = "\n\nRespond with only your choice, nothing else."
         return base_prompt + "\n\n" + choices_section + instruction
 
     def _format_choices(self):
@@ -715,7 +759,9 @@ class DECIDE(THOUGHT):
                 self._record_failure(memory, global_attempt, "exception", last_error, raw_response=None)
                 return None, last_error, attempts_made
 
-        self._accumulate_dm_usage(dm_res.get("usage"))
+        dm_usage = dm_res.get("usage")
+        self._accumulate_dm_usage(dm_usage)
+        self._emit_usage_event(memory, dm_usage, client=dm_client)
         self.last_response = dm_res
 
         if self.decide_mode == "multi":
@@ -806,13 +852,33 @@ class DECIDE(THOUGHT):
             else ans["value"]
         )
         passed_gate = self._passes_uncertainty_gate(ans)
-        final_val = raw_val if passed_gate else self.default
+        abstained = False
+        if passed_gate:
+            if self._is_abstain_value(raw_val):
+                final_val = self._abstain_token
+                source = "abstain"
+                abstained = True
+            else:
+                final_val = raw_val
+                source = "model"
+        else:
+            if self.default is not None:
+                final_val = self.default
+                source = "low_confidence"
+            elif self._abstain_token is not None:
+                final_val = self._abstain_token
+                source = "abstain"
+                abstained = True
+            else:
+                final_val = None
+                source = "low_confidence"
 
         self._last_finish_reason = "stop"
         self.last_result = final_val
         self.last_error = None
         self._last_decision_meta = {
-            "source": "model" if passed_gate else "low_confidence",
+            "source": source,
+            "abstained": abstained,
             "stored_value": final_val,
             "raw_value": raw_val,
             "probability": ans.get("probability"),
@@ -858,6 +924,7 @@ class DECIDE(THOUGHT):
                 "value": meta.get("stored_value"),
                 "raw_value": meta.get("raw_value"),
                 "source": meta.get("source"),
+                "abstained": bool(meta.get("abstained", False)),
                 "probability": meta.get("probability"),
                 "probabilities": meta.get("probabilities"),
                 "confidence": meta.get("confidence"),
@@ -871,10 +938,17 @@ class DECIDE(THOUGHT):
             if meta.get("model") is not None:
                 outcome["model"] = meta["model"]
         else:
-            # Generative LLM path (or pre-call template/HTTP error): distinguish model choice from fallback default.
+            # Generative LLM path (or pre-call template/HTTP error): distinguish
+            # model choice, explicit abstention, and fallback default.
+            abstained = False
             if ok:
-                source = "model"
-                val = self.last_result
+                if self._is_abstain_value(self.last_result):
+                    source = "abstain"
+                    abstained = True
+                    val = self._abstain_token
+                else:
+                    source = "model"
+                    val = self.last_result
             elif self.default is not None:
                 source = "default"
                 val = self.default
@@ -886,6 +960,7 @@ class DECIDE(THOUGHT):
                 "value": val,
                 "raw_value": self.last_result if ok else None,
                 "source": source,
+                "abstained": abstained,
                 "probability": None,
                 "probabilities": None,
                 "confidence": None,
@@ -894,6 +969,20 @@ class DECIDE(THOUGHT):
             })
 
         return outcome
+
+    def _write_extra_outcome_vars(self, memory):
+        """Record ``{name}_source`` on ``MEMORY`` alongside ``{name}_outcome``."""
+        if (
+            self.name
+            and isinstance(self.last_outcome, dict)
+            and hasattr(memory, "set_var")
+            and callable(getattr(memory, "set_var", None))
+        ):
+            memory.set_var(
+                "{}_source".format(self.name),
+                self.last_outcome.get("source"),
+                desc="Decision provenance for: {}".format(self.name),
+            )
 
     def update_memory(self, memory, result):
         """Store result in memory, substituting fallback/``default`` when ``result`` is ``None``."""
@@ -918,6 +1007,7 @@ class DECIDE(THOUGHT):
             "levels": copy.deepcopy(self.levels) if self.levels is not None else None,
             "questions": copy.deepcopy(self.questions) if self.questions is not None else None,
             "default": copy.deepcopy(self.default),
+            "abstain": self.abstain,
             "case_sensitive": self.case_sensitive,
             "threshold": self.threshold,
             "min_confidence": self.min_confidence,
@@ -960,6 +1050,7 @@ class DECIDE(THOUGHT):
             "pre_hook",
             "post_hook",
             "default",
+            "abstain",
             "case_sensitive",
             "levels",
             "questions",
@@ -988,6 +1079,7 @@ class DECIDE(THOUGHT):
             levels=data.get("levels"),
             questions=data.get("questions"),
             default=data.get("default"),
+            abstain=data.get("abstain", False),
             case_sensitive=data.get("case_sensitive", False),
             threshold=data.get("threshold", 0.5),
             min_confidence=data.get("min_confidence"),
@@ -1032,6 +1124,7 @@ class DECIDE(THOUGHT):
             "pre_hook",
             "post_hook",
             "default",
+            "abstain",
             "case_sensitive",
             "levels",
             "questions",
@@ -1052,6 +1145,7 @@ class DECIDE(THOUGHT):
             levels=copy.deepcopy(self.levels),
             questions=copy.deepcopy(self.questions),
             default=copy.deepcopy(self.default),
+            abstain=self.abstain,
             case_sensitive=self.case_sensitive,
             threshold=self.threshold,
             min_confidence=self.min_confidence,

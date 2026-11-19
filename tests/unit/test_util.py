@@ -921,3 +921,60 @@ def test_humanize_schema_error_strips_runtime_heap_addresses():
     assert "<ast.Name object>" in cleaned
     assert "Expected schema: {count: int}" in cleaned
 
+
+class TestTemplateParityAndHelpers:
+    """Tests for unified substitute/format parity (#40) and stateless helpers (#51b)."""
+
+    def test_substitute_unescapes_doubled_braces_and_resolves_fields(self):
+        from thoughtflow._util import substitute_placeholders
+
+        ctx = {"topic": "Mars", "user": {"name": "Ada"}, "items": ["alpha", "beta"], "score": 3.14159}
+        tpl = 'Keep {{"escaped": 1}}, {{topic}}, and {"raw": 2} for {user[name]} ({items[0]}, {score:.2f}, {missing})'
+        rendered = substitute_placeholders(tpl, ctx)
+
+        assert '{"escaped": 1}' in rendered
+        assert "{topic}" in rendered
+        assert '{"raw": 2}' in rendered
+        assert "for Ada (alpha, 3.14, {missing})" in rendered
+
+        # Escaped braces behave identically across format and substitute modes
+        shared = "Literal {{braces}} around {topic}"
+        assert render_template(shared, ctx, mode="format") == render_template(shared, ctx, mode="substitute")
+
+    def test_render_vars_formats_dicts_and_memories(self):
+        from thoughtflow import MEMORY
+        from thoughtflow._util import render_vars
+
+        assert render_vars({}) == "(none)"
+        assert render_vars({}, empty="N/A") == "N/A"
+
+        mem = MEMORY()
+        mem.set_var("goal", "orbit", desc="Mission target")
+        mem.set_var("constraints", ["low-fuel", "fast"])
+        mem.set_var("unused", "skip")
+
+        text = render_vars(mem, keys=["goal", "constraints"], include_desc=True)
+        assert '- goal (Mission target): orbit' in text
+        assert '- constraints: ["low-fuel", "fast"]' in text
+        assert "unused" not in text
+
+    def test_require_grounded_quotes_accepts_verbatim_and_rejects_hallucination(self):
+        from thoughtflow._util import require_grounded_quotes
+
+        corpus = "Mars has a thin carbon dioxide\natmosphere and polar ice caps."
+        check_prose = require_grounded_quotes(corpus, min_quotes=1, min_length=10)
+
+        ok, why = check_prose('The passage states: "Mars has a thin carbon dioxide atmosphere".')
+        assert ok is True and why == ""
+
+        ok_bad, why_bad = check_prose('The passage states: "Mars has oceans of liquid water".')
+        assert ok_bad is False
+        assert "not grounded" in why_bad
+
+        check_field = require_grounded_quotes([corpus], field="quotes", min_quotes=2, min_length=8)
+        ok_list, _ = check_field({"quotes": ["thin carbon dioxide", "polar ice caps"]})
+        assert ok_list is True
+        ok_short, why_short = check_field({"quotes": ["polar ice caps"]})
+        assert ok_short is False and "at least 2" in why_short
+
+

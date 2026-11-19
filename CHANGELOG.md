@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MEMORY.upsert(key, value, desc='', metadata=None, source=None)` no-op-when-unchanged variable writes, structured variable metadata (`get_var_meta`, `get_var_meta_history`), `MEMORY.find_vars(...)`, and `MEMORY.get_events(..., since=stamp)` (mirrored on `MEMORY.scope`).
 - `MEMORY.to_json(..., slim=True, keep_recent_turns=None)` lean serverless snapshots, monotonic `MEMORY.revision` counter, `MEMORY.merge(other)` branch union, and atomic file persistence across `MEMORY.save()` and `MEMORY.to_json(filename=...)`.
 - Decoupled `cosine_similarity(vec_a, vec_b)` and `cosine_retrieve(query_vec, items, ...)` helpers in `thoughtflow.embed`.
+- `DECIDE(..., abstain=True | '<token>')` explicit abstention option across `LLM` and `DM`, `outcome['abstained']` flag, and `{name}_source` provenance variable on `MEMORY`.
+- `THOUGHT(..., output_schema={...}, reasoning={'effort': ...})` native provider structured output with automatic fallback to prompt-guided JSON + repair retries, cross-provider reasoning effort normalization, and `'usage'` emits on `MEMORY`.
+- Unified doubled-brace escaping (`{{` / `}}`) and field/spec lookup in `substitute` template mode, atomic `system_prompt` + `prompt` rendering, readable `{messages}` transcript formatting, and `THOUGHT.BUILTIN_TEMPLATE_VARS`.
+- `THOUGHT.run(vars=None, memory=None)` one-liner execution helper plus decoupled `render_vars(...)` and `require_grounded_quotes(...)` utilities in `thoughtflow._util`.
 
 ## [0.3.0] - 2026-11-19
 

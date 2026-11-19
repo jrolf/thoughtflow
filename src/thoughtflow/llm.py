@@ -33,6 +33,7 @@ from thoughtflow.llm_params import (
     merge_call_params,
     split_call_params,
     normalize_usage,
+    normalize_reasoning_params,
     build_gemini_generation_config,
     pick_anthropic_wire_params,
 )
@@ -674,6 +675,7 @@ class LLM:
         self.last_params = dict(merged)
         allow_reasoning = merged.pop("allow_reasoning_fallback", self.allow_reasoning_fallback)
         wire_params, transport = split_call_params(merged)
+        normalize_reasoning_params(wire_params, self.service)
         self.last_finish_reason = None
 
         requested_n = wire_params.get("n")
@@ -772,6 +774,7 @@ class LLM:
         merged = merge_call_params(self.default_params, params or {})
         self.last_params = dict(merged)
         wire_params, transport = split_call_params(merged)
+        normalize_reasoning_params(wire_params, self.service)
 
         key = request = None
         if self._record_memory is not None:

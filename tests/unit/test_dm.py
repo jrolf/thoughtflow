@@ -1014,5 +1014,79 @@ class TestDecideWithDecisionModels:
             assert hid_mem.get_var("h_result") is True
             assert hid_mem.get_msgs(include=["assistant"]) == []
 
+    def test_decide_abstain_and_source_var_across_llm_and_dm(self, mock_llm):
+        """#32: DECIDE supports abstain=True / custom token and records {name}_source."""
+        # 1) Generative LLM chooses reserved 'none' abstain option
+        llm = mock_llm(responses=["none"])
+        router = DECIDE(
+            name="route",
+            llm=llm,
+            choices={"billing": "Invoices", "tech": "Bugs"},
+            prompt="Route: {query}",
+            abstain=True,
+            default="fallback_queue",
+            include_history=False,
+        )
+        mem = MEMORY()
+        out = router.run({"query": "What is the weather in Tokyo?"}, memory=mem)
+        assert out == "none"
+        assert mem.get_var("route_source") == "abstain"
+        assert mem.get_var("route_outcome")["source"] == "abstain"
+        assert mem.get_var("route_outcome")["abstained"] is True
+
+        # Round-trip and copy preserve abstain without duplicating 'none' in user choices
+        cloned = DECIDE.from_dict(json.loads(json.dumps(router.to_dict())), llm=mock_llm(responses=["billing"]))
+        assert cloned.abstain is True
+        assert list(cloned.choices.keys()) == ["billing", "tech"]
+        assert cloned._choices_list == ["billing", "tech", "none"]
+        assert router.copy()._choices_list == ["billing", "tech", "none"]
+
+        # 2) Generative LLM exhausts retries -> source='default', abstained=False
+        bad_llm = mock_llm(responses=["invalid"] * 3)
+        router_def = DECIDE(
+            name="route_def",
+            llm=bad_llm,
+            choices=["billing", "tech"],
+            prompt="Route: {query}",
+            abstain=True,
+            default="fallback_queue",
+            max_retries=2,
+            include_history=False,
+        )
+        mem_def = MEMORY()
+        router_def.run({"query": "help"}, memory=mem_def)
+        assert mem_def.get_var("route_def_result") == "fallback_queue"
+        assert mem_def.get_var("route_def_source") == "default"
+        assert mem_def.get_var("route_def_outcome")["abstained"] is False
+
+        # 3) DM low-confidence gate with abstain='unsure' and no default -> abstains cleanly + emits usage
+        low_conf_dm = _ScriptedDM([{
+            "model": "typesafe/jev-1.14",
+            "answers": {
+                "dm_route": {
+                    "type": "choice",
+                    "choice": "billing",
+                    "probabilities": {"billing": 0.40, "tech": 0.35, "unsure": 0.25},
+                    "confidence": 0.10,
+                }
+            },
+            "usage": {"input_tokens": 30, "output_tokens": 0, "cost": 0.0002},
+        }])
+        dm_step = DECIDE(
+            name="dm_route",
+            model=low_conf_dm,
+            choices=["billing", "tech"],
+            prompt="Classify {query}",
+            abstain="unsure",
+            min_confidence=0.60,
+        )
+        mem_dm = MEMORY()
+        val_dm = dm_step.run({"query": "ambiguous text"}, memory=mem_dm)
+        assert val_dm == "unsure"
+        assert mem_dm.get_var("dm_route_source") == "abstain"
+        assert mem_dm.get_var("dm_route_outcome")["abstained"] is True
+        assert len(mem_dm.get_emits("usage")) == 1
+
+
 
 
