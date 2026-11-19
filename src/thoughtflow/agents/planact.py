@@ -48,37 +48,68 @@ class PlanActAgent(AGENT):
         "Break down the following task into a numbered list of concrete steps. "
         "For each step, specify which tool to use (if any) and what arguments. "
         "Return ONLY a JSON list of objects, each with 'step', 'tool' (or null), "
-        "and 'args' (or {{}}).\n\nTask: {{task}}\n\n"
-        "Available tools: {{tool_list}}"
+        "and 'args' (or {{}}).\n\nTask: {task}\n\n"
+        "Available tools: {tool_list}"
     )
 
-    def __init__(self, plan_prompt=None, replan_on_failure=True, **kwargs):
+    def __init__(self, plan_prompt=None, replan_on_failure=True, max_replans=2, **kwargs):
         """
-        Initialize a PLANACT agent.
+        Initialize a PlanActAgent.
 
         Args:
             plan_prompt (str, optional): Prompt template for plan generation.
-                Uses {task} and {tool_list} placeholders.
-            replan_on_failure (bool): Whether to regenerate the plan when a
-                step fails. Defaults to True.
-            **kwargs: All other arguments passed to AGENT.__init__.
+                Supports ``{task}`` / ``{tool_list}`` (as well as legacy
+                ``{{task}}`` / ``{{tool_list}}``) placeholders without mangling
+                JSON braces.
+            replan_on_failure (bool): Whether to regenerate and execute a new
+                plan when a step fails. Defaults to ``True``.
+            max_replans (int): Maximum number of replan cycles allowed per call
+                (default ``2``).
+            **kwargs: All other arguments passed to ``AGENT.__init__``.
         """
         super().__init__(**kwargs)
         self.plan_prompt = plan_prompt or self.DEFAULT_PLAN_PROMPT
         self.replan_on_failure = replan_on_failure
+        self.max_replans = max(0, int(max_replans))
         self.current_plan = []
         self.execution_log = []
         self.plan_regex = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
+    @staticmethod
+    def _is_tool_failure(result):
+        """
+        Determine whether a tool execution result represents an operational failure.
+
+        Checks structured error dicts (``success is False`` or non-empty ``error``)
+        and explicit ``AGENT._execute_tool`` error strings (``"Error executing ..."``
+        or ``"Error: ..."``) without misclassifying normal prose that happens to
+        begin with the word ``"Error"`` (e.g. ``"Error handling in Python..."``).
+        """
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                return True
+            if result.get("error"):
+                return True
+            if result.get("status") in ("error", "timeout"):
+                return True
+            return False
+        if isinstance(result, str):
+            stripped = result.strip()
+            if stripped.startswith("Error executing ") or stripped.startswith("Error:"):
+                return True
+        return False
+
     def __call__(self, memory):
         """
-        Run the plan-then-execute loop.
+        Run the bounded plan-then-execute-and-replan loop (#24).
 
         1. Extract the task from the last user message
-        2. Generate a plan
-        3. Execute each step
-        4. If a step fails and replan_on_failure is True, regenerate the plan
-        5. Produce a final summary
+        2. Generate an initial plan
+        3. Execute steps sequentially in an outer loop bounded by ``max_replans``
+        4. When a step fails and ``replan_on_failure`` is ``True``, generate a
+           replacement plan for remaining work and execute it
+        5. Produce a final summary and record ``{name}_result``, ``{name}_status``,
+           and ``{name}_outcome``
 
         Args:
             memory: A MEMORY instance.
@@ -88,18 +119,14 @@ class PlanActAgent(AGENT):
         """
         self.execution_log = []
 
-        # Extract the task from the last user message
         task = self._extract_task(memory)
         if not task:
             if hasattr(memory, "add_msg"):
                 memory.add_msg("assistant", "No task found to plan.")
             return memory
 
-        # Generate the plan
         self.current_plan = self._generate_plan(task)
-
         if not self.current_plan:
-            # Fall back to base agent behavior if planning fails
             return super().__call__(memory)
 
         self.execution_log.append({
@@ -112,61 +139,135 @@ class PlanActAgent(AGENT):
         if hasattr(memory, "add_msg"):
             memory.add_msg("assistant", "Plan:\n" + json.dumps(self.current_plan))
 
-        # Execute the plan
-        for step_idx, step in enumerate(self.current_plan):
-            step_desc = step.get("step", "Step {}".format(step_idx + 1))
-            tool_name = step.get("tool")
-            tool_args = step.get("args", {})
+        replans_used = 0
+        steps_executed = 0
 
-            if tool_name and tool_name in self._tool_map:
-                result = self._execute_tool(tool_name, tool_args)
-                success = not str(result).startswith("Error")
+        while self.current_plan:
+            replanned = False
+            for step_idx, step in enumerate(self.current_plan):
+                if not isinstance(step, dict):
+                    step_desc = str(step)
+                    tool_name = None
+                    tool_args = {}
+                else:
+                    raw_label = step.get("step")
+                    step_desc = (
+                        str(raw_label)
+                        if raw_label is not None and str(raw_label) != ""
+                        else "Step {}".format(step_idx + 1)
+                    )
+                    tool_name = step.get("tool")
+                    tool_args = step.get("args") if isinstance(step.get("args"), dict) else {}
 
-                self.execution_log.append({
-                    "step": step_desc,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result": str(result),
-                    "success": success,
-                })
+                steps_executed += 1
 
-                if hasattr(memory, "add_msg"):
-                    memory.add_msg("assistant", "Step: {}\nResult: {}".format(
-                        step_desc, result
-                    ))
+                if tool_name and tool_name in self._tool_map:
+                    result = self._execute_tool(
+                        tool_name,
+                        tool_args,
+                        context={"memory": memory, "agent": self},
+                    )
+                    success = not self._is_tool_failure(result)
 
-                # Replan if step failed
-                if not success and self.replan_on_failure:
-                    remaining_task = self._summarize_remaining(task, step_idx)
-                    self.current_plan = self._generate_plan(remaining_task)
-                    if self.current_plan:
-                        self.execution_log.append({
-                            "step": "Replan",
-                            "tool": None,
-                            "result": json.dumps(self.current_plan),
-                            "success": True,
-                        })
-                        if hasattr(memory, "add_msg"):
-                            memory.add_msg("assistant", "Replan:\n" + json.dumps(self.current_plan))
-                        # Recursively execute the new plan (with reduced depth)
+                    self.execution_log.append({
+                        "step": step_desc,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": str(result),
+                        "success": success,
+                    })
+
+                    if hasattr(memory, "add_msg"):
+                        memory.add_msg(
+                            "assistant",
+                            "Step: {}\nResult: {}".format(step_desc, result),
+                        )
+
+                    if not success and self.replan_on_failure and replans_used < self.max_replans:
+                        replans_used += 1
+                        remaining_task = self._summarize_remaining(task)
+                        new_plan = self._generate_plan(remaining_task)
+                        if new_plan:
+                            self.current_plan = new_plan
+                            self.execution_log.append({
+                                "step": "Replan",
+                                "tool": None,
+                                "result": json.dumps(self.current_plan),
+                                "success": True,
+                            })
+                            if hasattr(memory, "add_msg"):
+                                memory.add_msg(
+                                    "assistant",
+                                    "Replan:\n" + json.dumps(self.current_plan),
+                                )
+                            replanned = True
                         break
-            else:
-                # No tool needed — this is a reasoning step
-                self.execution_log.append({
-                    "step": step_desc,
-                    "tool": None,
-                    "result": "Reasoning step",
-                    "success": True,
-                })
+                elif tool_name and tool_name not in self._tool_map:
+                    err_msg = "Error: unknown tool '{}'".format(tool_name)
+                    self.execution_log.append({
+                        "step": step_desc,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": err_msg,
+                        "success": False,
+                    })
+                    if self.replan_on_failure and replans_used < self.max_replans:
+                        replans_used += 1
+                        remaining_task = self._summarize_remaining(task)
+                        new_plan = self._generate_plan(remaining_task)
+                        if new_plan:
+                            self.current_plan = new_plan
+                            self.execution_log.append({
+                                "step": "Replan",
+                                "tool": None,
+                                "result": json.dumps(self.current_plan),
+                                "success": True,
+                            })
+                            if hasattr(memory, "add_msg"):
+                                memory.add_msg(
+                                    "assistant",
+                                    "Replan:\n" + json.dumps(self.current_plan),
+                                )
+                            replanned = True
+                        break
+                else:
+                    self.execution_log.append({
+                        "step": step_desc,
+                        "tool": None,
+                        "result": "Reasoning step",
+                        "success": True,
+                    })
 
-        # Generate final summary
+            if not replanned:
+                break
+
         summary = self._generate_summary(memory, task)
         if hasattr(memory, "add_msg"):
             memory.add_msg("assistant", summary)
         if hasattr(memory, "set_var"):
             memory.set_var(
-                "{}_result".format(self.name), summary,
-                desc="Final result from PlanActAgent"
+                "{}_result".format(self.name),
+                summary,
+                desc="Final result from PlanActAgent",
+            )
+            memory.set_var(
+                "{}_status".format(self.name),
+                "completed",
+                desc="Execution status for PlanActAgent",
+            )
+            any_unrecovered_failure = any(
+                not e["success"] for e in self.execution_log
+            ) and not (self.execution_log and self.execution_log[-1]["success"])
+            memory.set_var(
+                "{}_outcome".format(self.name),
+                {
+                    "ok": not any_unrecovered_failure,
+                    "status": "completed",
+                    "replans": replans_used,
+                    "steps_executed": steps_executed,
+                    "execution_log": list(self.execution_log),
+                },
+                desc="Structured outcome for PlanActAgent",
             )
 
         return memory
@@ -207,8 +308,10 @@ class PlanActAgent(AGENT):
             tool_descriptions.append("- {}: {}".format(t.name, t.description))
         tool_list = "\n".join(tool_descriptions) if tool_descriptions else "(none)"
 
-        prompt = self.plan_prompt.replace("{{task}}", task)
-        prompt = prompt.replace("{{tool_list}}", tool_list)
+        prompt = self.plan_prompt
+        prompt = prompt.replace("{{task}}", task).replace("{task}", task)
+        prompt = prompt.replace("{{tool_list}}", tool_list).replace("{tool_list}", tool_list)
+        prompt = prompt.replace("{{}}", "{}")
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": prompt},
@@ -237,24 +340,34 @@ class PlanActAgent(AGENT):
 
         return []
 
-    def _summarize_remaining(self, original_task, failed_step_idx):
+    def _summarize_remaining(self, original_task, failed_step_idx=None):
         """
-        Summarize the remaining work after a step failure.
+        Summarize completed vs failed work so a replan avoids repeating broken steps.
 
         Args:
             original_task (str): The original task.
-            failed_step_idx (int): Index of the step that failed.
+            failed_step_idx (int, optional): Legacy index parameter (unused; inspects
+                full ``execution_log`` across replan rounds).
 
         Returns:
-            str: A description of what still needs to be done.
+            str: A description of completed steps, last failure, and remaining work.
         """
-        completed = self.execution_log[:failed_step_idx]
-        completed_desc = ", ".join(e["step"] for e in completed if e["success"])
-        template = (
+        completed = [
+            str(e["step"])
+            for e in self.execution_log
+            if e["success"] and e["step"] not in ("Plan", "Replan")
+        ]
+        failures = [
+            "{} ({})".format(e["step"], e["result"])
+            for e in self.execution_log
+            if not e["success"]
+        ]
+        completed_desc = ", ".join(completed) if completed else "nothing"
+        failure_desc = "; ".join(failures) if failures else "none"
+        return (
             "Original task: {}. Completed so far: {}. "
-            "Continue from where we left off."
-        )
-        return template.format(original_task, completed_desc or "nothing")
+            "Failed steps to work around: {}. Continue from where we left off."
+        ).format(original_task, completed_desc, failure_desc)
 
     def _generate_summary(self, memory, task):
         """

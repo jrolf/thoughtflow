@@ -905,3 +905,57 @@ class TestProtocolAutoUnsupportedService:
 
         with pytest.raises(ValueError):
             AGENT(llm=OllamaLike(), policy={"x": "deny"})(user_memory())
+
+
+class TestPlanActAgentReplansPlaceholdersAndLabels:
+    """Tests for #24: PlanActAgent executes replans, honors {task}/{tool_list}, coerces int step labels."""
+
+    def test_executes_replan_coerces_int_steps_and_substitutes_single_brace_prompt(self):
+        calls = {"flaky": 0}
+
+        def flaky_fn(query):
+            calls["flaky"] += 1
+            return {"success": False, "error": "rate limited"}
+
+        def backup_fn(query):
+            # Starts with 'Error' word in normal prose — must NOT be misjudged as tool failure
+            return "Error handling in Python uses try/except for: " + query
+
+        flaky_tool = TOOL(name="flaky", description="Primary search", parameters={"query": {"type": "string"}}, fn=flaky_fn)
+        backup_tool = TOOL(name="backup", description="Backup search", parameters={"query": {"type": "string"}}, fn=backup_fn)
+
+        plan_1 = json.dumps([
+            {"step": 1, "tool": "flaky", "args": {"query": "exceptions"}},
+            {"step": 2, "tool": None, "args": {}},
+        ])
+        replan_2 = json.dumps([
+            {"step": 3, "tool": "backup", "args": {"query": "exceptions"}},
+        ])
+        llm = MockLLM(responses=[plan_1, replan_2, "Exceptions use try/except."])
+
+        agent = PlanActAgent(
+            llm=llm,
+            tools=[flaky_tool, backup_tool],
+            plan_prompt="Plan task: {task}\nTools:\n{tool_list}",
+            max_replans=2,
+            name="pa",
+        )
+        mem = MEMORY()
+        mem.add_msg("user", "How does Python handle exceptions?")
+        mem = agent(mem)
+
+        # Single-brace {task} and {tool_list} were substituted in initial plan prompt
+        first_prompt = llm.calls[0]["msgs"][1]["content"]
+        assert "How does Python handle exceptions?" in first_prompt
+        assert "flaky: Primary search" in first_prompt
+
+        # Replan actually executed backup_tool and succeeded!
+        tool_entries = [e for e in agent.execution_log if e.get("tool")]
+        assert [e["tool"] for e in tool_entries] == ["flaky", "backup"]
+        assert tool_entries[0]["success"] is False
+        assert tool_entries[1]["success"] is True
+        assert mem.get_var("pa_result") == "Exceptions use try/except."
+        outcome = mem.get_var("pa_outcome")
+        assert outcome["ok"] is True
+        assert outcome["replans"] == 1
+

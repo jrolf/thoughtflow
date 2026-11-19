@@ -55,13 +55,13 @@ from thoughtflow.embed import EMBED, ReplayEMBED
 from thoughtflow.dm import DM, ReplayDM, DecisionError
 from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
-from thoughtflow.thoughts import DECIDE, PLAN
+from thoughtflow.thoughts import DECIDE, PLAN, run_plan
 from thoughtflow.action import ACTION
 from thoughtflow.tool import TOOL, ReplayTOOL
 from thoughtflow.mcp import MCP
 from thoughtflow.agent import AGENT, tool_loop
 from thoughtflow.agents import ReactAgent, ReflectAgent, PlanActAgent
-from thoughtflow.delegate import DELEGATE
+from thoughtflow.delegate import DELEGATE, map_thought
 from thoughtflow.workflow import WORKFLOW
 from thoughtflow.chron import CHRON
 from thoughtflow.chat import CHAT
@@ -137,6 +137,7 @@ __all__ = [
     "THOUGHT",
     "DECIDE",
     "PLAN",
+    "run_plan",
     "ACTION",
     "TOOL",
     "ReplayTOOL",
@@ -147,6 +148,7 @@ __all__ = [
     "ReflectAgent",
     "PlanActAgent",
     "DELEGATE",
+    "map_thought",
     "WORKFLOW",
     "CHRON",
     "CHAT",

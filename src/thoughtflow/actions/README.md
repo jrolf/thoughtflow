@@ -9,8 +9,8 @@
 
 ThoughtFlow separates **imperative execution** from **model-selected capability**:
 
-- **`ACTION` (this directory) is imperative.** Your Python workflow, `CHRON` job, or `WORKFLOW` step invokes it deterministically: `memory = action(memory, **kwargs)`. It logs execution timing, contains exceptions into structured error dicts rather than crashing the flow, and stores results in `{name}_result` (or `store_as=`).
-- **`TOOL` (`../tool.py`) is declarative.** It attaches a JSON Schema so an `LLM` / `AGENT` can choose *whether* and *how* to call a function. Any `ACTION` can be promoted into a context-aware `TOOL` via `TOOL.from_action(action, description=..., parameters=...)`, which automatically passes the active `MEMORY` into the action function via `needs_context=True`.
+- **`ACTION` (this directory) is imperative.** Your Python workflow, `CHRON` job, or `WORKFLOW` step invokes it deterministically: `memory = action(memory, **kwargs)`. It logs execution timing, detects both raised exceptions and structured verb failures (such as nonzero `RUN` exit codes or missing `READ` files), writes out-of-band `{name}_status` (`'ok'` | `'error'`), `{name}_error`, and `{name}_outcome`, and stores results in `{name}_result` alongside verb-specific keys (`store_as=`).
+- **`TOOL` (`../tool.py`) is declarative.** It attaches a JSON Schema so an `LLM` / `AGENT` can choose *whether* and *how* to call a function. Any `ACTION` can be promoted into a context-aware `TOOL` via `TOOL.from_action(action, description=..., parameters=..., memory=...)`, which merges `action.config` and passes the active (or bound) `MEMORY` into the action function.
 
 ---
 
@@ -39,5 +39,5 @@ Every verb is implemented purely with the Python standard library (`urllib.reque
 
 ## Internal Support Modules
 
-- **`_substitution.py`:** Implements recursive `{variable}` placeholder resolution (`substitute(value, memory)` and `resolve_value(...)`) across strings, dicts, lists, and `callable(memory)` values so action configs can bind dynamically to `MEMORY` state at call time.
+- **`_substitution.py`:** Implements identifier-only `{variable}` placeholder resolution (`substitute(value, memory, strict=False)` and `resolve_value(...)`) with `{{` / `}}` brace unescaping so literal JSON payloads in bodies or commands are never consumed.
 - **`_http.py`:** Shared stdlib `urllib.request` client handling timeouts, header normalization, JSON encoding/decoding, and structured HTTP error capture for `FETCH`, `POST`, `SEARCH`, `SCRAPE`, and `NOTIFY`.

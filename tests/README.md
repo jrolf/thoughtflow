@@ -39,7 +39,8 @@ ThoughtFlow's test suite enforces three guarantees:
 | `test_chat.py` | `CHAT` interactive loop, reverse-chronological multi-step `_extract_response`, `internal=True` filtering |
 | `test_replay.py`, `test_eval.py` | Cross-primitive record/replay determinism and `Harness` (`strict=True` absorbed-error detection, partial `memory` capture) |
 | `test_reference_plan_loop.py` | Reference plan-commit-reflect loop receipts, `{step_N_result}` resolution, approvals, and sub-run isolation |
-| `test_util.py`, `test_this.py` | `EventStamp`, `hashify`, `valid_extract`, `render_template`, heap-address scrubbing, and `thoughtflow.this` |
+| `test_util.py`, `test_this.py` | `EventStamp`, `hashify`, `valid_extract`, `render_template`, `render_vars`, `require_grounded_quotes`, heap-address scrubbing, and `thoughtflow.this` |
+| `test_crash_sweep.py` | Cross-primitive boundary sweep: Unicode/emoji/JSON payloads, empty/malformed LLM replies, missing files/commands, concurrent `map_thought` / `dispatch_many` / `run_plan` fan-out, and slim snapshot round-trips |
 
 ---
 

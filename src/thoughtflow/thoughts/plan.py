@@ -6,7 +6,11 @@ A specialized THOUGHT subclass for structured multi-step execution planning.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import inspect
 import json
+import re
+import time
 
 from thoughtflow.thought import THOUGHT
 
@@ -211,14 +215,14 @@ Structure: [[{{task}}, {{task}}], [{{task}}], ...]
 - Outer array: steps (executed in sequence)
 - Inner array: tasks (can execute in parallel within that step)
 
-You can reference results from previous steps using {{step_N_result}} in parameter values,
-where N is the step index (0-based).
+You can reference results from previous steps using $step_N_result (or $step_N.field for dict outputs)
+in parameter values, where N is the step index (0-based).
 
 Example:
 [
   [{{"action": "search", "params": {{"query": "example"}}, "reason": "Start by gathering relevant information on the topic."}}],
-  [{{"action": "analyze", "params": {{"content": "{{step_0_result}}"}}, "reason": "Analyze search results to extract key insights."}}],
-  [{{"action": "summarize", "params": {{"text": "{{step_1_result}}"}}, "reason": "Condense findings into actionable summary."}},
+  [{{"action": "analyze", "params": {{"content": "$step_0_result"}}, "reason": "Analyze search results to extract key insights."}}],
+  [{{"action": "summarize", "params": {{"text": "$step_1_result"}}, "reason": "Condense findings into actionable summary."}},
    {{"action": "notify", "params": {{"message": "Done!"}}, "reason": "Alert user that the task is complete."}}]
 ]
 
@@ -555,3 +559,353 @@ Constraints:
             self.name or 'unnamed',
             len(self._actions_list)
         )
+
+
+_STEP_REF_RE = re.compile(
+    r"\$step_(\d+)(?:_(\d+))?(?:_result|\.([A-Za-z_][A-Za-z0-9_]*))?"
+    r"|\{step_(\d+)(?:_(\d+))?(?:_result|\.([A-Za-z_][A-Za-z0-9_]*))?\}"
+)
+
+
+def _lookup_step_reference(match, step_outputs, task_outputs, current_step_idx):
+    """Resolve one regex match against completed ``step_outputs`` / ``task_outputs``."""
+    if match.group(1) is not None:
+        ref_step = int(match.group(1))
+        ref_task = int(match.group(2)) if match.group(2) is not None else None
+        field = match.group(3)
+    else:
+        ref_step = int(match.group(4))
+        ref_task = int(match.group(5)) if match.group(5) is not None else None
+        field = match.group(6)
+
+    if ref_step >= current_step_idx or ref_step not in step_outputs:
+        raise KeyError(
+            "Step {} cannot reference unavailable step {} output ('{}')".format(
+                current_step_idx, ref_step, match.group(0)
+            )
+        )
+
+    if ref_task is not None:
+        if (ref_step, ref_task) not in task_outputs:
+            raise KeyError(
+                "Step {} Task {} output not found ('{}')".format(
+                    ref_step, ref_task, match.group(0)
+                )
+            )
+        base_val = task_outputs[(ref_step, ref_task)]
+    else:
+        base_val = step_outputs[ref_step]
+
+    if not field:
+        return base_val
+    if isinstance(base_val, dict) and field in base_val:
+        return base_val[field]
+    if field == "result":
+        return base_val
+    raise KeyError(
+        "Field '{}' not found on step {} output ({})".format(
+            field, ref_step, type(base_val).__name__
+        )
+    )
+
+
+def _resolve_plan_params(value, step_outputs, task_outputs, current_step_idx):
+    """
+    Recursively resolve ``$step_N_result``, ``$step_N.field``, and ``{step_N_result}``
+    references inside task parameter values.
+
+    Exact full-string references preserve native Python types (dicts, lists, ints);
+    substring references format cleanly into surrounding text.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        full_match = _STEP_REF_RE.fullmatch(stripped)
+        if full_match is not None:
+            return _lookup_step_reference(
+                full_match, step_outputs, task_outputs, current_step_idx
+            )
+
+        def _sub(m):
+            resolved = _lookup_step_reference(
+                m, step_outputs, task_outputs, current_step_idx
+            )
+            if isinstance(resolved, (dict, list)):
+                return json.dumps(resolved, ensure_ascii=False, default=str)
+            return "" if resolved is None else str(resolved)
+
+        return _STEP_REF_RE.sub(_sub, value)
+
+    if isinstance(value, dict):
+        return {
+            k: _resolve_plan_params(v, step_outputs, task_outputs, current_step_idx)
+            for k, v in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _resolve_plan_params(item, step_outputs, task_outputs, current_step_idx)
+            for item in value
+        ]
+
+    return value
+
+
+def _normalize_action_registry(actions):
+    """Normalize a dict or iterable of ACTION/TOOL/callables into ``{name: target}``."""
+    if isinstance(actions, dict):
+        return dict(actions)
+    if isinstance(actions, (list, tuple, set)):
+        registry = {}
+        for item in actions:
+            name = getattr(item, "name", None) or getattr(item, "__name__", None) or str(item)
+            registry[name] = item
+        return registry
+    raise TypeError(
+        "actions must be a dict or iterable of ACTION/TOOL/callables, got {}".format(
+            type(actions).__name__
+        )
+    )
+
+
+def _execute_single_plan_task(entry, target_memory, params, clone_action=False):
+    """
+    Invoke an ``ACTION``, ``TOOL``, or plain Python callable and return ``(ok, result, error)``.
+    """
+    from thoughtflow.action import ACTION
+    from thoughtflow.tool import TOOL
+
+    if isinstance(entry, ACTION):
+        runner = entry.copy() if clone_action else entry
+        runner(target_memory, **params)
+        ok = runner.was_successful()
+        err = str(runner.last_error) if runner.last_error is not None else None
+        return ok, runner.last_result, err
+
+    if isinstance(entry, TOOL):
+        try:
+            out = entry(params, context={"memory": target_memory})
+            structured_err = ACTION._detect_structured_error(out)
+            if structured_err is not None:
+                return False, out, structured_err
+            return True, out, None
+        except Exception as exc:
+            return False, None, str(exc)
+
+    if callable(entry):
+        try:
+            sig = inspect.signature(entry)
+            param_names = list(sig.parameters.keys())
+            takes_memory = bool(param_names) and param_names[0] in ("memory", "mem")
+        except (TypeError, ValueError):
+            takes_memory = False
+
+        try:
+            if takes_memory:
+                out = entry(target_memory, **params)
+            else:
+                out = entry(**params)
+            structured_err = ACTION._detect_structured_error(out)
+            if structured_err is not None:
+                return False, out, structured_err
+            return True, out, None
+        except Exception as exc:
+            return False, None, str(exc)
+
+    return False, None, "Unsupported action entry of type {}".format(type(entry).__name__)
+
+
+def run_plan(
+    plan,
+    memory,
+    actions,
+    on_error="stop",
+    parallel_inner=False,
+    max_workers=None,
+):
+    """
+    Execute a ``PLAN`` data structure against ``memory``, resolving inter-step references (#48).
+
+    Supports ``$step_N_result``, ``$step_N.field``, ``$step_N_M_result``, and
+    legacy ``{step_N_result}`` parameter references without colliding with
+    ``THOUGHT``'s prompt template braces.
+
+    Args:
+        plan (list): ``list[list[dict]]`` produced by ``PLAN`` (or a flat
+            ``list[dict]`` of sequential tasks).
+        memory (MEMORY): ``MEMORY`` instance updated with ``step_{N}_result``
+            and ``plan_receipts``.
+        actions (dict or list): Mapping of ``{action_name: ACTION | TOOL | callable}``
+            or an iterable of named ``ACTION`` / ``TOOL`` / function objects.
+        on_error (str): ``'stop'`` (default — halt after a failing step),
+            ``'continue'`` (record error receipt and continue), or ``'raise'``
+            (raise ``RuntimeError`` on the first task failure).
+        parallel_inner (bool): When ``True``, execute multi-task inner steps
+            concurrently via ``ThreadPoolExecutor`` over isolated memory copies
+            and commit results in deterministic task order.
+        max_workers (int, optional): Worker cap when ``parallel_inner=True``.
+
+    Returns:
+        list[dict]: Ordered execution receipts, each containing ``step``,
+        ``task``, ``action``, ``params``, ``reason``, ``ok``, ``result``,
+        ``error``, and ``duration_ms``.
+
+    Example:
+        >>> receipts = run_plan(plan, memory, {"search": search_tool, "summarize": sum_fn})
+        >>> all(r["ok"] for r in receipts)
+        True
+    """
+    if on_error not in ("stop", "continue", "raise"):
+        raise ValueError(
+            "on_error must be 'stop', 'continue', or 'raise', got: {!r}".format(on_error)
+        )
+
+    registry = _normalize_action_registry(actions)
+    if not plan:
+        if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+            memory.set_var("plan_receipts", [], desc="Execution receipts from run_plan")
+        return []
+
+    normalized_steps = [
+        step if isinstance(step, list) else [step]
+        for step in plan
+    ]
+
+    receipts = []
+    step_outputs = {}
+    task_outputs = {}
+
+    for step_idx, step_tasks in enumerate(normalized_steps):
+        use_parallel = bool(parallel_inner and len(step_tasks) > 1)
+
+        def _run_task_at(task_idx, task_spec):
+            t0 = time.time()
+            action_name = task_spec.get("action") if isinstance(task_spec, dict) else None
+            raw_params = (task_spec.get("params") or {}) if isinstance(task_spec, dict) else {}
+            reason = task_spec.get("reason", "") if isinstance(task_spec, dict) else ""
+
+            if not action_name or action_name not in registry:
+                err_msg = "Unknown action: {!r}".format(action_name)
+                return {
+                    "step": step_idx,
+                    "task": task_idx,
+                    "action": action_name,
+                    "params": raw_params,
+                    "reason": reason,
+                    "ok": False,
+                    "result": None,
+                    "error": err_msg,
+                    "duration_ms": round((time.time() - t0) * 1000, 2),
+                }
+
+            try:
+                resolved_params = _resolve_plan_params(
+                    raw_params, step_outputs, task_outputs, step_idx
+                )
+            except Exception as exc:
+                return {
+                    "step": step_idx,
+                    "task": task_idx,
+                    "action": action_name,
+                    "params": raw_params,
+                    "reason": reason,
+                    "ok": False,
+                    "result": None,
+                    "error": str(exc),
+                    "duration_ms": round((time.time() - t0) * 1000, 2),
+                }
+
+            target_mem = (
+                memory.copy()
+                if (use_parallel and hasattr(memory, "copy") and callable(getattr(memory, "copy", None)))
+                else memory
+            )
+            ok, res_val, err_msg = _execute_single_plan_task(
+                registry[action_name],
+                target_mem,
+                resolved_params,
+                clone_action=use_parallel,
+            )
+            return {
+                "step": step_idx,
+                "task": task_idx,
+                "action": action_name,
+                "params": resolved_params,
+                "reason": reason,
+                "ok": ok,
+                "result": res_val,
+                "error": err_msg,
+                "duration_ms": round((time.time() - t0) * 1000, 2),
+                "_branch_mem": target_mem if target_mem is not memory else None,
+            }
+
+        if use_parallel:
+            base_vars = (
+                memory.get_all_vars(resolve_refs=False)
+                if hasattr(memory, "get_all_vars")
+                else {}
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(_run_task_at, t_idx, t_spec)
+                    for t_idx, t_spec in enumerate(step_tasks)
+                ]
+                step_receipts = [f.result() for f in futures]
+            for item in step_receipts:
+                branch_mem = item.pop("_branch_mem", None)
+                if (
+                    branch_mem is not None
+                    and hasattr(branch_mem, "get_all_vars")
+                    and hasattr(memory, "set_var")
+                ):
+                    for var_k, var_v in branch_mem.get_all_vars().items():
+                        if base_vars.get(var_k) != var_v:
+                            memory.set_var(var_k, var_v)
+        else:
+            step_receipts = []
+            for t_idx, t_spec in enumerate(step_tasks):
+                rec = _run_task_at(t_idx, t_spec)
+                rec.pop("_branch_mem", None)
+                step_receipts.append(rec)
+                if not rec["ok"] and on_error in ("stop", "raise"):
+                    break
+
+        step_failed = False
+        step_values = []
+        for rec in step_receipts:
+            receipts.append(rec)
+            task_outputs[(step_idx, rec["task"])] = rec["result"]
+            step_values.append(rec["result"])
+            if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+                memory.set_var(
+                    "step_{}_{}_result".format(step_idx, rec["task"]),
+                    rec["result"],
+                    desc="Plan step {} task {} output".format(step_idx, rec["task"]),
+                )
+            if not rec["ok"]:
+                step_failed = True
+                if on_error == "raise":
+                    if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+                        memory.set_var("plan_receipts", list(receipts), desc="Execution receipts from run_plan")
+                    raise RuntimeError(
+                        "Plan failed at step {} task {} ('{}'): {}".format(
+                            step_idx, rec["task"], rec["action"], rec["error"]
+                        )
+                    )
+
+        step_summary_val = step_values[0] if len(step_tasks) == 1 and step_values else step_values
+        step_outputs[step_idx] = step_summary_val
+        if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+            memory.set_var(
+                "step_{}_result".format(step_idx),
+                step_summary_val,
+                desc="Plan step {} output".format(step_idx),
+            )
+
+        if step_failed and on_error == "stop":
+            break
+
+    if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+        memory.set_var("plan_receipts", list(receipts), desc="Execution receipts from run_plan")
+
+    return receipts
+

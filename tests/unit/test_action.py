@@ -418,3 +418,71 @@ class TestActionSerialization:
         assert restored.description == "Test desc"
         assert restored.result_key == "my_result"
         assert restored.fn is my_func
+
+
+class TestActionStatusOutcomeAliasesAndSafeSubstitution:
+    """Tests for #33: out-of-band status/error/outcome, {name}_result alias, safe substitution, TOOL.from_action(memory=)."""
+
+    def test_verbs_write_canonical_result_alias_and_out_of_band_status(self, memory, tmp_path):
+        from thoughtflow.actions import READ, RUN
+
+        p = tmp_path / "hello.txt"
+        p.write_text("greetings", encoding="utf-8")
+
+        read_ok = READ(name="cfg", path=str(p))
+        read_ok(memory)
+        assert memory.get_var("cfg_content") == "greetings"
+        assert memory.get_var("cfg_result") == "greetings"
+        assert memory.get_var("cfg_status") == "ok"
+        assert memory.get_var("cfg_error") is None
+        assert memory.get_var("cfg_outcome")["ok"] is True
+
+        # Nonzero exit in RUN marks action status='error' and populates {name}_error
+        run_fail = RUN(name="bad_cmd", command="exit 7", on_error="ignore")
+        run_fail(memory)
+        assert run_fail.was_successful() is False
+        assert memory.get_var("bad_cmd_status") == "error"
+        assert "7" in memory.get_var("bad_cmd_error")
+        assert memory.get_var("bad_cmd_outcome")["ok"] is False
+
+        # Missing file in READ marks status='error' and writes both read_content and read_result
+        read_missing = READ(name="missing_doc", path=str(tmp_path / "nope.txt"))
+        read_missing(memory)
+        assert memory.get_var("missing_doc_status") == "error"
+        assert memory.get_var("missing_doc_error")
+        assert memory.get_var("missing_doc_result") == memory.get_var("missing_doc_content")
+
+    def test_substitution_preserves_json_braces_and_supports_strict_mode(self, memory):
+        import pytest
+        from thoughtflow.actions._substitution import substitute
+
+        memory.set_var("user", "Ada")
+        payload = '{"event": "signup", "user": "{user}", "meta": {"nested": 1}, "literal": "{{kept}}"}'
+        rendered = substitute(payload, memory)
+
+        assert '"event": "signup"' in rendered
+        assert '"user": "Ada"' in rendered
+        assert '"meta": {"nested": 1}' in rendered
+        assert '"literal": "{kept}"' in rendered
+
+        # Missing identifier stays intact by default, raises KeyError in strict=True
+        assert substitute("Hello {undeclared}!", memory) == "Hello {undeclared}!"
+        with pytest.raises(KeyError, match="undeclared"):
+            substitute("Hello {undeclared}!", memory, strict=True)
+
+    def test_tool_from_action_supports_bound_memory_and_action_config(self, memory):
+        from thoughtflow import TOOL
+
+        memory.set_var("api_prefix", "v2")
+        act = ACTION(
+            name="lookup",
+            fn=lambda mem, item, limit=3: "{}:{}:{}".format(mem.get_var("api_prefix"), item, limit),
+            config={"limit": 5},
+        )
+        tool = TOOL.from_action(
+            act,
+            parameters={"item": {"type": "string"}},
+            memory=memory,
+        )
+        assert tool({"item": "books"}) == "v2:books:5"
+
