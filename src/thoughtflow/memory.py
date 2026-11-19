@@ -946,7 +946,16 @@ class MEMORY:
             keep.add(i)
             used += c
 
-        # Never leave a tool result whose assistant tool_calls were dropped.
+        # Keep tool turns paired: drop an assistant tool_calls message when any of
+        # its results exists but was dropped, then drop results left without a caller.
+        result_idx = {}
+        for i, msg in enumerate(msgs):
+            if msg.get('role') == 'tool':
+                result_idx[msg.get('tool_call_id')] = i
+        for i in sorted(keep):
+            ids = [tc.get('id') for tc in msgs[i].get('tool_calls') or []]
+            if any(cid in result_idx and result_idx[cid] not in keep for cid in ids):
+                keep.discard(i)
         live_ids = set()
         for i in sorted(keep):
             for tc in msgs[i].get('tool_calls') or []:
@@ -992,7 +1001,11 @@ class MEMORY:
             if meta.get('summary'):
                 covered.update(meta.get('summary_of') or [])
         live = [e for e in events if e.get('stamp') not in covered]
-        older = live[:-keep] if keep > 0 else live
+        cut = max(0, len(live) - keep) if keep > 0 else len(live)
+        # Never split an assistant tool_calls message from its tool results.
+        while 0 < cut < len(live) and live[cut].get('role') == 'tool':
+            cut -= 1
+        older = live[:cut]
         if not older:
             return None
         if summarizer is not None:
@@ -1010,7 +1023,8 @@ class MEMORY:
             metadata={'summary': True, 'internal': True, 'summary_of': stamps},
         )
         self.emit('memory_compacted', {'covered': len(stamps), 'kept': keep})
-        return {'stamp': self.get_msgs(include=['system'])[-1]['stamp'], 'covered': len(stamps)}
+        base = getattr(self, 'base', self)
+        return {'stamp': base.get_msgs(include=['system'])[-1]['stamp'], 'covered': len(stamps)}
 
     def suspend(self, reason, pending=None, resume_at=None, suspension_id=None):
         """

@@ -217,22 +217,48 @@ class WORKFLOW:
         """
         step_name = name or "while_{}".format(len(self.steps))
 
-        def while_step(memory):
-            """Run the body until the condition fails, the cap hits, or state repeats."""
+        progress_key = "{}_loop".format(step_name)
+
+        def while_step(memory, decision=None):
+            """Run the body until the condition fails, the cap hits, state repeats, or it suspends."""
             iterations = 0
             stopped = "condition_false"
+            progress = memory.get_var(progress_key) or {}
+            if progress.get("suspended"):
+                # Resuming: keep earlier iterations and hand the decision to the body.
+                iterations = int(progress.get("iterations", 0))
+            elif decision is not None:
+                decision = None
             while condition(memory):
                 if iterations >= max_iterations:
                     stopped = "max_iterations"
                     break
                 before = repr(memory.get_var(state_key)) if state_key else None
-                result = body_fn(memory)
+                before_id = self._suspension_id(memory)
+                if decision is not None and not self._accepts_decision(body_fn):
+                    memory.resolve_suspension(decision)
+                    decision = None
+                    before_id = None
+                if decision is not None:
+                    result = body_fn(memory, decision=decision)
+                else:
+                    result = body_fn(memory)
+                decision = None
                 if result is not None:
                     memory = result
+                after_id = self._suspension_id(memory)
+                if after_id is not None and after_id != before_id:
+                    memory.set_var(progress_key, {"iterations": iterations, "suspended": True},
+                                   desc="Loop progress for step: {}".format(step_name))
+                    stopped = "suspended"
+                    break
                 iterations += 1
                 if state_key and repr(memory.get_var(state_key)) == before:
                     stopped = "stopped_repeated"
                     break
+            if stopped != "suspended" and progress.get("suspended"):
+                memory.set_var(progress_key, {"iterations": iterations, "suspended": False},
+                               desc="Loop progress for step: {}".format(step_name))
             self._step_note = {"iterations": iterations, "stopped": stopped}
             return memory
 

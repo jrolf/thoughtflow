@@ -879,3 +879,29 @@ class TestReflectFixes:
         assert agent._should_approve("Looks good to me")
         assert not agent._should_approve("This is unapproved")
         assert not agent._should_approve("Disapproved.")
+
+
+class TestProtocolAutoUnsupportedService:
+    def test_llm_with_unsupported_service_uses_text_loop(self):
+        class AnthropicLike:
+            service = "anthropic"
+            model = "m"
+
+            def chat(self, *args, **kwargs):
+                raise ValueError("LLM.chat supports the openai, openrouter and groq services")
+
+            def call(self, msgs, params=None):
+                return ["plain text answer"]
+
+        memory = AGENT(llm=AnthropicLike(), name="an")(user_memory("hi"))
+        assert memory.get_var("an_result") == "plain text answer"
+
+    def test_governance_with_unsupported_service_is_rejected(self):
+        class OllamaLike:
+            service = "ollama"
+
+            def chat(self, *args, **kwargs):
+                raise ValueError("unsupported")
+
+        with pytest.raises(ValueError):
+            AGENT(llm=OllamaLike(), policy={"x": "deny"})(user_memory())

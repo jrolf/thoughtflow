@@ -587,3 +587,39 @@ class TestWorkflowWithGovernedAgent:
         assert paid == [900]
         assert restored.get_var("flag") is True
         assert restored.get_var("payer_status") == "final"
+
+
+class TestWhileSuspension:
+    def test_suspending_body_stops_loop_and_resume_keeps_progress(self):
+        calls = []
+
+        def body(memory, decision=None):
+            calls.append(decision)
+            n = (memory.get_var("counter") or 0) + 1
+            if n == 2 and decision is None:
+                memory.suspend("approval_required")
+                return memory
+            if decision is not None:
+                memory.resolve_suspension(decision)
+            memory.set_var("counter", n)
+            return memory
+
+        def build():
+            wf = WORKFLOW("w")
+            wf.while_(lambda m: (m.get_var("counter") or 0) < 3, body, name="loop")
+            return wf
+
+        wf = build()
+        memory = wf(MEMORY())
+        assert memory.is_suspended()
+        assert memory.get_var("counter") == 1
+        assert len(calls) == 2  # iteration 1 and the suspending attempt, then it stopped
+        assert wf.execution_log[0]["status"] == "suspended"
+
+        restored = MEMORY.from_json(memory.to_json())
+        wf2 = build()
+        done = wf2(restored, decision={"approve": True})
+        assert done.get_var("counter") == 3
+        assert not done.is_suspended()
+        assert wf2.execution_log[-1]["iterations"] == 3
+        assert calls[2] == {"approve": True}

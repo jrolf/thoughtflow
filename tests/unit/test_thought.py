@@ -2549,3 +2549,38 @@ class TestVisibility:
         llm = _ScriptedLLM([("ok", "stop")])
         THOUGHT(name="rp", llm=llm, prompt="Say hi", record_prompt=True)(memory)
         assert "Say hi" in memory.get_var("rp_prompt")
+
+
+class TestReviewFeedbackThought:
+    def test_doubling_starts_from_llm_default_params(self, memory):
+        llm = _ScriptedLLM([("trunc", "length"), ('{"a": "ok"}', "stop")])
+        llm.default_params = {"max_tokens": 200}
+        thought = THOUGHT(
+            name="dp", llm=llm, prompt="Go",
+            parsing_rules={"kind": "json", "format": {"a": ""}},
+            max_retries=3, retry={"on": {"length": "double_budget"}},
+        )
+        thought(memory)
+        assert llm.calls[1]["params"]["max_tokens"] == 400
+
+    def test_to_dict_round_trip_keeps_new_options_and_flags_fallback(self):
+        import json
+
+        backup = _ScriptedLLM([("x", "stop")])
+        thought = THOUGHT(
+            name="rt", llm=_ScriptedLLM([("x", "stop")]), prompt="Go", visibility="internal",
+            instruct_schema=False, record_prompt=True,
+            retry={"on": {"length": "double_budget"}, "fallback_llm": backup},
+        )
+        data = json.loads(json.dumps(thought.to_dict()))
+        assert data["has_fallback_llm"] is True
+        clone = THOUGHT.from_dict(data, llm=_ScriptedLLM([("x", "stop")]), fallback_llm=backup)
+        assert clone.visibility == "internal" and clone.instruct_schema is False
+        assert clone.record_prompt is True
+        assert clone.retry["on"] == {"length": "double_budget"}
+        assert clone.retry["fallback_llm"] is backup
+
+    def test_copy_shares_fallback_llm(self):
+        backup = _ScriptedLLM([("x", "stop")])
+        thought = THOUGHT(name="cp", llm=None, prompt="Go", retry={"fallback_llm": backup})
+        assert thought.copy().retry["fallback_llm"] is backup

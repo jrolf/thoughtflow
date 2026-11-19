@@ -19,6 +19,7 @@ import json
 import re
 
 from thoughtflow._util import event_stamp
+from thoughtflow.llm_chat import CHAT_SERVICES
 
 _FENCED_JSON_RE = re.compile(
     r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
@@ -147,11 +148,16 @@ class AGENT:
         if self.protocol == "text":
             return False
         if self.llm is not None and callable(getattr(self.llm, "chat", None)):
-            return True
+            # ThoughtFlow's LLM has chat() for every service, but only some
+            # services support it; unknown custom objects with chat() are trusted.
+            service = getattr(self.llm, "service", None)
+            if service is None or service in CHAT_SERVICES:
+                return True
         if self._governed():
             raise ValueError(
                 "allow/policy/budget/checkpoint need native tool calls, but this llm has no "
-                "chat(). Use an LLM with chat() or drop the governance options."
+                "usable chat() (LLM.chat supports the openai, openrouter and groq services). "
+                "Use one of those or drop the governance options."
             )
         return False
 

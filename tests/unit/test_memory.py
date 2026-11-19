@@ -1862,3 +1862,48 @@ class TestSuspension:
 
     def test_resolve_without_suspension(self):
         assert MEMORY().resolve_suspension()['status'] == 'not_suspended'
+
+
+class TestToolPairBoundaries:
+    """Review feedback on PR 59: tool turns stay paired under compact and budgets."""
+
+    def _tool_memory(self):
+        memory = MEMORY()
+        memory.add_msg('user', 'first')
+        memory.add_msg('assistant', 'a' * 20, tool_calls=[{'id': 'c1', 'name': 't', 'arguments': {}}])
+        memory.add_msg('tool', 'r1', tool_call_id='c1', name='t')
+        memory.add_msg('assistant', 'done')
+        return memory
+
+    def _valid(self, msgs):
+        calls = set()
+        for m in msgs:
+            for tc in m.get('tool_calls') or []:
+                calls.add(tc['id'])
+        results = {m['tool_call_id'] for m in msgs if m['role'] == 'tool'}
+        return results == calls
+
+    def test_compact_does_not_split_assistant_from_tool_result(self):
+        memory = self._tool_memory()
+        memory.compact(keep=2)  # naive cut would keep [tool, assistant]
+        assert self._valid(memory.get_llm_msgs(format='openai'))
+
+    def test_budget_drops_assistant_when_its_result_was_dropped(self):
+        memory = MEMORY()
+        memory.add_msg('user', 'q')
+        memory.add_msg('assistant', '', tool_calls=[
+            {'id': 'a', 'name': 't', 'arguments': {}}, {'id': 'b', 'name': 't', 'arguments': {}},
+        ])
+        memory.add_msg('tool', 'x' * 400, tool_call_id='a', name='t')
+        memory.add_msg('tool', 'y', tool_call_id='b', name='t')
+        memory.add_msg('user', 'again')
+        for budget in (5, 20, 40, 80, 200):
+            assert self._valid(memory.get_llm_msgs(format='openai', budget_tokens=budget))
+
+    def test_scope_compact_with_write_only_room(self):
+        memory = MEMORY()
+        for i in range(6):
+            memory.add_msg('user', 'm{}'.format(i), channel='api')
+        scoped = memory.scope('x', read_rooms=['api'], write_room='cli')
+        result = scoped.compact(keep=2)
+        assert result['covered'] == 4 and result['stamp']

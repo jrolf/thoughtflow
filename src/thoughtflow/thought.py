@@ -877,6 +877,7 @@ class THOUGHT:
                         base_budget = (
                             attempt_max_tokens
                             or llm_kwargs.get("max_tokens")
+                            or (getattr(self.llm, "default_params", None) or {}).get("max_tokens")
                             or getattr(self.llm, "max_tokens", None)
                             or 1024
                         )
@@ -1853,7 +1854,11 @@ class THOUGHT:
         Returns:
             dict: Serializable representation of this thought.
         """
-        clean_config = self._sanitize_for_json(self.config)
+        config = dict(self.config)
+        if isinstance(config.get("retry"), dict):
+            # LLM objects are never serialized; has_fallback_llm records the fact.
+            config["retry"] = {k: v for k, v in config["retry"].items() if k != "fallback_llm"}
+        clean_config = self._sanitize_for_json(config)
         serializable_validation = (
             self.validation
             if self.validation is not None and not callable(self.validation)
@@ -1875,6 +1880,7 @@ class THOUGHT:
             "execution_history": self.execution_history,
             # Store metadata about non-serializable items
             "llm_type": type(self.llm).__name__ if self.llm else None,
+            "has_fallback_llm": self.retry.get("fallback_llm") is not None,
             "has_parse_fn": self.parse_fn is not None,
             "has_validation": self.validation is not None,
             "has_pre_hook": self.pre_hook is not None,
@@ -1882,7 +1888,7 @@ class THOUGHT:
         }
 
     @classmethod
-    def from_dict(cls, data, llm=None, parse_fn=None, validation=None, pre_hook=None, post_hook=None):
+    def from_dict(cls, data, llm=None, parse_fn=None, validation=None, pre_hook=None, post_hook=None, fallback_llm=None):
         """
         Reconstruct a THOUGHT from a dictionary representation.
         
@@ -1894,6 +1900,8 @@ class THOUGHT:
                 declarative validation stored in ``data`` when provided).
             pre_hook: Optional pre-execution hook.
             post_hook: Optional post-execution hook.
+            fallback_llm: Optional LLM for ``retry['fallback_llm']`` (LLM objects
+                are not serialized; ``has_fallback_llm`` in the dict says one was set).
             
         Returns:
             THOUGHT: Reconstructed THOUGHT object.
@@ -1945,6 +1953,9 @@ class THOUGHT:
             **config
         )
         
+        if fallback_llm is not None:
+            thought.retry["fallback_llm"] = fallback_llm
+
         # Restore ID if provided
         if data.get("id"):
             thought.id = data["id"]
@@ -1953,6 +1964,20 @@ class THOUGHT:
         thought.execution_history = data.get("execution_history", [])
         
         return thought
+
+    def _copy_config(self):
+        """Deep-copy config, sharing (not copying) the fallback LLM object."""
+        import copy as copy_module
+
+        config = dict(self.config)
+        retry = config.pop("retry", None)
+        copied = copy_module.deepcopy(config)
+        if retry is not None:
+            fallback = retry.get("fallback_llm")
+            copied["retry"] = dict(copy_module.deepcopy(
+                {k: v for k, v in retry.items() if k != "fallback_llm"}
+            ), fallback_llm=fallback)
+        return copied
 
     def copy(self):
         """
@@ -1981,7 +2006,7 @@ class THOUGHT:
             validation=self.validation,
             pre_hook=self.pre_hook,
             post_hook=self.post_hook,
-            **copy_module.deepcopy(self.config)
+            **self._copy_config()
         )
         
         new_thought.visibility = self.visibility
