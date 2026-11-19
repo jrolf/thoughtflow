@@ -1766,3 +1766,99 @@ class TestCausalOrderingAndScopes:
         assert set(rooms).issubset(memory.valid_channels)
 
 
+
+
+# ============================================================================
+# Token budget, compaction, suspend/resume (#46, #44)
+# ============================================================================
+
+
+def _chatty_memory(n=10):
+    memory = MEMORY()
+    memory.add_msg('system', 'Be brief.')
+    for i in range(n):
+        memory.add_msg('user', 'question {} '.format(i) + 'x' * 40)
+        memory.add_msg('assistant', 'answer {} '.format(i) + 'y' * 40)
+    return memory
+
+
+class TestTokenBudget:
+    def test_budget_drops_oldest_and_pins_system_and_last_user(self):
+        memory = _chatty_memory()
+        msgs = memory.get_llm_msgs(budget_tokens=60)
+        assert msgs[0]['role'] == 'system'
+        assert any(m['role'] == 'user' and 'question 9' in m['content'] for m in msgs)
+        assert not any('question 0' in m['content'] for m in msgs)
+        assert len(memory.get_msgs()) == 21
+
+    def test_no_budget_returns_everything(self):
+        assert len(_chatty_memory().get_llm_msgs()) == 21
+
+    def test_summarizer_digest_inserted_after_system(self):
+        memory = _chatty_memory()
+        msgs = memory.get_llm_msgs(
+            budget_tokens=60, summarizer=lambda dropped: '{} dropped'.format(len(dropped))
+        )
+        assert msgs[1]['role'] == 'system' and 'dropped' in msgs[1]['content']
+
+    def test_orphan_tool_results_are_not_returned(self):
+        memory = MEMORY()
+        memory.add_msg('user', 'go')
+        memory.add_msg('assistant', 'z' * 400, tool_calls=[{'id': 'c1', 'name': 't', 'arguments': {}}])
+        memory.add_msg('tool', 'ok', tool_call_id='c1', name='t')
+        memory.add_msg('user', 'again')
+        msgs = memory.get_llm_msgs(budget_tokens=10)
+        assert not any(m['role'] == 'tool' for m in msgs)
+
+    def test_scope_supports_budget(self):
+        memory = _chatty_memory()
+        scoped = memory.scope('a')
+        assert len(scoped.get_llm_msgs(budget_tokens=60)) < 21
+
+
+class TestCompact:
+    def test_compact_is_non_destructive(self):
+        memory = _chatty_memory()
+        result = memory.compact(keep=4)
+        assert result['covered'] == 16
+        assert len(memory.get_msgs(include=['user', 'assistant'])) == 20
+        view = memory.get_llm_msgs()
+        assert len(view) < 21
+        assert any('Summary' in m['content'] for m in view)
+        assert memory.get_emits('memory_compacted')
+
+    def test_compact_twice_does_not_recover_summarized(self):
+        memory = _chatty_memory()
+        memory.compact(keep=4)
+        assert memory.compact(keep=4) is None
+
+    def test_custom_summarizer(self):
+        memory = _chatty_memory(4)
+        memory.compact(keep=2, summarizer=lambda msgs: 'S{}'.format(len(msgs)))
+        assert memory.get_llm_msgs()[0]['content'] in ('Be brief.', 'S6')
+        assert any(m['content'] == 'S6' for m in memory.get_llm_msgs())
+
+
+class TestSuspension:
+    def test_suspend_and_resolve_once(self):
+        memory = MEMORY()
+        assert not memory.is_suspended()
+        memory.suspend('approval_required', pending={'calls': ['c1']})
+        assert memory.is_suspended()
+        first = memory.resolve_suspension({'approve': True})
+        second = memory.resolve_suspension({'approve': False})
+        assert first['status'] == 'resolved'
+        assert second['status'] == 'already_resolved'
+        assert second['suspension']['decision'] == {'approve': True}
+        assert not memory.is_suspended()
+        assert len(memory.get_emits('run_resumed')) == 1
+
+    def test_suspension_survives_round_trip(self):
+        memory = MEMORY()
+        memory.suspend('wait', pending={'x': 1})
+        restored = MEMORY.from_json(memory.to_json())
+        assert restored.is_suspended()
+        assert restored.get_suspension()['pending'] == {'x': 1}
+
+    def test_resolve_without_suspension(self):
+        assert MEMORY().resolve_suspension()['status'] == 'not_suspended'

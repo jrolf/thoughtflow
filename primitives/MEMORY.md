@@ -28,7 +28,7 @@ The contract is: memory flows through primitives — `memory = primitive(memory)
 | Reflections | Agent reasoning traces (role: reflection) |
 | object_threshold | Size in bytes above which values auto-compress to object refs (default 10KB) |
 
-**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `emit`, `get_emits`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `scope`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
+**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `emit`, `get_emits`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `compact`, `suspend`, `resolve_suspension`, `is_suspended`, `get_suspension`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `scope`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
 
 ## Scoped Perspectives (`memory.scope`)
 
@@ -75,6 +75,10 @@ events = memory.get_emits('plan_rejected')
 memory.to_json('backup.json')
 memory3 = MEMORY.from_json('backup.json')
 ```
+
+**Context budgets and compaction:** `get_llm_msgs(budget_tokens=N)` drops the oldest unpinned messages (system messages and the latest user message are pinned by default) using a cheap `len // 4` estimate, or your `token_counter=`. A `summarizer=fn(dropped)` inserts a digest as one system message. Tool results are never returned without their assistant `tool_calls`. `compact(keep=6, summarizer=None)` adds a summary system message tagged `metadata={'summary': True, 'internal': True, 'summary_of': [...]}` and emits `memory_compacted`; originals stay in the log and the LLM view shows the summary instead.
+
+**Suspend and resume:** `suspend(reason, pending=...)` stores a `_suspension` variable (it round-trips through JSON) and emits `run_suspended`. `resolve_suspension(decision)` is idempotent: the first call returns `status='resolved'` and emits `run_resumed`; repeats return `already_resolved` without overwriting the decision. `is_suspended()` and `get_suspension()` read the state.
 
 ## Relationship to Other Primitives
 
