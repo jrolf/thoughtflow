@@ -860,4 +860,159 @@ class TestDecideWithDecisionModels:
         assert mem.get_var("route_result") == "billing"
         assert mem.get_var("route_outcome")["used_fallback_llm"] is True
 
+    def test_dm_refusal_failover_clears_stale_meta_caps_backup_retries_and_preserves_history(self, mock_llm):
+        """
+        PR #60 review #1:
+        1. Primary DM refusal followed by generative LLM rescue must report the
+           fallback's chosen value and source='model' rather than stale refusal meta.
+        2. Generative LLM fallback runs at most 1 rescue attempt (not max_retries=5)
+           and preserves primary failure history in _failure_attempts / _last_error.
+        """
+        refusing_dm = _ScriptedDM([{
+            "model": "openai/gpt-6-luna-decisions",
+            "answers": {"route": {"type": "refusal"}},
+            "usage": {"input_tokens": 40, "output_tokens": 0},
+        }])
+        rescue_llm = mock_llm(responses=["billing"])
+
+        step = DECIDE(
+            name="route",
+            model=refusing_dm,
+            choices=["billing", "tech"],
+            prompt="Route {ticket}",
+            default="escalate",
+            max_retries=5,
+            retry={"fallback_llm": rescue_llm},
+            include_history=False,
+        )
+        mem = MEMORY()
+        mem.set_var("ticket", "Duplicate invoice")
+        mem = step(mem)
+
+        outcome = mem.get_var("route_outcome")
+        assert mem.get_var("route_result") == "billing"
+        assert outcome["ok"] is True
+        assert outcome["value"] == "billing"
+        assert outcome["source"] == "model"
+        assert outcome["used_fallback_llm"] is True
+        assert outcome["attempts"] == 2
+        assert len(step._failure_attempts) == 1
+        assert step._failure_attempts[0]["failure_kind"] == "refusal"
+
+        # When fallback LLM also fails, it gets 1 rescue attempt (not 5) and preserves both failures
+        refusing_dm2 = _ScriptedDM([{
+            "model": "openai/gpt-6-luna-decisions",
+            "answers": {"route2": {"type": "refusal"}},
+            "usage": {"input_tokens": 40, "output_tokens": 0},
+        }])
+        bad_backup = mock_llm(responses=["not_a_choice"] * 10)
+        step2 = DECIDE(
+            name="route2",
+            model=refusing_dm2,
+            choices=["billing", "tech"],
+            prompt="Route {ticket}",
+            default="escalate",
+            max_retries=5,
+            retry={"fallback_llm": bad_backup},
+            include_history=False,
+        )
+        mem2 = MEMORY()
+        mem2.set_var("ticket", "Duplicate invoice")
+        mem2 = step2(mem2)
+
+        assert step2.max_retries == 5
+        assert bad_backup.call_count == 1
+        assert mem2.get_var("route2_attempts") == 2
+        err_log = mem2.get_var("route2_last_error")
+        assert [a["attempt"] for a in err_log["attempts"]] == [1, 2]
+        assert [a["failure_kind"] for a in err_log["attempts"]] == ["refusal", "validation"]
+
+    def test_multi_mode_on_llm_honors_fallback_llm(self, mock_llm):
+        """PR #60 review #2: multi-question mode on a generative LLM triggers fallback_llm."""
+        broken_primary = mock_llm(responses=["not json", "still not json"])
+        working_backup = mock_llm(responses=[
+            json.dumps({"dept": {"type": "choice", "choice": "billing"}})
+        ])
+        step = DECIDE(
+            name="triage",
+            llm=broken_primary,
+            questions={"dept": {"type": "choice", "instructions": "Owner?", "choices": ["billing", "tech"]}},
+            max_retries=2,
+            retry={"fallback_llm": working_backup},
+        )
+        mem = step(MEMORY())
+        assert broken_primary.call_count == 2
+        assert working_backup.call_count == 1
+        assert mem.get_var("triage_result") == {"dept": "billing"}
+        assert mem.get_var("triage_outcome")["used_fallback_llm"] is True
+
+    def test_dm_retry_honors_http_exponential_backoff(self):
+        """PR #60 review #3: retry={'on': {'http': 'backoff'}} sleeps with exponential backoff on DM retries."""
+        flaky_dm = _ScriptedDM([
+            DecisionError("503 busy #1", status=503, retryable=True),
+            DecisionError("503 busy #2", status=503, retryable=True),
+            {
+                "model": "typesafe/jev-1.14",
+                "answers": {"ok_q": {"type": "noul", "noul": 0.90}},
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        ])
+        step = DECIDE(
+            name="ok_q",
+            model=flaky_dm,
+            choices=bool,
+            prompt="Check {x}",
+            max_retries=3,
+            retry={"on": {"http": "backoff"}, "backoff_base": 0.25, "max_backoff": 1.0},
+        )
+        sleeps = []
+        mem = MEMORY()
+        mem.set_var("x", "payload")
+        with patch("time.sleep", side_effect=sleeps.append):
+            mem = step(mem)
+
+        assert mem.get_var("ok_q_result") is True
+        assert sleeps == [0.25, 0.5]
+
+    def test_dm_honors_visibility_chat_turn_and_record_prompt(self):
+        """PR #60 review #4: DM-backed DECIDE honors visibility ('public'/'internal'/'silent') and record_prompt."""
+        from thoughtflow import CHAT
+
+        pub_dm = _ScriptedDM([{
+            "model": "typesafe/jev-1.14",
+            "answers": {
+                "route": {
+                    "type": "choice",
+                    "choice": "billing",
+                    "probabilities": {"billing": 0.98, "tech": 0.02},
+                    "confidence": 0.96,
+                }
+            },
+            "usage": {"input_tokens": 25, "output_tokens": 0},
+        }])
+        pub_step = DECIDE(
+            name="route",
+            model=pub_dm,
+            choices=["billing", "tech"],
+            prompt="Route: {last_user_msg}",
+            record_prompt=True,
+        )
+        chat = CHAT(pub_step)
+        reply = chat.turn("Charged twice")
+        assert reply == "billing"
+        assert "`last_user_msg`" in chat.memory.get_var("route_prompt")
+
+        for hidden_mode in ("internal", "silent"):
+            hid_dm = _ScriptedDM([{
+                "model": "typesafe/jev-1.14",
+                "answers": {"h": {"type": "noul", "noul": 0.95}},
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            }])
+            hid_mem = MEMORY()
+            hid_mem.set_var("x", "test")
+            DECIDE(name="h", model=hid_dm, choices=bool, prompt="Check {x}", visibility=hidden_mode)(hid_mem)
+            assert hid_mem.get_var("h_result") is True
+            assert hid_mem.get_msgs(include=["assistant"]) == []
+
+
 

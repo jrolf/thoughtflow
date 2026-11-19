@@ -8,6 +8,7 @@ generative LLMs (``LLM``) and structured System-One decision models (``DM``).
 from __future__ import annotations
 
 import copy
+import json
 import re
 import string
 import time
@@ -143,11 +144,10 @@ class DECIDE(THOUGHT):
         self.questions = None
 
         if questions is not None:
-            normalize_questions_spec(questions)
+            self.questions = normalize_questions_spec(questions)
             self.decide_mode = "multi"
-            self.questions = copy.deepcopy(questions)
             self.choices = None
-            self._choices_list = list(questions.keys())
+            self._choices_list = list(self.questions.keys())
             self._choices_descriptions = {}
         elif (
             choices is bool
@@ -510,6 +510,141 @@ class DECIDE(THOUGHT):
                 return False
         return True
 
+    def _accumulate_dm_usage(self, dm_usage):
+        """Accumulate normalized ``DM`` usage across retries or ``fallback_llm`` failover."""
+        if not isinstance(dm_usage, dict):
+            return
+        if self._last_call_usage is None:
+            self._last_call_usage = dict(dm_usage)
+            return
+        self._last_call_usage["prompt_tokens"] = (
+            self._last_call_usage.get("prompt_tokens", 0)
+            + dm_usage.get("prompt_tokens", 0)
+        )
+        self._last_call_usage["completion_tokens"] = (
+            self._last_call_usage.get("completion_tokens", 0)
+            + dm_usage.get("completion_tokens", 0)
+        )
+        if "cost" in dm_usage and dm_usage["cost"] is not None:
+            self._last_call_usage["cost"] = (
+                (self._last_call_usage.get("cost") or 0) + dm_usage["cost"]
+            )
+
+    def _finalize_dm_side_effects(self, memory, result_val):
+        """Apply ``THOUGHT`` parity side effects (``visibility``, ``add_reflection``, ``record_prompt``)."""
+        channel = self.config.get("channel", "api")
+        if result_val is not None:
+            rendered_reply = (
+                json.dumps(result_val)
+                if isinstance(result_val, (dict, list))
+                else str(result_val)
+            )
+            if hasattr(memory, "add_msg") and callable(getattr(memory, "add_msg", None)):
+                self._add_assistant_msg(memory, rendered_reply, channel)
+            if self.config.get("add_reflection", False):
+                if hasattr(memory, "add_ref") and callable(getattr(memory, "add_ref", None)):
+                    preview = rendered_reply[:300]
+                    if len(rendered_reply) > 300:
+                        preview += "..."
+                    memory.add_ref("Thought '{}': {}".format(self.name, preview))
+
+        if (
+            self.record_prompt
+            and self.name
+            and result_val is not None
+            and self.last_prompt is not None
+            and hasattr(memory, "set_var")
+            and callable(getattr(memory, "set_var", None))
+        ):
+            memory.set_var(
+                "{}_prompt".format(self.name),
+                self.last_prompt,
+                desc="Rendered prompt for thought: {}".format(self.name),
+            )
+
+    def _maybe_run_fallback(self, memory, vars, res, err, attempts, **kwargs):
+        """
+        Execute ``retry['fallback_llm']`` for a single rescue attempt after primary exhaustion.
+
+        Clears stale ``_last_decision_meta`` from any primary refusal so generative
+        ``LLM`` fallbacks build fresh outcomes, caps the backup run at 1 attempt,
+        and preserves primary ``_failure_attempts`` history.
+        """
+        fallback = (self.retry or {}).get("fallback_llm")
+        last_kind = (
+            self._failure_attempts[-1].get("failure_kind")
+            if self._failure_attempts
+            else None
+        )
+        if (
+            res is not None
+            or err is None
+            or fallback is None
+            or self._used_fallback_llm
+            or last_kind in ("template", "replay_miss")
+        ):
+            return res, err, attempts
+
+        self._used_fallback_llm = True
+        self._last_decision_meta = None
+        self._has_fallback_result = False
+        self._fallback_result = None
+
+        saved_failures = list(self._failure_attempts)
+        saved_max_retries = self.max_retries
+        primary_llm = self.llm
+        try:
+            self.llm = fallback
+            self.max_retries = 1
+            if getattr(fallback, "is_decision_model", False):
+                res2, err2, attempts2 = self._execute_dm_call(
+                    memory, vars, dm_client=fallback, attempt_offset=attempts, **kwargs
+                )
+            elif self.decide_mode == "multi":
+                res2, err2, attempts2 = self._execute_dm_call(
+                    memory, vars, dm_client=DM.from_llm(fallback), attempt_offset=attempts, **kwargs
+                )
+            else:
+                res2, err2, attempts2 = super()._execute_llm_call(memory, vars, **kwargs)
+                # super()._execute_llm_call resets _failure_attempts; restore primary history
+                # and offset any fallback failure attempt numbers.
+                fb_failures = []
+                for entry in self._failure_attempts:
+                    shifted = dict(entry)
+                    shifted["attempt"] = attempts + int(shifted.get("attempt", 1))
+                    fb_failures.append(shifted)
+                self._failure_attempts = saved_failures + fb_failures
+                if (
+                    res2 is None
+                    and err2 is not None
+                    and self.name
+                    and hasattr(memory, "set_var")
+                    and callable(getattr(memory, "set_var", None))
+                ):
+                    final_kind = (
+                        self._failure_attempts[-1].get("failure_kind", "exception")
+                        if self._failure_attempts
+                        else "exception"
+                    )
+                    memory.set_var(
+                        "{}_last_error".format(self.name),
+                        {
+                            "reason": err2,
+                            "failure_kind": final_kind,
+                            "attempts": list(self._failure_attempts),
+                        },
+                        desc="Last error for thought: {}".format(self.name),
+                    )
+                    memory.set_var(
+                        "{}_attempts".format(self.name),
+                        attempts + attempts2,
+                        desc="Attempts for thought: {}".format(self.name),
+                    )
+            return res2, err2, attempts + attempts2
+        finally:
+            self.llm = primary_llm
+            self.max_retries = saved_max_retries
+
     def _execute_llm_call(self, memory, vars, **kwargs):
         """Route to ``DM`` execution when ``self.llm`` is a decision model (or ``multi`` mode)."""
         self.last_result = None
@@ -517,42 +652,26 @@ class DECIDE(THOUGHT):
         self._has_fallback_result = False
         self._fallback_result = None
 
-        if self._is_decision_model():
-            res, err, attempts = self._execute_dm_call(memory, vars, dm_client=self.llm, **kwargs)
-            fallback = (self.retry or {}).get("fallback_llm")
-            if (
-                res is None
-                and err is not None
-                and fallback is not None
-                and not self._used_fallback_llm
-                and (not self._failure_attempts or self._failure_attempts[-1].get("failure_kind") not in ("template", "replay_miss"))
-            ):
-                self._used_fallback_llm = True
-                primary_llm = self.llm
-                try:
-                    self.llm = fallback
-                    if getattr(fallback, "is_decision_model", False):
-                        res2, err2, attempts2 = self._execute_dm_call(memory, vars, dm_client=fallback, **kwargs)
-                    elif self.decide_mode == "multi":
-                        res2, err2, attempts2 = self._execute_dm_call(memory, vars, dm_client=DM.from_llm(fallback), **kwargs)
-                    else:
-                        res2, err2, attempts2 = super()._execute_llm_call(memory, vars, **kwargs)
-                    return res2, err2, attempts + attempts2
-                finally:
-                    self.llm = primary_llm
-            return res, err, attempts
-        if self.decide_mode == "multi":
+        if self._is_decision_model() or self.decide_mode == "multi":
             if self.llm is None:
                 raise ValueError("No LLM or DM instance provided to this DECIDE.")
-            return self._execute_dm_call(memory, vars, dm_client=DM.from_llm(self.llm), **kwargs)
+            primary_client = (
+                self.llm if self._is_decision_model() else DM.from_llm(self.llm)
+            )
+            res, err, attempts = self._execute_dm_call(
+                memory, vars, dm_client=primary_client, **kwargs
+            )
+            return self._maybe_run_fallback(memory, vars, res, err, attempts, **kwargs)
+
         return super()._execute_llm_call(memory, vars, **kwargs)
 
-    def _execute_dm_call(self, memory, vars, dm_client, **kwargs):
+    def _execute_dm_call(self, memory, vars, dm_client, attempt_offset=0, **kwargs):
         """Execute a single-pass Decision Model evaluation with transient-only retry."""
         if dm_client is None:
             raise ValueError("No DM or LLM instance provided to this DECIDE.")
 
         attempts_made = 0
+        http_failures = 0
         max_attempts = max(1, int(self.max_retries or 1))
         call_params = dict(self.config.get("llm_params", {}))
         call_params.update(kwargs)
@@ -560,40 +679,43 @@ class DECIDE(THOUGHT):
         try:
             state_obj, instructions, ctx = self._build_dm_state_and_instructions(memory, vars)
             qmap = self._build_dm_questions(instructions, ctx, state_obj)
-            self.last_prompt = instructions
+            self.last_prompt = instructions if instructions else json.dumps(qmap, default=str)
         except TemplateRenderError as exc:
             err = str(exc)
             self.last_error = err
-            self._record_failure(memory, 1, "template", err, raw_response=None)
+            self._record_failure(memory, attempt_offset + 1, "template", err, raw_response=None)
             return None, err, 1
 
         dm_res = None
         last_error = None
         while attempts_made < max_attempts:
             attempts_made += 1
+            global_attempt = attempt_offset + attempts_made
             try:
                 dm_res = dm_client.call(state_obj, qmap, params=call_params or None)
                 break
             except ReplayMissError as exc:
                 last_error = str(exc)
                 self.last_error = last_error
-                self._record_failure(memory, attempts_made, "replay_miss", last_error, raw_response=None)
+                self._record_failure(memory, global_attempt, "replay_miss", last_error, raw_response=None)
                 return None, last_error, attempts_made
             except DecisionError as exc:
                 last_error = str(exc)
                 self.last_error = last_error
-                self._record_failure(memory, attempts_made, "http", last_error, raw_response=exc.body or None)
+                self._record_failure(memory, global_attempt, "http", last_error, raw_response=exc.body or None)
                 if not exc.retryable or attempts_made >= max_attempts:
                     return None, last_error, attempts_made
+                http_failures += 1
+                self._backoff_sleep(http_failures)
                 if self.retry_delay:
                     time.sleep(self.retry_delay)
             except Exception as exc:
                 last_error = str(exc)
                 self.last_error = last_error
-                self._record_failure(memory, attempts_made, "exception", last_error, raw_response=None)
+                self._record_failure(memory, global_attempt, "exception", last_error, raw_response=None)
                 return None, last_error, attempts_made
 
-        self._last_call_usage = dm_res.get("usage")
+        self._accumulate_dm_usage(dm_res.get("usage"))
         self.last_response = dm_res
 
         if self.decide_mode == "multi":
@@ -637,7 +759,9 @@ class DECIDE(THOUGHT):
                     "answers": dm_res["answers"],
                     "model": dm_res.get("model"),
                 }
-                self._record_failure(memory, attempts_made, "refusal", why, raw_response=None)
+                self._record_failure(
+                    memory, attempt_offset + attempts_made, "refusal", why, raw_response=None
+                )
                 return None, why, attempts_made
 
             self._last_finish_reason = "stop"
@@ -650,6 +774,7 @@ class DECIDE(THOUGHT):
                 "answers": dm_res["answers"],
                 "model": dm_res.get("model"),
             }
+            self._finalize_dm_side_effects(memory, values)
             return values, None, attempts_made
 
         qkey = self.name or "decision"
@@ -670,7 +795,9 @@ class DECIDE(THOUGHT):
                 "margin": None,
                 "model": dm_res.get("model"),
             }
-            self._record_failure(memory, attempts_made, "refusal", why, raw_response=None)
+            self._record_failure(
+                memory, attempt_offset + attempts_made, "refusal", why, raw_response=None
+            )
             return None, why, attempts_made
 
         raw_val = (
@@ -696,6 +823,7 @@ class DECIDE(THOUGHT):
             "legend": ans.get("legend"),
             "model": dm_res.get("model"),
         }
+        self._finalize_dm_side_effects(memory, final_val)
         return final_val, None, attempts_made
 
     # ------------------------------------------------------------------ #

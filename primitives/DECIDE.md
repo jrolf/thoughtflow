@@ -41,6 +41,9 @@ All four modes work on both `DM` and `LLM` instances (multi-question `questions=
 | `default` | Fallback value used when retries exhaust, the model refuses, or confidence/margin falls below threshold. |
 | `case_sensitive` | Case-sensitive choice matching on the `LLM` path (default `False`). |
 | `max_retries` | Maximum attempts (default `5`). On `DM` calls, only transient `429`/`5xx`/timeout errors retry; `4xx` errors and refusals finish in 1 attempt. |
+| `retry` | Inherited `THOUGHT` retry policy (`{"on": {"http": "backoff"}, "backoff_base": 0.5, "max_backoff": 8.0, "fallback_llm": ...}`). `fallback_llm` may be a backup `DM` or a generative `LLM` and runs for a single rescue attempt after primary exhaustion or refusal. |
+| `visibility` | Inherited `THOUGHT` transcript visibility (`"public"` writes the decision as an assistant message so `CHAT` works seamlessly; `"internal"` / `"silent"` suppresses assistant-message writes). |
+| `record_prompt` | When `True`, records the rendered instructions (or question map) to `{name}_prompt` on both `DM` and `LLM` paths. |
 
 ## Structured Outcome (`{name}_outcome`)
 
