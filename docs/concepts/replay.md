@@ -61,7 +61,7 @@ assert fresh.get_var("respond_result") == original
 
 The replayed flow runs in a fresh MEMORY against the recorded responses. If the flow is unchanged, the output is identical. If repeated identical requests were recorded, they replay in their recorded order.
 
-`EMBED` and `TOOL` mirror this seam: `embed.record(memory)` / `EMBED.replay(memory)` return a `ReplayEMBED` that serves recorded vectors, and `tool.record(memory)` / `tool.replay(memory)` (or `TOOL.replay_all(tools, memory)`) return `ReplayTOOL` instances that serve recorded tool or MCP outputs offline without re-firing external side effects. Passing `on_miss="live"` to `tool.replay(...)` alongside `LLM.replay(recorded, on_miss=live_llm)` enables time-travel splice debugging: recorded prefix steps replay in under a millisecond while diverged calls fall through to the live system.
+`EMBED`, `DM`, and `TOOL` mirror this seam: `embed.record(memory)` / `EMBED.replay(memory)` return a `ReplayEMBED` that serves recorded vectors, `dm.record(memory)` / `DM.replay(memory)` return a `ReplayDM` that serves recorded System-One decision distributions, and `tool.record(memory)` / `tool.replay(memory)` (or `TOOL.replay_all(tools, memory)`) return `ReplayTOOL` instances that serve recorded tool or MCP outputs offline without re-firing external side effects. Passing `on_miss="live"` to `tool.replay(...)` alongside `LLM.replay(recorded, on_miss=live_llm)` or `DM.replay(recorded, on_miss=live_dm)` enables time-travel splice debugging: recorded prefix steps replay in under a millisecond while diverged calls fall through to the live system.
 
 ---
 

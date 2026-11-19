@@ -1,84 +1,118 @@
 # DECIDE
 
-> A specialized THOUGHT subclass for constrained decision-making from a finite set of choices.
+> A specialized THOUGHT subclass for constrained decision-making across generative LLMs (`LLM`) and structured System-One decision models (`DM`).
 
 ## Philosophy
 
-DECIDE exists because many agent workflows require the LLM to make a discrete choice rather than produce free-form text. Routing a support ticket, classifying intent, approving or rejecting a request, selecting a category — these are all cases where the output must be one of a fixed set of options. A plain THOUGHT can ask for a choice, but it cannot guarantee the response will match. DECIDE enforces that constraint.
+DECIDE exists because many workflows need a bounded, typed judgment rather than free-form prose: routing a support ticket, gating a high-risk tool call, checking whether a condition holds, or scoring an item against a rubric.
 
-By subclassing THOUGHT, DECIDE inherits the full cognitive pipeline: prompt construction, context injection, LLM invocation, parsing, and validation. It adds choice-specific behavior: automatic presentation of options in the prompt, smart parsing to extract the selection from varied LLM output, validation against allowed choices, and choice-specific repair prompts when retries are needed. This keeps decision logic explicit and reliable.
+By subclassing THOUGHT, DECIDE keeps one uniform `memory = decide(memory)` contract across both model families:
 
-Within the ThoughtFlow ecosystem, DECIDE sits between raw THOUGHT (unconstrained) and PLAN (structured multi-step output). It is the right primitive when the answer is "which one?" rather than "what?" or "how?"
+- **With an `LLM` (System Two)**: DECIDE formats the allowed options into the prompt, extracts an unambiguous non-negated choice from the text response, validates it, and runs choice-specific repair retries when needed.
+- **With a `DM` (System One)**: DECIDE executes a single forward pass against the decision model's typed endpoint (`choice`, `noul`, `score`, or batched `questions`), automatically isolating untrusted `{variable}` state from instructions and recording calibrated probabilities, normalized `confidence`, and top-2 `margin` in `{name}_outcome`.
 
-## How It Works
+Switching a router or guardrail from a generative `LLM` to a `DM` is a one-line model change; downstream code reading `memory.get_var("{name}_result")` stays untouched.
 
-DECIDE builds a prompt by appending a formatted list of choices to the base prompt, then instructs the LLM to respond with only its choice. When the LLM responds, `parse_response` extracts an unambiguous selection: first by exact match (after normalization), then by a leading choice token at the start of the reply, and finally by checking whether exactly one distinct choice appears on word boundaries without negation (so `"I do not approve this. Revise."` will not match `"approve"`). Matching is case-insensitive by default.
+## Decision Modes
 
-If the parsed result fails validation (not in the allowed set), DECIDE appends a repair suffix to the prompt and retries. The repair prompt explicitly lists the valid choices. After `max_retries` attempts (default 5), if no valid choice is obtained and a `default` was configured, that value is stored. Otherwise the last parsed value (or None) is stored.
+| Mode | Configuration | `{name}_result` Value |
+|------|---------------|-----------------------|
+| **Choice** (default) | `choices=["a", "b"]` or `choices={"a": "desc", "b": "desc"}` | Selected key (`str`), or `default` |
+| **Binary (`noul`)** | `choices=bool` (optional `threshold=0.5`) | `True` or `False` (`bool`), with $P(\text{true})$ in `{name}_outcome["probability"]` |
+| **Rubric (`score`)** | `levels=["Low: ...", "Medium: ...", "High: ..."]` | Continuous rubric position (`float` in `[0.0, K - 1.0]`) |
+| **Multi-question** | `questions={"dept": {...}, "urgent": {...}}` | Dict mapping each question key to its typed answer (`dict`) |
 
-The result is written to memory at `{name}_result`, consistent with THOUGHT.
+All four modes work on both `DM` and `LLM` instances (multi-question `questions=` on an `LLM` adapts automatically through `DM.from_llm`).
 
 ## Inputs & Configuration
 
 | Parameter | Description |
 |-----------|-------------|
-| `name` | Unique identifier for this decision. |
-| `llm` | LLM instance for execution. |
-| `prompt` | Prompt template with `{variable}` placeholders. |
-| `choices` | Required. List (`["approve", "reject"]`) or dict (`{"approve": "Accept the request", "reject": "Deny the request"}`). Dict values are descriptions shown to the LLM. |
-| `default` | Optional. Fallback choice when all retries fail. |
-| `case_sensitive` | Whether matching is case-sensitive. Default: False. |
-| `max_retries` | Maximum retry attempts. Default: 5. |
-| `**kwargs` | Additional THOUGHT parameters (e.g. `context_vars`, `pre_hook`). |
+| `name` | Unique identifier driving `{name}_result`, `{name}_outcome`, and `{name}_attempts`. |
+| `llm` / `model` | `LLM` or `DM` instance (`model=` is an alias for `llm=`). |
+| `prompt` | Prompt or instruction template with `{variable}` placeholders. |
+| `choices` | Allowed options (`list` or `dict`), or `bool` for binary `noul` evaluation. |
+| `levels` | Ordered rubric level descriptions (lowest to highest) for `score` mode. |
+| `questions` | Map of `question_id -> spec` for single-pass multi-question evaluation. |
+| `state` | State construction mode on `DM` calls: `"auto"` (default — extracts `{var}` values into a structured `state` dict and rewrites `{var}` to backticked `` `var` `` in `instructions`), `list[str]` of `MEMORY` variable names, `dict` template, or template `str`. |
+| `threshold` | Probability threshold for `choices=bool` / `noul` questions (default `0.5`). |
+| `min_confidence` | Optional minimum normalized concentration (`0.0..1.0`) required to accept a `DM` answer; below this threshold `DECIDE` substitutes `default` with `outcome["source"] = "low_confidence"`. |
+| `min_margin` | Optional minimum top-2 probability gap (`p_top1 - p_top2`) required to accept a `DM` answer. |
+| `default` | Fallback value used when retries exhaust, the model refuses, or confidence/margin falls below threshold. |
+| `case_sensitive` | Case-sensitive choice matching on the `LLM` path (default `False`). |
+| `max_retries` | Maximum attempts (default `5`). On `DM` calls, only transient `429`/`5xx`/timeout errors retry; `4xx` errors and refusals finish in 1 attempt. |
+
+## Structured Outcome (`{name}_outcome`)
+
+Every `DECIDE` run writes `{name}_outcome` extending `THOUGHT`'s standard outcome keys (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`) with decision provenance:
+
+- `kind`: `'choice'`, `'noul'`, `'score'`, or `'multi'`
+- `value`: Final stored result (after any `default` fallback)
+- `raw_value`: Model's un-gated selection before `min_confidence` / `min_margin`
+- `source`: `'model'`, `'low_confidence'`, `'default'`, `'refusal'`, or `'error'`
+- `probability`: Winning option probability or $P(\text{true})$ (`DM` path)
+- `probabilities`: Full discrete probability map (`DM` path)
+- `confidence`: Cross-vendor normalized concentration in `[0.0, 1.0]` (`DM` path)
+- `provider_confidence`: Raw provider-reported confidence when supplied
+- `margin`: Top-2 probability margin `p_top1 - p_top2` (`DM` path)
 
 ## Usage
 
 ```python
-from thoughtflow import DECIDE, MEMORY, LLM
+from thoughtflow import DECIDE, DM, LLM, MEMORY
 
-llm = LLM("openai:gpt-4o", key="...")
+# 1. One-line swap between generative LLM and System-One DM
+dm = DM("openrouter:typesafe/jev-1.14", key="sk-or-...")
 memory = MEMORY()
+memory.add_msg("user", "My blender arrived smashed. I want a refund.")
 
-# Simple list of choices
-decide = DECIDE(
-    name="sentiment",
-    llm=llm,
-    choices=["positive", "negative", "neutral"],
-    prompt="Classify the sentiment of: {text}",
-)
-memory.set_var("text", "I love this product!")
-memory = decide(memory)
-result = memory.get_var("sentiment_result")  # "positive", "negative", or "neutral"
-```
-
-```python
-# Dict with descriptions (shown to LLM)
-decide = DECIDE(
+router = DECIDE(
     name="route",
-    llm=llm,
+    model=dm,   # works identically with llm=LLM("openai:gpt-4o", key="...")
     choices={
-        "approve": "Accept and proceed with the request",
-        "reject": "Deny the request",
-        "escalate": "Send to human reviewer",
+        "refund": "Damaged goods or money-back requests",
+        "tech": "Product bugs, crashes, or login errors",
+        "sales": "Pricing, plans, and seat quotes",
     },
-    prompt="Decide how to handle: {request}",
+    prompt="Route this customer message: {last_user_msg}",
+    min_margin=0.50,
     default="escalate",
 )
-memory.set_var("request", "Customer wants a refund.")
-memory = decide(memory)
-result = memory.get_var("route_result")
+memory = router(memory)
+result = memory.get_var("route_result")      # "refund"
+outcome = memory.get_var("route_outcome")    # includes probabilities, confidence, margin, source
+
+# 2. Binary gate (`choices=bool`) and rubric score (`levels=[...]`)
+is_sec = DECIDE(
+    name="touches_auth",
+    model=dm,
+    choices=bool,
+    threshold=0.7,
+    prompt="Does {diff} modify authentication or permission checks?",
+)
+
+severity = DECIDE(
+    name="risk",
+    model=dm,
+    levels=["Low: docs only", "Medium: isolated handler", "High: auth or schema change"],
+    prompt="Rate deployment risk of {diff}.",
+)
+
+# 3. Single-pass multi-question triage (`questions={...}`)
+intake = DECIDE(
+    name="triage",
+    model=dm,
+    state=["ticket"],
+    questions={
+        "owner": {"type": "choice", "instructions": "Owner?", "choices": ["billing", "eng"]},
+        "is_sev1": {"type": "noul", "instructions": "Production revenue blocked?"},
+        "urgency": {"type": "score", "instructions": "Urgency?", "levels": ["P3", "P2", "P1"]},
+    },
+)
 ```
 
 ## Relationship to Other Primitives
 
-- **THOUGHT**: DECIDE is a subclass. It inherits prompt building, context injection, execution history, serialization (`to_dict`/`from_dict`), and the `memory = decide(memory)` contract.
-- **PLAN**: Both constrain LLM output. DECIDE constrains to a single choice; PLAN constrains to a structured multi-step plan. Use DECIDE for routing or classification; use PLAN when you need a sequence of actions.
-- **WORKFLOW**: WORKFLOW can orchestrate DECIDE steps (e.g. decide, then branch on the result).
-- **AGENT**: An agent loop may use DECIDE internally for routing or confirmation steps.
-
-## Considerations for Future Development
-
-- Support for weighted or ranked choices (e.g. top-k).
-- Optional confidence score alongside the chosen value.
-- Integration with structured output APIs when available (native schema enforcement instead of text parsing).
-- Allow choices to be dynamically loaded from memory (e.g. `choices="{available_options}"`).
+- **`DM`**: Intelligence-layer client for System-One decision models (`openrouter`, `typesafe`, `openai`, `liquid`, `cloudflare`, `perplexity`, `inception`, `upstage`, `ollama`, `vllm`).
+- **`THOUGHT`**: Parent class providing context extraction, lazy `_obj_ref` resolution, lifecycle `emit` events, execution history, and pure-JSON `to_dict()` / `from_dict()`.
+- **`WORKFLOW`**: Combine fast `DECIDE(model=dm, min_margin=..., default="escalate")` gates with `WORKFLOW.branch(...)` to route clear traffic in a single cheap pass and escalate only genuinely ambiguous cases to an `LLM` or `AGENT`.

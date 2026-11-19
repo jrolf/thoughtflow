@@ -100,10 +100,16 @@ def normalize_usage(response, service, model):
         "model": model,
     }
 
-    prompt_details = usage.get("prompt_tokens_details") or {}
+    prompt_details = (
+        usage.get("prompt_tokens_details")
+        or usage.get("input_tokens_details")
+        or {}
+    )
     cached = prompt_details.get("cached_tokens")
     if cached:
         record["cached_tokens"] = cached
+    if prompt_details.get("cache_write_tokens"):
+        record["cache_write_tokens"] = prompt_details["cache_write_tokens"]
 
     if usage.get("cache_read_input_tokens"):
         record["cache_read_input_tokens"] = usage["cache_read_input_tokens"]
@@ -114,6 +120,9 @@ def normalize_usage(response, service, model):
     reasoning = completion_details.get("reasoning_tokens")
     if reasoning:
         record["reasoning_tokens"] = reasoning
+
+    if "cost" in usage and usage["cost"] is not None:
+        record["cost"] = usage["cost"]
 
     return record
 

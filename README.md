@@ -305,7 +305,7 @@ ThoughtFlow is built in layers. Four **foundational** primitives form the base; 
 │  COGNITION            THOUGHT  (→ DECIDE · PLAN)                        │
 │  OPERATION            ACTION   (→ 16 elemental subclasses)              │
 │  STATE                MEMORY                                            │
-│  INTELLIGENCE         LLM · EMBED                                       │
+│  INTELLIGENCE         LLM · EMBED · DM                                  │
 │  ─────────────────────────────────────────────────────────────────────── │
 │  ↑ Foundational layer            ↑ Higher-level layer                   │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -329,7 +329,8 @@ Built on the foundational layer for richer capabilities.
 | Primitive | Layer | Purpose |
 |-----------|-------|---------|
 | **EMBED** | Intelligence | Vector embeddings from any provider |
-| **DECIDE** | Cognition | Constrained decisions from finite choices (extends THOUGHT) |
+| **DM** | Intelligence | Structured System-One decision models (`choice`, `noul`, `score`, `box`) |
+| **DECIDE** | Cognition | Constrained decisions over `LLM` or `DM` (extends THOUGHT) |
 | **PLAN** | Cognition | Structured multi-step execution plans (extends THOUGHT) |
 | **TOOL** | Capability | Wrap any callable as an LLM-invocable tool |
 | **MCP** | Capability | Model Context Protocol client for external tool servers |
@@ -1229,12 +1230,12 @@ result = memory.get_var("route_request_result")  # "approve", "reject", or "esca
 ```
 
 **Key features:**
-- **Constrained output** — Forces LLM to pick from valid choices
-- **Flexible input** — List for simple choices, dict for choices with descriptions
-- **Smart parsing** — Handles exact matches, embedded choices, and case variations
-- **Higher retry default** — 5 retries vs THOUGHT's 1, since classification often needs correction
-- **Default fallback** — Optional default choice when all retries fail
-- **Inherits from THOUGHT** — Full serialization, hooks, and history support
+- **Works with `LLM` or `DM`** — Pass a generative `LLM` or a System-One `DM("openrouter:typesafe/jev-1.14", key=...)` (`model=` alias supported) with zero downstream code changes
+- **Four decision modes** — Categorical `choices`, binary `choices=bool` (`noul`), ordered `levels=[...]` (`score`), and single-pass `questions={...}` batching
+- **Calibrated uncertainty gating** — `min_confidence=` and `min_margin=` route ambiguous ties to `default=` with full probabilities in `{name}_outcome`
+- **Automatic `state` isolation** — On `DM` calls, `{var}` placeholders are lifted into structured `state` data separate from `instructions`
+- **Smart LLM parsing & retries** — Handles exact, leading, and non-negated embedded matches with choice-specific repair prompts (`max_retries=5`)
+- **Inherits from THOUGHT** — Full JSON serialization, hooks, lifecycle emits, and execution history support
 
 ---
 
@@ -1655,6 +1656,40 @@ print(embed.last_error)  # None on success; error string on provider failure
 ```
 
 Supported embedding providers: OpenAI, Gemini, Groq, OpenRouter, and local Ollama (`ollama:all-minilm:33m`, etc.).
+
+### `DM` — Structured Decision Models
+
+`DM` is the System-One decision counterpart to `LLM` and `EMBED`. Instead of generating prose and regex-parsing labels, `DM` sends structured `state` and one or more typed `questions` (`choice`, `noul`, `score`, `box`) to a decision model and returns calibrated probabilities in a single forward pass — normalizing wire dialects across OpenRouter, TypeSafe (Jev), OpenAI (`/v1/decisions`), Liquid (`d1`), Cloudflare (`clef`), Perplexity, Inception, Upstage, local Ollama (`d3`, `clef`), and vLLM:
+
+```python
+from thoughtflow import DM, DECIDE, MEMORY
+
+dm = DM("openrouter:typesafe/jev-1.14", key="sk-or-...")
+
+# Plug straight into DECIDE (1-line swap from LLM)
+router = DECIDE(
+    name="route",
+    model=dm,
+    choices={"billing": "Invoices and charges", "tech": "Crashes and bugs"},
+    prompt="Route this ticket: {last_user_msg}",
+    min_margin=0.60,
+    default="escalate",
+)
+
+# Or evaluate multiple typed questions over shared state in one pass
+res = dm.call(
+    state={"ticket": "Charged twice on invoice #901."},
+    questions={
+        "dept": {"type": "choice", "instructions": "Owner?", "choices": ["billing", "tech"]},
+        "is_refund": {"type": "noul", "instructions": "Asking for money back?"},
+        "urgency": {"type": "score", "instructions": "Urgency?", "levels": ["Low", "Med", "High"]},
+    },
+)
+
+# Deterministic offline replay via MEMORY
+dm.record(memory)
+replay_dm = DM.replay(memory)
+```
 
 ---
 
@@ -2312,6 +2347,7 @@ thoughtflow/
 │   ├── llm_cache.py     # Prompt caching helpers (cached_system, etc.)
 │   ├── providers/       # GroqLLM, CerebrasLLM, OpenRouterLLM
 │   ├── embed.py         # EMBED — multi-provider embeddings
+│   ├── dm.py            # DM — multi-provider structured decision models
 │   ├── memory.py        # MEMORY — event-sourced state container
 │   ├── thought.py       # THOUGHT — atomic cognitive unit
 │   ├── action.py        # ACTION — external operations base class
@@ -2372,7 +2408,7 @@ See [developer/](developer/) for comprehensive development documentation.
 
 | Aspect | Status | Notes |
 |--------|--------|-------|
-| **Foundational Primitives** | ✅ Stable | LLM, EMBED, MEMORY, THOUGHT, ACTION |
+| **Foundational Primitives** | ✅ Stable | LLM, EMBED, DM, MEMORY, THOUGHT, ACTION |
 | **Cognitive / Planning** | ✅ Stable | DECIDE, PLAN |
 | **Capability** | ✅ Stable | TOOL, MCP |
 | **Autonomy** | ✅ Stable | AGENT, ReactAgent, ReflectAgent, PlanActAgent |
