@@ -12,7 +12,7 @@ DELEGATE supports three modes with different semantics. Handoff is fire-and-forg
 
 **Registration** — Pass a list of agents to the constructor. Each must have a `name` attribute. DELEGATE builds a `name -> agent` lookup. Unknown agent names raise `KeyError`.
 
-**Memory copy** — `_copy_memory` creates a lightweight copy: new MEMORY instance, same messages and variables. Not a deep copy; nested objects are shared. The copy is passed to the target agent so the original is unchanged (except for merged results).
+**Memory copy** — `_copy_memory` delegates to `memory.copy()` (deep-copying events, scalar/collection variable values, descriptions, tombstones, and compressed objects) so the target agent receives an isolated, faithful snapshot of the caller's state without mutating the original `MEMORY` except when `dispatch` or `broadcast` merges results back.
 
 **Handoff** — Copy memory, optionally add task as user message, run target agent on the copy. Log the delegation. Return the result memory (caller typically discards it). Original memory unchanged.
 

@@ -22,7 +22,7 @@ LLM("myservice:my-model")
    _send_request()            ← shared urllib POST helper
 ```
 
-`EMBED` in `src/thoughtflow/embed.py` mirrors the same architecture for embedding endpoints. If the provider offers embeddings, add the counterpart there too.
+`EMBED` in `src/thoughtflow/embed.py` and `DM` in `src/thoughtflow/dm.py` mirror the same `service:model` routing and `split_call_params()` architecture for embedding endpoints and structured System-One decision models (`PROVIDER_DECISION_PROFILES`). If the provider offers native tool-calling over the OpenAI chat-completions dialect, also consider adding its service name to `CHAT_SERVICES` and `chat_endpoint()` in `src/thoughtflow/llm_chat.py` so `LLM.chat()` and native `AGENT` loops work out of the box.
 
 ### Param pipeline (required for all providers)
 

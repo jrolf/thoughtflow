@@ -36,6 +36,7 @@ CHRON includes a pure-Python cron expression parser (zero dependencies). It supp
 - Ranges: `1-5`
 - Steps: `*/15`, `1-10/3`
 - Lists: `1,15,30`
+- Shorthand aliases: `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`
 - Day-of-week: 0=Sunday, 6=Saturday (7 is also accepted as Sunday)
 - Standard OR-logic when both day-of-month and day-of-week are restricted
 

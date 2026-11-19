@@ -190,6 +190,14 @@ class MEMORY:
     """
 
     def __init__(self):
+        """
+        Initialize an empty event-sourced MEMORY container.
+
+        Sets up four internal layers: ``events`` (stamp-keyed event store),
+        ``idx_*`` (sorted ``[dt_utc, seq, stamp]`` indexes), ``vars`` /
+        ``var_desc_history`` (append-only variable histories with tombstones),
+        and ``objects`` (zlib-compressed large payloads above ``object_threshold``).
+        """
         self.id = event_stamp()
         
         # DATA LAYER: Single source of truth for all events
@@ -2555,6 +2563,7 @@ class _MemoryScope:
         _ancestor_prefixes=(),
         _export_prefix="",
     ):
+        """Initialize a zero-copy scoped perspective unwrapping directly to the root MEMORY."""
         if not isinstance(actor, str) or not actor.strip():
             raise ValueError("scope actor must be a non-empty string")
         sub_actor = actor.strip()
@@ -2632,9 +2641,11 @@ class _MemoryScope:
 
     @property
     def id(self):
+        """Return a composite scope identifier ``'{root_id}:{actor}'``."""
         return "{}:{}".format(self.base.id, self.actor)
 
     def _var_key_visible(self, raw_key):
+        """Return True when ``raw_key`` belongs to this scope or its readable public keys."""
         if raw_key.startswith(self.ns):
             return True
         for key in self.public_keys:
@@ -2646,6 +2657,7 @@ class _MemoryScope:
         return False
 
     def _event_visible(self, event):
+        """Return True when ``event`` is epistemically visible to this actor scope."""
         etype = event.get('type', 'msg')
         if etype == 'msg':
             return self._msg_in_read_rooms(event)
@@ -2672,18 +2684,22 @@ class _MemoryScope:
 
     @property
     def objects(self):
+        """Expose the underlying compressed object store for stamp resolution."""
         return self.base.objects
 
     @property
     def valid_roles(self):
+        """Return the set of valid message roles on the root MEMORY."""
         return self.base.valid_roles
 
     @property
     def valid_modes(self):
+        """Return the set of valid communication modes on the root MEMORY."""
         return self.base.valid_modes
 
     @property
     def valid_channels(self):
+        """Return the set of registered channels/rooms on the root MEMORY."""
         return self.base.valid_channels
 
     @property
@@ -2728,28 +2744,33 @@ class _MemoryScope:
         return self.ns + key
 
     def get_var(self, key, resolve_refs=True):
+        """Read ``{actor}__{key}`` first, falling back to ancestor/root ``public_keys``."""
         real = self._resolve_read_key(key)
         if real is None:
             return None
         return self.base.get_var(real, resolve_refs=resolve_refs)
 
     def get_all_vars(self, resolve_refs=True):
+        """Return a dict of all non-deleted variables visible to this scope."""
         return {
             key: self.get_var(key, resolve_refs=resolve_refs)
             for key in self.vars
         }
 
     def set_var(self, key, value, desc=''):
+        """Write ``key`` into ``{actor}__{key}`` (or export target when in ``export_keys``)."""
         target = self._resolve_write_key(key)
         return self.base.set_var(target, value, desc=desc)
 
     def del_var(self, key):
+        """Append a deletion tombstone on this scope's write target for ``key``."""
         target = self._resolve_write_key(key)
         if target not in self.base.vars:
             return None
         return self.base.del_var(target)
 
     def is_var_deleted(self, key):
+        """Return True if ``key`` was tombstoned in this scope or in visible ``public_keys``."""
         scoped = self.ns + key
         if scoped in self.base.vars:
             return self.base.is_var_deleted(scoped)
@@ -2763,6 +2784,7 @@ class _MemoryScope:
         return False
 
     def _msg_in_read_rooms(self, event):
+        """Return True when ``event`` belongs to one of this scope's ``read_rooms``."""
         if self.read_rooms is None:
             return True
         meta = event.get('metadata') or {}
@@ -2781,6 +2803,7 @@ class _MemoryScope:
         tool_call_id=None,
         name=None,
     ):
+        """Append a message tagged with ``actor`` and routed to ``write_room`` by default."""
         meta = dict(metadata or {})
         meta.setdefault('actor', self.actor)
         if self.write_room:
@@ -2807,6 +2830,7 @@ class _MemoryScope:
         channel=None,
         metadata=None,
     ):
+        """Append a scoped RAG/context augment message into this scope's ``write_room``."""
         meta = dict(metadata or {})
         meta['augments'] = target
         return self.add_msg(role, content, mode=mode, channel=channel, metadata=meta)
@@ -2821,6 +2845,7 @@ class _MemoryScope:
         metadata_filter=None,
         exclude_metadata=None,
     ):
+        """Return messages visible in ``read_rooms`` matching role/channel/metadata filters."""
         events = self.base.get_msgs(
             limit=-1,
             include=include,
@@ -2843,6 +2868,7 @@ class _MemoryScope:
         raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
 
     def get_events(self, limit=-1, event_types=None, channel=None):
+        """Return master-index events filtered to those epistemically visible to this scope."""
         events = [
             e
             for e in self.base.get_events(limit=-1, event_types=event_types, channel=channel)
@@ -2851,10 +2877,12 @@ class _MemoryScope:
         return events[-limit:] if limit > 0 else events
 
     def get_logs(self, limit=-1):
+        """Return log entries visible to this scope."""
         logs = [e for e in self.base.get_logs(limit=-1) if self._event_visible(e)]
         return logs[-limit:] if limit > 0 else logs
 
     def get_refs(self, limit=-1):
+        """Return reflection entries visible to this scope."""
         refs = [e for e in self.base.get_refs(limit=-1) if self._event_visible(e)]
         return refs[-limit:] if limit > 0 else refs
 
@@ -2872,6 +2900,7 @@ class _MemoryScope:
         summarizer=None,
         token_counter=None,
     ):
+        """Build LLM-ready message dicts from this scope's visible room history."""
         if format not in ('raw', 'openai'):
             raise ValueError("Invalid format '{}'. Choose 'raw' or 'openai'.".format(format))
         effective_include = include
@@ -2895,69 +2924,84 @@ class _MemoryScope:
         )
 
     def compact(self, keep=6, summarizer=None, channel='unknown'):
+        """Summarize older visible turns in this scope without deleting raw events."""
         return MEMORY.compact(self, keep=keep, summarizer=summarizer, channel=channel)
 
     def suspend(self, reason, pending=None, resume_at=None, suspension_id=None):
+        """Record a scoped suspension marker under ``{actor}___suspension``."""
         return MEMORY.suspend(self, reason, pending, resume_at, suspension_id)
 
     def get_suspension(self):
+        """Return this scope's current suspension record, or None."""
         return MEMORY.get_suspension(self)
 
     def is_suspended(self):
+        """Return True while this scope holds an unresolved suspension."""
         return MEMORY.is_suspended(self)
 
     def resolve_suspension(self, decision=None):
+        """Idempotently resolve this scope's suspension with ``decision``."""
         return MEMORY.resolve_suspension(self, decision)
 
     def last_user_msg(self, content_only=False):
+        """Return the most recent visible ``user`` message in this scope."""
         msgs = self.get_msgs(include=['user'])
         if not msgs:
             return '' if content_only else None
         return msgs[-1]['content'] if content_only else msgs[-1]
 
     def last_asst_msg(self, content_only=False):
+        """Return the most recent visible ``assistant`` message in this scope."""
         msgs = self.get_msgs(include=['assistant'])
         if not msgs:
             return '' if content_only else None
         return msgs[-1]['content'] if content_only else msgs[-1]
 
     def last_sys_msg(self, content_only=False):
+        """Return the most recent visible ``system`` message in this scope."""
         msgs = self.get_msgs(include=['system'])
         if not msgs:
             return '' if content_only else None
         return msgs[-1]['content'] if content_only else msgs[-1]
 
     def last_result_msg(self, content_only=False):
+        """Return the most recent visible ``result`` message in this scope."""
         msgs = self.get_msgs(include=['result'])
         if not msgs:
             return '' if content_only else None
         return msgs[-1]['content'] if content_only else msgs[-1]
 
     def last_log_msg(self, content_only=False):
+        """Return the most recent visible log entry in this scope."""
         logs = self.get_logs()
         if not logs:
             return '' if content_only else None
         return logs[-1]['content'] if content_only else logs[-1]
 
     def last_ref(self, content_only=False):
+        """Return the most recent visible reflection entry in this scope."""
         refs = self.get_refs()
         if not refs:
             return '' if content_only else None
         return refs[-1]['content'] if content_only else refs[-1]
 
     def add_log(self, message):
+        """Append a log entry prefixed with ``[{actor}]``."""
         return self.base.add_log("[{}] {}".format(self.actor, message))
 
     def add_ref(self, content):
+        """Append a reflection entry prefixed with ``[{actor}]``."""
         return self.base.add_ref("[{}] {}".format(self.actor, content))
 
     def emit(self, kind, payload, schema_version=1):
+        """Emit a typed lifecycle event tagged with ``payload['actor'] = self.actor``."""
         tagged = dict(payload) if isinstance(payload, dict) else payload
         if isinstance(tagged, dict):
             tagged.setdefault('actor', self.actor)
         return self.base.emit(kind, tagged, schema_version=schema_version)
 
     def get_emits(self, kind=None, limit=-1):
+        """Return lifecycle emits produced by this actor or its nested child scopes."""
         emits = self.base.get_emits(kind=kind, limit=-1)
         scoped = [
             e
@@ -2968,22 +3012,28 @@ class _MemoryScope:
         return scoped[-limit:] if limit > 0 else scoped
 
     def set_obj(self, data, name=None, desc='', content_type='auto'):
+        """Store a compressed object on the root MEMORY, scoping ``name`` when provided."""
         mapped_name = self._resolve_write_key(name) if name else None
         return self.base.set_obj(data, name=mapped_name, desc=desc, content_type=content_type)
 
     def get_obj(self, stamp):
+        """Decompress and return an object by stamp from the root MEMORY."""
         return self.base.get_obj(stamp)
 
     def get_obj_info(self, stamp):
+        """Return compressed object size/type metadata without decompressing."""
         return self.base.get_obj_info(stamp)
 
     def add_exchange(self, kind, key, service, model, request, response):
+        """Record a model/tool exchange on the root MEMORY."""
         return self.base.add_exchange(kind, key, service, model, request, response)
 
     def get_exchanges(self, kind=None):
+        """Retrieve recorded exchanges from the root MEMORY."""
         return self.base.get_exchanges(kind=kind)
 
     def copy(self):
+        """Return an independent deep copy of both the root MEMORY and this scope view."""
         copied = _MemoryScope(
             base=self.base.copy(),
             actor=self.actor,

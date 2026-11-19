@@ -26,32 +26,46 @@ The actual library code lives here. This is what gets packaged and published to 
 
 ```
 src/thoughtflow/
+├── README.md               # Package architecture & invariants guide
 ├── __init__.py             # Package entry point, public API exports
-├── py.typed                # Marker for PEP 561 type hints
-├── llm.py                  # LLM: multi-provider model calls + record/replay
-├── embed.py                # EMBED: multi-provider embeddings + record/replay
-├── memory.py               # MEMORY: event-sourced state container
-├── thought.py              # THOUGHT: prompt + LLM + parsing + validation
-├── action.py               # ACTION: imperative operation wrapper
-├── tool.py                 # TOOL: LLM-selectable capability with schema
-├── agent.py                # AGENT: autonomous tool-use loop
-├── mcp.py                  # MCP: Model Context Protocol client
-├── workflow.py             # WORKFLOW: flow composition
-├── chat.py                 # CHAT: human-in-the-loop conversation
+├── py.typed                # Marker for PEP 561
+├── llm.py                  # LLM: multi-provider text calls + ReplayLLM
+├── llm_chat.py             # LLM.chat: structured native tool calls, stream events, abort
+├── llm_params.py           # Unified model-param pipeline (transport vs wire)
+├── llm_cache.py            # Prompt caching markers & Anthropic wire adapter
+├── embed.py                # EMBED: multi-provider embeddings + ReplayEMBED
+├── dm.py                   # DM: System-One decision models + ReplayDM
+├── memory.py               # MEMORY: event-sourced state, scopes, budgets, suspend/resume
 ├── message.py              # Message schema helpers
-├── _util.py                # Internal utilities (not public API)
+├── thought.py              # THOUGHT: prompt + LLM + parsing + validation + outcomes
+├── action.py               # ACTION: imperative operation wrapper
+├── tool.py                 # TOOL: LLM-selectable capability + ReplayTOOL
+├── mcp.py                  # MCP: Model Context Protocol client (stdio & HTTP+SSE)
+├── agent.py                # AGENT & tool_loop: governed write-ahead tool loop
+├── delegate.py             # DELEGATE: multi-agent handoff, dispatch, broadcast
+├── workflow.py             # WORKFLOW: step orchestration, while_, suspend/resume
+├── chron.py                # CHRON: recurring cron / @daily / interval scheduler
+├── _cron_expr.py           # Internal cron expression parser
+├── chat.py                 # CHAT: human-in-the-loop conversation
+├── this.py                 # The Zen of ThoughtFlow (`from thoughtflow import this`)
+├── _util.py                # Internal utilities (stamps, valid_extract, templates)
 │
-├── agents/                 # Agent methodology subclasses
+├── providers/              # Production LLM convenience subclasses (+ README.md)
+│   ├── groq.py             # GroqLLM
+│   ├── cerebras.py         # CerebrasLLM
+│   └── openrouter.py       # OpenRouterLLM
+│
+├── agents/                 # Agent methodology subclasses (+ README.md)
 │   ├── react.py            # ReactAgent (Reason + Act)
 │   ├── reflect.py          # ReflectAgent (critique + revise)
 │   └── planact.py          # PlanActAgent (plan then execute)
 │
-├── thoughts/               # THOUGHT subclasses (DECIDE, PLAN)
-├── actions/                # Action primitives (SAY, ASK, SEARCH, FETCH, ...)
+├── thoughts/               # THOUGHT subclasses: DECIDE, PLAN (+ README.md)
+├── actions/                # 14 elemental ACTION verbs: SAY, ASK, SEARCH, ... (+ README.md)
 │
-└── eval/                   # Evaluation utilities
+└── eval/                   # Evaluation utilities (+ README.md)
     ├── __init__.py
-    └── harness.py          # Test harness (Harness, TestCase)
+    └── harness.py          # Test harness (Harness, TestCase, strict mode)
 ```
 
 ### Key Files to Know
@@ -135,14 +149,9 @@ examples/
 
 ```
 .github/
-├── workflows/
-│   ├── ci.yml              # CI pipeline (lint, test, type-check)
-│   ├── publish.yml         # PyPI publishing
-│   └── release.yml         # Release automation
-├── ISSUE_TEMPLATE/
-│   ├── bug_report.yml
-│   └── feature_request.yml
-└── PULL_REQUEST_TEMPLATE.md
+└── workflows/
+    ├── test.yml            # CI pipeline (ruff check, pytest matrix 3.9-3.13, zero-deps proof)
+    └── publish.yml         # Automatic PyPI publishing on main version bumps
 ```
 
 ---
@@ -225,7 +234,7 @@ When you run `pip install -e .`:
 → Create `examples/XX_description.py`
 
 ### "Where is the CI configuration?"
-→ `.github/workflows/ci.yml`
+→ `.github/workflows/test.yml` and `.github/workflows/publish.yml`
 
 ---
 

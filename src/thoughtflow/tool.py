@@ -448,6 +448,16 @@ class ReplayTOOL(TOOL):
     """
 
     def __init__(self, source_tool, memory, on_miss="raise"):
+        """
+        Initialize a ReplayTOOL over ``source_tool`` and recorded ``memory`` exchanges.
+
+        Args:
+            source_tool (TOOL): Live tool providing ``name``, ``description``,
+                ``parameters``, ``needs_context``, and optional live fallback.
+            memory (MEMORY): Memory containing recorded ``kind='tool'`` exchanges.
+            on_miss (str | callable): ``'raise'`` (default), ``'live'`` (time-travel
+                splice fallback to ``source_tool``), or a custom ``fn(arguments)``.
+        """
         super().__init__(
             name=source_tool.name,
             description=source_tool.description,
@@ -472,6 +482,13 @@ class ReplayTOOL(TOOL):
                 self._cursor.setdefault(key, 0)
 
     def __call__(self, arguments=None, context=None):
+        """
+        Serve the next recorded output (or recorded exception) matching ``arguments``.
+
+        Advances a thread-safe per-signature cursor and returns a deep copy of
+        the recorded result (decompressing ``result_obj_ref`` blobs from
+        ``memory.objects`` when needed) so caller mutations never corrupt the tape.
+        """
         arguments = arguments or {}
         key, _request = self._request_signature(arguments)
 

@@ -59,31 +59,23 @@ Welcome to the ThoughtFlow developer documentation! These guides provide step-by
 ### Most Common Commands
 
 ```bash
-# Run tests
+# Run unit tests
 pytest tests/unit/ -v
 
-# Format code
-ruff format src/ tests/
-
-# Check lint
+# Check lint (Pyflakes bug-catching rules only; no auto-formatter churn)
 ruff check src/ tests/
 
-# Type check
-mypy src/
-
-# Build docs
+# Serve documentation locally
 mkdocs serve
 ```
 
 ### Before Every PR
 
 ```bash
-# Run the full pre-commit check
-pre-commit run --all-files
+# Run pre-commit hooks via prek
+prek run --all-files
 
-# Or run each step manually
-ruff format src/ tests/
+# Or run each check manually
 ruff check src/ tests/
-mypy src/
 pytest tests/unit/ -v
 ```
