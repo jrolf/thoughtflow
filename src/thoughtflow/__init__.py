@@ -47,6 +47,7 @@ from thoughtflow.llm_chat import ChatError
 from thoughtflow.llm_cache import cached_system, cached_message
 from thoughtflow.providers import GroqLLM, CerebrasLLM, OpenRouterLLM
 from thoughtflow.embed import EMBED, ReplayEMBED
+from thoughtflow.dm import DM, ReplayDM, DecisionError
 from thoughtflow.memory import MEMORY
 from thoughtflow.thought import THOUGHT
 from thoughtflow.thoughts import DECIDE, PLAN
@@ -124,6 +125,9 @@ __all__ = [
     "cached_message",
     "EMBED",
     "ReplayEMBED",
+    "DM",
+    "ReplayDM",
+    "DecisionError",
     "MEMORY",
     "THOUGHT",
     "DECIDE",

@@ -137,7 +137,7 @@ decode_num = EventStamp.decode_num
 # (what is being asked). Excluded from exchange keys so a session recorded
 # against one endpoint replays cleanly against any other.
 TRANSPORT_PARAM_KEYS = frozenset({
-    'base_url', 'extra_headers', 'ollama_url', 'referer', 'title',
+    'account_id', 'base_url', 'extra_headers', 'ollama_url', 'referer', 'title',
 })
 
 

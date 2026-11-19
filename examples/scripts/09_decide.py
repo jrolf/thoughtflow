@@ -17,7 +17,7 @@ Run:
     python examples/scripts/09_decide.py
 """
 
-from thoughtflow import MEMORY, DECIDE
+from thoughtflow import DM, MEMORY, DECIDE
 
 
 # Create a mock LLM for examples that don't need real API calls
@@ -291,6 +291,41 @@ Consider the context and choose the most appropriate intent.""",
         "other": "→ Route to general support",
     }
     print(f"Action: {handlers.get(intent, 'Unknown')}")
+
+    # =========================================================================
+    # Part 10: Decision Models (DM) + Binary/Rubric/Multi-Question Modes
+    # =========================================================================
+    print("\n=== Part 10: Decision Models (DM) & Extended DECIDE Modes ===\n")
+
+    # In production, point DM at OpenRouter / TypeSafe / OpenAI / Ollama:
+    #   dm = DM("openrouter:typesafe/jev-1.14", key="sk-or-...")
+    # Offline, DM.from_llm adapts any LLM or mock to the exact DM contract:
+    dm_mock = DM.from_llm(MockLLM(responses=[
+        '{"is_refund": {"type": "noul", "noul": 0.94}}'
+    ]))
+
+    mem_dm = MEMORY()
+    mem_dm.set_var("ticket", "My blender arrived broken; please refund my order.")
+    dm_mock.record(mem_dm)
+
+    refund_gate = DECIDE(
+        name="is_refund",
+        model=dm_mock,
+        choices=bool,
+        threshold=0.7,
+        prompt="Is {ticket} asking for a refund?",
+    )
+    mem_dm = refund_gate(mem_dm)
+    print(f"Binary DM decision (`choices=bool`): {mem_dm.get_var('is_refund_result')}")
+    print(f"Outcome probability: {mem_dm.get_var('is_refund_outcome')['probability']}")
+
+    # Deterministic offline replay from MEMORY
+    replay_dm = DM.replay(MEMORY.from_json(mem_dm.to_json()))
+    replay_gate = DECIDE.from_dict(refund_gate.to_dict(), model=replay_dm)
+    fresh = MEMORY()
+    fresh.set_var("ticket", "My blender arrived broken; please refund my order.")
+    fresh = replay_gate(fresh)
+    print(f"Replayed offline decision: {fresh.get_var('is_refund_result')}")
 
     # =========================================================================
     # Summary

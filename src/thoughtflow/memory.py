@@ -677,15 +677,17 @@ class MEMORY:
 
     def add_exchange(self, kind, key, service, model, request, response):
         """
-        Record a model exchange (LLM or EMBED call) as a memory event.
+        Record a model or tool exchange (LLM, EMBED, DM, or TOOL call) as a memory event.
 
         This is the seam that powers ThoughtFlow's record/replay system:
         because MEMORY is event-sourced, capturing the nondeterministic
         boundary (the model call) as an event makes the whole flow
-        deterministically replayable. See LLM.record() / LLM.replay().
+        deterministically replayable. See LLM.record() / LLM.replay(),
+        EMBED.record() / EMBED.replay(), and DM.record() / DM.replay().
 
         Args:
-            kind: 'chat' for LLM exchanges, 'embed' for EMBED exchanges.
+            kind: 'chat' for LLM exchanges, 'embed' for EMBED exchanges,
+                'decide' for DM exchanges, 'tool' for TOOL exchanges.
             key: Deterministic content hash of the request (exchange_key).
             service: Provider name (e.g. 'openai').
             model: Model name.
@@ -713,7 +715,8 @@ class MEMORY:
         Get recorded model exchanges in chronological order.
 
         Args:
-            kind: Filter by exchange kind ('chat' or 'embed'). None = all.
+            kind: Filter by exchange kind ('chat', 'embed', 'decide', or 'tool').
+                None = all.
 
         Returns:
             List of exchange event dicts.

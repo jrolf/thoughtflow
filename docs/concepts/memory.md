@@ -84,11 +84,11 @@ memory.set_obj(big_dataframe_dict, name="raw_data", desc="Scraped dataset")
 
 ## Recorded Exchanges
 
-MEMORY also stores model exchanges — the request/response pairs captured by `llm.record(memory)` and `embed.record(memory)`:
+MEMORY also stores model exchanges — the request/response pairs captured by `llm.record(memory)`, `embed.record(memory)`, `dm.record(memory)`, and `tool.record(memory)`:
 
 ```python
-memory.add_exchange(kind, key, service, model, request, response)  # called by LLM/EMBED
-memory.get_exchanges(kind="chat")                                  # read them back
+memory.add_exchange(kind, key, service, model, request, response)  # called by LLM/EMBED/DM/TOOL
+memory.get_exchanges(kind="chat")                                  # 'chat' | 'embed' | 'decide' | 'tool'
 ```
 
 You rarely call these directly; they power the record/replay system. Because exchanges are ordinary events, recordings survive serialization round trips and travel with the rest of the state. See [Deterministic Replay](replay.md).
