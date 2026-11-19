@@ -683,7 +683,17 @@ class MEMORY:
 
         return copy.deepcopy(events)
 
-    def add_exchange(self, kind, key, service, model, request, response):
+    def add_exchange(
+        self,
+        kind,
+        key,
+        service,
+        model,
+        request,
+        response,
+        usage=None,
+        default_params=None,
+    ):
         """
         Record a model or tool exchange (LLM, EMBED, DM, or TOOL call) as a memory event.
 
@@ -701,6 +711,10 @@ class MEMORY:
             model: Model name.
             request: JSON-serializable dict describing the request.
             response: JSON-serializable response payload.
+            usage: Optional normalized token/cost usage dict for the call.
+            default_params: Optional constructor-level model params active
+                when the exchange was recorded, enabling ReplayLLM to adopt
+                them automatically on replay.
         """
         stamp = event_stamp({'key': key, 'kind': kind, 'response': response})
         exchange = {
@@ -716,6 +730,10 @@ class MEMORY:
             'dt_bog'   : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'   : str(dtt.datetime.now(tz_utc))[:23],
         }
+        if usage is not None:
+            exchange['usage'] = copy.deepcopy(usage)
+        if default_params is not None:
+            exchange['default_params'] = copy.deepcopy(default_params)
         self._store_event('llm', exchange)
 
     def get_exchanges(self, kind=None):
@@ -3024,9 +3042,28 @@ class _MemoryScope:
         """Return compressed object size/type metadata without decompressing."""
         return self.base.get_obj_info(stamp)
 
-    def add_exchange(self, kind, key, service, model, request, response):
+    def add_exchange(
+        self,
+        kind,
+        key,
+        service,
+        model,
+        request,
+        response,
+        usage=None,
+        default_params=None,
+    ):
         """Record a model/tool exchange on the root MEMORY."""
-        return self.base.add_exchange(kind, key, service, model, request, response)
+        return self.base.add_exchange(
+            kind,
+            key,
+            service,
+            model,
+            request,
+            response,
+            usage=usage,
+            default_params=default_params,
+        )
 
     def get_exchanges(self, kind=None):
         """Retrieve recorded exchanges from the root MEMORY."""

@@ -206,6 +206,7 @@ class AGENT:
             params = self._build_params()
 
             response = self.llm.call(messages, params)
+            self._emit_usage_on_memory(memory, getattr(self.llm, "last_usage", None))
 
             # The LLM returns a list; take the first response
             raw_response = response[0] if response else ""
@@ -472,6 +473,7 @@ class AGENT:
                 break
             state["model_calls"] += 1
             self._add_usage(state, message.get("usage"))
+            self._emit_usage_on_memory(memory, message.get("usage"))
 
             calls = list(message.get("tool_calls") or [])
             content = message.get("content") or ""
@@ -535,6 +537,21 @@ class AGENT:
                 if key in prior and key != "error":
                     state[key] = prior[key]
         return state
+
+    def _emit_usage_on_memory(self, memory, usage):
+        """Emit a ``'usage'`` event onto ``memory`` unless already emitted via ``llm.record(memory)``."""
+        if not isinstance(usage, dict) or not usage:
+            return
+        if not hasattr(memory, "emit") or not callable(getattr(memory, "emit", None)):
+            return
+        rec_mem = getattr(self.llm, "_record_memory", None)
+        root_mem = getattr(memory, "base", memory)
+        root_rec = getattr(rec_mem, "base", rec_mem) if rec_mem is not None else None
+        if root_rec is not None and root_mem is root_rec:
+            return
+        payload = dict(usage)
+        payload["agent"] = self.name
+        memory.emit("usage", payload)
 
     @staticmethod
     def _add_usage(state, usage):
