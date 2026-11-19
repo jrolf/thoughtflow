@@ -12,7 +12,7 @@ Within the ThoughtFlow ecosystem, CHAT is the human-in-the-loop wrapper. AGENT r
 
 ## How It Works
 
-CHAT holds an `agent` (callable), a `memory` instance (fresh MEMORY if none provided), and configuration for greeting, exit commands, channel, and labels. Two modes: `run()` enters an interactive loop that repeatedly calls `get_input()`, checks for exit commands (`q` and `quit` are always active), invokes `turn(user_input)`, and displays the response via `display()`. `turn()` adds the user message to memory, invokes the agent, extracts the response (via custom `response_extractor` or by diffing event stamps to find new assistant messages), appends to `history`, and returns the response text.
+CHAT holds an `agent` (callable), a `memory` instance (fresh MEMORY if none provided), and configuration for greeting, exit commands, channel, and labels. Two modes: `run()` enters an interactive loop that repeatedly calls `get_input()`, checks for exit commands (`q` and `quit` are always active), invokes `turn(user_input)`, and displays the response via `display()`. `turn()` adds the user message to memory, invokes the agent, extracts the response (via custom `response_extractor` or by walking new assistant messages in reverse chronological order while skipping `metadata={'internal': True}` notes), appends to `history`, and returns the response text.
 
 Exceptions from the agent are caught and displayed as errors; the session does not crash. `on_start()` and `on_end()` hooks run at loop entry and exit (e.g. show greeting, show goodbye). Subclasses override `get_input()` and `display()` to change I/O (e.g. read from a socket, render HTML).
 

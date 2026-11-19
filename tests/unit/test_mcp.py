@@ -388,3 +388,53 @@ class TestMCPRepr:
         assert "stdio" in s
 
         mcp.close()
+
+
+class TestMCPFederationAndErrors:
+    """Tests for multi-server tool prefixing, isError handling, and argv list stdio."""
+
+    @patch('subprocess.Popen')
+    def test_argv_list_uses_shell_false_and_prefix_namespaces_tools(self, mock_popen):
+        """
+        Passing an argv list must launch Popen with shell=False, and prefix=
+        must namespace returned TOOL names while calling the server's raw name.
+        """
+        mock_proc = make_mock_process([
+            (1, {"protocolVersion": "2024-11-05", "capabilities": {}}),
+            (2, {"tools": [{"name": "status", "description": "Health", "inputSchema": {"type": "object", "properties": {}}}]}),
+            (3, {"content": [{"type": "text", "text": "metrics:ok"}]}),
+        ])
+        mock_popen.return_value = mock_proc
+
+        with MCP(["python3", "-m", "my_mcp_server"], prefix="metrics__") as mcp:
+            assert mock_popen.call_args[1]["shell"] is False
+            tools = mcp.list_tools()
+            assert [t.name for t in tools] == ["metrics__status"]
+            assert tools[0]() == "metrics:ok"
+
+        # Verify wire JSON-RPC call sent raw unprefixed tool name "status"
+        written_blobs = [c[0][0].decode("utf-8") for c in mock_proc.stdin.write.call_args_list]
+        call_msg = json.loads(written_blobs[-1])
+        assert call_msg["method"] == "tools/call"
+        assert call_msg["params"]["name"] == "status"
+
+    @patch('urllib.request.urlopen')
+    def test_call_tool_raises_when_mcp_response_marks_is_error_true(self, mock_urlopen):
+        """call_tool() must raise RuntimeError when MCP returns isError=True."""
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.read.return_value = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "Upstream 503 unavailable"}],
+            },
+        }).encode("utf-8")
+        mock_urlopen.return_value = mock_response
+
+        mcp = MCP("https://example.com/mcp")
+        with pytest.raises(RuntimeError, match="Upstream 503 unavailable"):
+            mcp.call_tool("query_metrics", {})
+

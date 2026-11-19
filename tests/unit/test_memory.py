@@ -1570,3 +1570,199 @@ class TestEmitOperations:
         emits = memory.get_emits()
         assert len(emits) == 2
         assert all(event["type"] == "emit" for event in emits)
+
+
+# ============================================================================
+# Causal Event Ordering & Scoped Views
+# ============================================================================
+
+
+class TestCausalOrderingAndScopes:
+    """Tests for sub-millisecond from_events ordering, get_llm_msgs filters, and memory.scope()."""
+
+    def test_from_events_unordered_preserves_submillisecond_writes_and_tombstones(self, memory):
+        """
+        from_events() documents that input order does not matter; reversed tight
+        sub-millisecond writes and deletions must still replay in causal order.
+        """
+        memory.set_var("phase", "step_1")
+        memory.set_var("phase", "step_2")
+        memory.set_var("phase", "step_3")
+        memory.set_var("temp_secret", "ephemeral")
+        memory.del_var("temp_secret")
+
+        snap = memory.snapshot()
+        shuffled = list(reversed(list(snap["events"].values())))
+        restored = MEMORY.from_events(shuffled, memory_id=memory.id, objects=snap["objects"])
+
+        assert restored.get_var("phase") == "step_3"
+        assert restored.is_var_deleted("temp_secret") is True
+        assert restored.get_var("temp_secret") is None
+
+        # Duplicate ancestor events (e.g. from branch event-list union) are deduplicated cleanly.
+        merged_union = MEMORY.from_events(shuffled + list(snap["events"].values()), memory_id=memory.id)
+        assert len(merged_union.events) == len(memory.events)
+        assert len(merged_union.idx_all) == len(memory.idx_all)
+        assert merged_union.get_var("phase") == "step_3"
+
+    def test_get_llm_msgs_supports_channel_and_metadata_filters(self, memory):
+        """get_llm_msgs() must forward channel, metadata_filter, and exclude_metadata."""
+        memory.add_msg("user", "Public brief", channel="webapp", metadata={"room": "public"})
+        memory.add_msg("assistant", "Private counsel note", channel="api", metadata={"room": "private", "internal": True})
+
+        public_only = memory.get_llm_msgs(metadata_filter={"room": "public"})
+        non_internal = memory.get_llm_msgs(exclude_metadata={"internal": True})
+        webapp_only = memory.get_llm_msgs(channel="webapp")
+
+        assert public_only == [{"role": "user", "content": "Public brief"}]
+        assert non_internal == [{"role": "user", "content": "Public brief"}]
+        assert webapp_only == [{"role": "user", "content": "Public brief"}]
+
+    def test_scope_isolates_rooms_and_scratchpad_variables_with_thought(self, memory, mock_llm):
+        """
+        memory.scope() must isolate private room messages and actor scratchpad
+        variables ({name}_result) while sharing public_keys and export_keys.
+        """
+        from thoughtflow import THOUGHT
+
+        memory.set_var("deal_target", "CloudPulse")
+        alpha = memory.scope(
+            "alpha",
+            read_rooms={"public_room", "alpha_board"},
+            write_room="alpha_board",
+            public_keys={"deal_target"},
+            export_keys={"shared_verdict"},
+        )
+        beta = memory.scope(
+            "beta",
+            read_rooms={"public_room", "beta_board"},
+            write_room="beta_board",
+            public_keys={"deal_target"},
+        )
+
+        alpha.set_var("ceiling", 78)
+        beta.set_var("ceiling", 92)
+        alpha.add_msg("user", "ALPHA-SECRET: cap is 78")
+        beta.add_msg("user", "BETA-SECRET: cap is 92")
+
+        llm_b = mock_llm(responses=["Bid 90"])
+        step = THOUGHT(
+            name="bid",
+            llm=llm_b,
+            prompt="Target={deal_target} ceiling={ceiling} note={last_user_msg}",
+        )
+        step(beta)
+        alpha.set_var("shared_verdict", "ready")
+
+        sent_blob = str(step.last_msgs)
+        assert "CloudPulse" in sent_blob
+        assert "92" in sent_blob
+        assert "ALPHA-SECRET" not in sent_blob
+        assert "78" not in sent_blob
+        assert beta.get_var("bid_result") == "Bid 90"
+        assert "beta__bid_result" in memory.vars
+        assert "bid_result" not in memory.vars
+        assert memory.get_var("shared_verdict") == "ready"
+        assert beta.get_var("ceiling") == 92
+        assert alpha.get_var("ceiling") == 78
+
+    def test_scope_rejects_blank_actor(self, memory):
+        """scope() must reject empty or whitespace-only actor identifiers."""
+        with pytest.raises(ValueError, match="actor"):
+            memory.scope("   ")
+
+    def test_from_events_forked_branch_merge_is_order_independent_on_seq_ties(self, memory):
+        """
+        Two branches forked from a common MEMORY share post-fork _seq values;
+        merging their event lists via from_events() must break (dt_utc, _seq)
+        ties deterministically by stamp regardless of argument order.
+        """
+        memory.set_var("shared_seed", "init")
+        branch_a = memory.copy()
+        branch_b = memory.copy()
+
+        # Force identical dt_utc and _seq across the two independent branches.
+        branch_a.set_var("outcome", "from_a")
+        branch_b.set_var("outcome", "from_b")
+        ev_a = [e for s, e in branch_a.events.items() if s not in memory.events][0]
+        ev_b = [e for s, e in branch_b.events.items() if s not in memory.events][0]
+        ev_b["dt_utc"] = ev_a["dt_utc"]
+        assert ev_a["_seq"] == ev_b["_seq"]
+
+        events_a = list(branch_a.snapshot()["events"].values())
+        events_b = list(branch_b.snapshot()["events"].values())
+
+        merged_ab = MEMORY.from_events(events_a + events_b, memory_id=memory.id)
+        merged_ba = MEMORY.from_events(events_b + events_a, memory_id=memory.id)
+
+        assert merged_ab.get_var("outcome") == merged_ba.get_var("outcome")
+        assert [p[-1] for p in merged_ab.idx_all] == [p[-1] for p in merged_ba.idx_all]
+
+    def test_nested_scope_unwraps_root_and_filters_events_and_last_result_msg(self, memory):
+        """
+        Nested scope.scope() must unwrap directly to the root MEMORY (preserving
+        vars/del_var/is_var_deleted), filter scope.events to visible rooms/vars,
+        support concurrent room creation, and expose last_result_msg().
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        memory.set_var("global_cfg", "v1")
+        alpha = memory.scope(
+            "alpha",
+            read_rooms={"public", "alpha_room"},
+            write_room="alpha_room",
+            public_keys={"global_cfg"},
+            export_keys={"final_report"},
+        )
+        beta = memory.scope(
+            "beta",
+            read_rooms={"public", "beta_room"},
+            write_room="beta_room",
+        )
+        beta.add_msg("user", "BETA-PRIVATE-NOTE")
+        beta.set_var("secret_num", 999)
+
+        alpha.set_var("team_brief", "focus on latency")
+        sub = alpha.scope(
+            "worker",
+            public_keys={"global_cfg", "team_brief"},
+            export_keys={"draft", "final_report"},
+        )
+        assert sub.base is memory
+        assert sub.get_var("global_cfg") == "v1"
+        assert sub.get_var("team_brief") == "focus on latency"
+
+        sub.set_var("scratch", "tmp")
+        sub.del_var("scratch")
+        assert sub.is_var_deleted("scratch") is True
+        assert sub.get_var("scratch") is None
+
+        # draft exports to parent scope alpha; final_report exports to root memory
+        sub.set_var("draft", "worker draft")
+        sub.set_var("final_report", "published")
+        assert alpha.get_var("draft") == "worker draft"
+        assert memory.get_var("draft") is None
+        assert memory.get_var("final_report") == "published"
+
+        # scope.events must exclude beta's private room message and secret var
+        visible_contents = [str(ev.get("content", "")) for ev in sub.events.values()]
+        assert all("BETA-PRIVATE-NOTE" not in c for c in visible_contents)
+        assert all(ev.get("var_name") != "beta__secret_num" for ev in sub.events.values())
+
+        # last_result_msg mirrors MEMORY.last_result_msg within visible rooms
+        alpha.add_msg("result", "tool-output-42")
+        beta.add_msg("result", "beta-hidden-result")
+        assert alpha.last_result_msg(content_only=True) == "tool-output-42"
+
+        # Concurrent scope creation across worker threads registers channels atomically
+        def make_worker_scope(i):
+            room = "parallel_room_{}".format(i)
+            sc = memory.scope("w{}".format(i), read_rooms={room}, write_room=room)
+            sc.add_msg("user", "hi {}".format(i))
+            return room
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rooms = list(pool.map(make_worker_scope, range(16)))
+        assert set(rooms).issubset(memory.valid_channels)
+
+

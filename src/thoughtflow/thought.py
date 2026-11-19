@@ -23,9 +23,21 @@ from thoughtflow._util import (
     format_schema_annotation,
     scan_none_exemplars,
     TemplateRenderError,
+    is_obj_ref,
 )
 from thoughtflow.llm import ReplayMissError
 from thoughtflow.llm_chat import ChatError
+
+
+_TEMPLATE_FIELD_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)")
+
+
+class _PrebuiltContext(dict):
+    """
+    Internal dict marker passed from ``build_msgs`` to ``build_prompt`` so
+    ``build_prompt`` skips a second ``get_context(memory)`` pass without
+    mutating any shared instance attribute across concurrent threads.
+    """
 
 
 class THOUGHT:
@@ -729,10 +741,7 @@ class THOUGHT:
             try:
                 # Stage 1: prompt + context — working_prompt may carry repair suffix (dict prompts)
                 self.prompt = working_prompt
-
-                ctx = self.get_context(memory)
-                ctx.update(vars)
-                msgs = self.build_msgs(memory, ctx)
+                msgs = self.build_msgs(memory, vars)
                 if pending_repair and isinstance(original_prompt, str):
                     if isinstance(self.last_prompt, str) and self.last_prompt:
                         self.last_prompt = self.last_prompt.rstrip() + pending_repair
@@ -1204,9 +1213,12 @@ class THOUGHT:
         Returns:
             str: The constructed prompt string.
         """
-        ctx = self.get_context(memory)
-        if context_vars:
-            ctx.update(context_vars)
+        if isinstance(context_vars, _PrebuiltContext):
+            ctx = dict(context_vars)
+        else:
+            ctx = self.get_context(memory)
+            if context_vars:
+                ctx.update(context_vars)
         self._validate_required_vars(ctx)
         prompt = self._render_template_value(self.prompt, ctx)
         self.last_prompt = prompt
@@ -1239,7 +1251,7 @@ class THOUGHT:
             self.config.get("system_prompt", ""),
             ctx,
         )
-        usr_prompt = self.build_prompt(memory, ctx)
+        usr_prompt = self.build_prompt(memory, _PrebuiltContext(ctx))
 
         msgs = []
         if self._include_history():
@@ -1268,9 +1280,57 @@ class THOUGHT:
         self.last_msgs = msgs_out
         return msgs_out
 
+    def _referenced_template_vars(self):
+        """
+        Return the set of variable identifiers referenced by this thought's
+        templates and explicit var lists, or ``None`` when all variables may be
+        needed (e.g. ``memory_query`` or ``conditional`` operations).
+
+        Used by ``get_context`` so compressed large objects (``{'_obj_ref': ...}``)
+        stored in MEMORY are only decompressed when actually referenced.
+        """
+        op = self.operation or "llm_call"
+        if op in ("memory_query", "conditional") or callable(self.prompt):
+            return None
+
+        referenced = set(self.required_vars or []) | set(self.optional_vars or [])
+        sys_tpl = self.config.get("system_prompt")
+        if isinstance(sys_tpl, str):
+            referenced.update(_TEMPLATE_FIELD_RE.findall(sys_tpl))
+
+        if isinstance(self.prompt, str):
+            referenced.update(_TEMPLATE_FIELD_RE.findall(self.prompt))
+        elif isinstance(self.prompt, dict):
+            for section in self.prompt.values():
+                if isinstance(section, str):
+                    referenced.update(_TEMPLATE_FIELD_RE.findall(section))
+        elif self.prompt is not None:
+            return None
+
+        return referenced
+
+    @staticmethod
+    def _raw_var_is_obj_ref(memory, var_name):
+        """Return True when the latest stored entry for ``var_name`` is a compressed object ref."""
+        vars_map = getattr(memory, "vars", None)
+        if not isinstance(vars_map, dict):
+            return False
+        history = vars_map.get(var_name)
+        if not isinstance(history, list) or not history:
+            return False
+        last_entry = history[-1]
+        if isinstance(last_entry, (list, tuple)) and len(last_entry) >= 2:
+            return is_obj_ref(last_entry[1])
+        return False
+
     def get_context(self, memory):
         """
         Extract relevant context from the MEMORY object for this thought.
+
+        Plain scalar/collection variables are copied into context directly, while
+        compressed large-object references (``_obj_ref``) are decompressed lazily
+        only when referenced by ``prompt``, ``system_prompt``, ``required_vars``,
+        or ``optional_vars``.
 
         Args:
             memory: MEMORY object.
@@ -1279,6 +1339,7 @@ class THOUGHT:
             dict: Context variables for prompt filling.
         """
         ctx = {}
+        needed_vars = self._referenced_template_vars()
         # If required_vars is specified, try to get those from memory
         if hasattr(self, "required_vars") and self.required_vars:
             for var in self.required_vars:
@@ -1315,6 +1376,14 @@ class THOUGHT:
             ctx["messages"] = memory.get_msgs(repr="list")
         if hasattr(memory, "vars"):
             for var_name in memory.vars:
+                if var_name in ctx:
+                    continue
+                if (
+                    needed_vars is not None
+                    and var_name not in needed_vars
+                    and self._raw_var_is_obj_ref(memory, var_name)
+                ):
+                    continue
                 if hasattr(memory, "get_var") and callable(
                     getattr(memory, "get_var", None)
                 ):
@@ -1464,16 +1533,80 @@ class THOUGHT:
         validator = self.validation if self.validation is not None else self.config.get("validator", None)
         return validator is not None and callable(validator)
 
+    @staticmethod
+    def _evaluate_declarative_rules(parsed_result, rules):
+        """
+        Evaluate a JSON-serializable list of declarative validation rule dicts.
+
+        Supported rule ops:
+          - ``{"op": "in", "field": "k", "allowed": [...]}``
+          - ``{"op": "non_empty", "field": "k"}``
+          - ``{"op": "range", "field": "k", "min": 0, "max": 100}``
+          - ``{"op": "regex", "field": "k", "pattern": "^...$"}``
+          - ``{"op": "has_keys", "keys": ["k1", "k2"]}``
+
+        When ``field`` is omitted on ``in``, ``non_empty``, ``range``, or
+        ``regex``, the rule validates ``parsed_result`` directly rather than a
+        dict field, enabling pure-JSON portable THOUGHT definitions without
+        unserializable Python lambdas.
+        """
+        for rule in rules:
+            if not isinstance(rule, dict) or "op" not in rule:
+                return False, "Invalid declarative validation rule: {!r}".format(rule)
+            op = rule["op"]
+            if op == "has_keys":
+                req_keys = rule.get("keys") or []
+                if not isinstance(parsed_result, dict):
+                    return False, "Result is not a dict"
+                missing = [k for k in req_keys if k not in parsed_result]
+                if missing:
+                    return False, "Missing keys: {}".format(missing)
+                continue
+
+            field = rule.get("field")
+            if field is not None:
+                if not isinstance(parsed_result, dict):
+                    return False, "Expected dict to validate field '{}'".format(field)
+                val = parsed_result.get(field)
+                label = field
+            else:
+                val = parsed_result
+                label = "value"
+
+            if op == "in":
+                allowed = rule.get("allowed") or []
+                if val not in allowed:
+                    return False, "{}={!r} must be one of {}".format(label, val, allowed)
+            elif op == "non_empty":
+                if val is None or (isinstance(val, (str, list, dict)) and len(val.strip() if isinstance(val, str) else val) == 0):
+                    return False, "{} must be non-empty".format(label)
+            elif op == "range":
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    return False, "{}={!r} must be numeric".format(label, val)
+                low = rule.get("min")
+                high = rule.get("max")
+                if low is not None and val < low:
+                    return False, "{}={!r} must be >= {}".format(label, val, low)
+                if high is not None and val > high:
+                    return False, "{}={!r} must be <= {}".format(label, val, high)
+            elif op == "regex":
+                pattern = rule.get("pattern", "")
+                if not isinstance(val, str) or re.search(pattern, val) is None:
+                    return False, "{}={!r} must match pattern {!r}".format(label, val, pattern)
+            else:
+                return False, "Unknown declarative validation op {!r}".format(op)
+        return True, ""
+
     def validate(self, parsed_result):
         """
         Validate the parsed result according to the thought's rules.
 
         The canonical spelling is the ``validation=`` constructor kwarg, which
-        accepts either a callable returning (bool, why) or a bare bool (coerced
-        automatically), or one of the built-in validator strings ('any',
-        'has_keys:k1,k2', 'list_min_len:N', 'summary_v1'). The ``validator=``
-        config key is the equivalent config-style spelling and remains fully
-        supported; both behave identically.
+        accepts a callable returning ``(bool, why)`` or bare ``bool``, one of
+        the built-in validator strings (``'any'``, ``'has_keys:k1,k2'``,
+        ``'list_min_len:N'``, ``'summary_v1'``), or a JSON-serializable list of
+        declarative rule dicts (``in``, ``non_empty``, ``range``, ``regex``,
+        ``has_keys``). The ``validator=`` config key behaves identically.
 
         When validation_mode='rescue' and schema parsing failed but left a
         pending schema error, the callable validator may accept the payload.
@@ -1485,7 +1618,7 @@ class THOUGHT:
             (bool, why): True if valid, False otherwise, and reason string.
         """
         # Resolve the validation spec: validation= kwarg takes precedence,
-        # then the validator= config key. Both accept callables or strings.
+        # then the validator= config key.
         validator = self.validation if self.validation is not None else self.config.get("validator", None)
 
         if validator is not None and callable(validator):
@@ -1505,6 +1638,8 @@ class THOUGHT:
                 return False, "Validation exception: {}".format(e)
         if validator is None or validator == "any":
             return True, ""
+        if isinstance(validator, (list, tuple)):
+            return self._evaluate_declarative_rules(parsed_result, validator)
         elif isinstance(validator, str):
             if validator.startswith("has_keys:"):
                 keys = [k.strip() for k in validator.split(":", 1)[1].split(",")]
@@ -1561,29 +1696,78 @@ class THOUGHT:
             setattr(memory, varname, result)
         return memory
 
+    _TYPE_TO_EXEMPLAR = {
+        str: "",
+        int: 0,
+        float: 0.0,
+        bool: False,
+        list: [],
+        dict: {},
+        type(None): None,
+    }
+
+    @staticmethod
+    def _sanitize_for_json(value):
+        """
+        Recursively strip callables and convert Python schema marker types
+        (``str``, ``int``, ``float``, ``bool``, ``list``, ``dict``) into their
+        equivalent JSON exemplars so ``json.dumps(thought.to_dict())`` succeeds
+        on both exemplar-style and type-style ``parsing_rules`` schemas.
+        """
+        if isinstance(value, type):
+            if value in THOUGHT._TYPE_TO_EXEMPLAR:
+                exemplar = THOUGHT._TYPE_TO_EXEMPLAR[value]
+                return list(exemplar) if isinstance(exemplar, list) else (dict(exemplar) if isinstance(exemplar, dict) else exemplar)
+            return value.__name__
+        if callable(value):
+            return None
+        if isinstance(value, dict):
+            cleaned = {}
+            for k, v in value.items():
+                if callable(v) and not isinstance(v, type):
+                    continue
+                cleaned[k] = THOUGHT._sanitize_for_json(v)
+            return cleaned
+        if isinstance(value, (list, tuple)):
+            return [
+                THOUGHT._sanitize_for_json(item)
+                for item in value
+                if not (callable(item) and not isinstance(item, type))
+            ]
+        return value
+
     def to_dict(self):
         """
-        Return a serializable dictionary representation of this THOUGHT.
+        Return a JSON-serializable dictionary representation of this THOUGHT.
         
-        Note: The LLM instance, parse_fn, validation, and hooks cannot be serialized,
-        so they are represented by type/name only. When deserializing, these must be
-        provided separately.
+        Callables (``llm``, ``parse_fn``, callable ``validation``, ``on_failure``,
+        ``on_token``, ``pre_hook``, ``post_hook``) are omitted from ``config``
+        and summarized via ``has_*`` boolean flags so ``json.dumps(thought.to_dict())``
+        never fails. Declarative ``validation`` rules (lists of rule dicts or
+        built-in validator strings) are preserved in full.
         
         Returns:
             dict: Serializable representation of this thought.
         """
+        clean_config = self._sanitize_for_json(self.config)
+        serializable_validation = (
+            self.validation
+            if self.validation is not None and not callable(self.validation)
+            else None
+        )
         return {
             "name": self.name,
             "id": self.id,
             "prompt": self.prompt,
             "operation": self.operation,
-            "config": self.config,
+            "config": clean_config,
             "description": self.description,
             "max_retries": self.max_retries,
             "retry_delay": self.retry_delay,
             "output_var": self.output_var,
             "required_vars": self.required_vars,
             "optional_vars": self.optional_vars,
+            "validation": serializable_validation,
             "execution_history": self.execution_history,
             # Store metadata about non-serializable items
             "llm_type": type(self.llm).__name__ if self.llm else None,
@@ -1602,15 +1786,42 @@ class THOUGHT:
             data (dict): Dictionary representation of a THOUGHT.
             llm: LLM instance to use (required for execution).
             parse_fn: Optional custom parse function.
-            validation: Optional custom validation function.
+            validation: Optional custom validation function (overrides any
+                declarative validation stored in ``data`` when provided).
             pre_hook: Optional pre-execution hook.
             post_hook: Optional post-execution hook.
             
         Returns:
             THOUGHT: Reconstructed THOUGHT object.
         """
-        # Extract config and merge with explicit kwargs
-        config = data.get("config", {}).copy()
+        # Pop keys passed explicitly below so **config never raises
+        # TypeError: got multiple values for keyword argument '...'.
+        config = dict(data.get("config") or {})
+        explicit_keys = (
+            "name",
+            "llm",
+            "prompt",
+            "operation",
+            "description",
+            "max_retries",
+            "retry_delay",
+            "output_var",
+            "required_vars",
+            "optional_vars",
+            "parse_fn",
+            "validation",
+            "pre_hook",
+            "post_hook",
+        )
+        config_validation = config.pop("validation", None)
+        for key in explicit_keys:
+            config.pop(key, None)
+
+        effective_validation = (
+            validation
+            if validation is not None
+            else (data.get("validation") if data.get("validation") is not None else config_validation)
+        )
         
         thought = cls(
             name=data.get("name"),
@@ -1624,7 +1835,7 @@ class THOUGHT:
             required_vars=data.get("required_vars", []),
             optional_vars=data.get("optional_vars", []),
             parse_fn=parse_fn,
-            validation=validation,
+            validation=effective_validation,
             pre_hook=pre_hook,
             post_hook=post_hook,
             **config

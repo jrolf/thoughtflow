@@ -644,7 +644,7 @@ def humanize_schema_error(message: str, schema: Any = None) -> str:
     Returns:
         str: Human-oriented message suitable for logs and repair suffixes.
     """
-    text = message
+    text = re.sub(r" at 0x[0-9a-fA-F]+", "", message)
     if text.startswith("$."):
         text = text[2:]
     elif text.startswith("$:"):

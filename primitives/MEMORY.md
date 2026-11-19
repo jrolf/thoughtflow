@@ -28,7 +28,14 @@ The contract is: memory flows through primitives — `memory = primitive(memory)
 | Reflections | Agent reasoning traces (role: reflection) |
 | object_threshold | Size in bytes above which values auto-compress to object refs (default 10KB) |
 
-**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `emit`, `get_emits`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
+**Key methods:** `add_msg`, `add_augment`, `add_log`, `add_ref`, `emit`, `get_emits`, `add_exchange`, `set_var`, `del_var`, `get_var`, `get_msgs`, `get_llm_msgs`, `get_exchanges`, `last_user_msg`, `last_asst_msg`, `last_result_msg`, `prepare_context`, `scope`, `save`, `load`, `to_json`, `from_json`, `copy`, `from_events`.
+
+## Scoped Perspectives (`memory.scope`)
+
+Multi-party debates, sealed-bid negotiations, and parallel branches often share one event-sourced `MEMORY` while requiring epistemic isolation between actors. `memory.scope(actor, read_rooms=None, write_room=None, public_keys=(), export_keys=())` returns a zero-copy view over `memory`:
+
+- **Room visibility:** `events`, `get_events`, `get_msgs`, `get_llm_msgs`, `last_user_msg`, `last_asst_msg`, `last_sys_msg`, and `last_result_msg` expose only events matching `read_rooms` (`metadata['room']` or `channel`), while `add_msg` writes into `write_room` (atomically registering custom domain room names in `valid_channels`).
+- **Scratchpad & nested scope isolation:** Variable writes default to `{actor}__{key}` unless listed in `export_keys`, while reads check `{actor}__{key}` first and fall back to `public_keys`. Calling `scope.scope(sub_actor, ...)` unwraps directly to the root `MEMORY` under `{actor}__{sub_actor}__{key}`, exporting back to the parent scope (or to root when exported by both). Stock `THOUGHT`, `DECIDE`, `PLAN`, and `CHAT` run directly against a scope without colliding on `{name}_result` or decompressing out-of-scope large objects.
 
 ## Channel selection: logs, emits, and exchanges
 
@@ -38,7 +45,7 @@ MEMORY offers three distinct write paths for non-message facts. Pick the channel
 |---------|--------|----------|-------|
 | Human / legacy logs | `add_log(message)` | Operators, debugging prose | Plain string content |
 | Machine-readable lifecycle / eval | `emit(kind, payload, schema_version=1)` | Harnesses, batch eval, run lifecycle helpers | Typed dict with `type='emit'`, `kind`, JSON-safe `payload`, `schema_version` |
-| Model record / replay | `add_exchange(...)` | `LLM.record` / `LLM.replay`, `EMBED.record` | `type='llm'` exchange events |
+| Model & tool record / replay | `add_exchange(...)` | `LLM.record` / `LLM.replay`, `EMBED.record`, `TOOL.record` / `ReplayTOOL` | `type='llm'` exchange events (`kind='chat'`, `'embed'`, `'tool'`) |
 
 `emit` stores normal events through the existing `_store_event` path. Payloads are deep-copied on write, and `get_emits` returns independent event copies so callers cannot rewrite stored history through a read result. Callers must keep payloads JSON-serializable, redact secrets, and bound size. MEMORY is not thread-safe; callers own synchronization.
 

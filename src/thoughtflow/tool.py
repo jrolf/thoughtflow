@@ -15,9 +15,11 @@ be formatted into the JSON structure expected by LLM provider tool-calling APIs.
 
 from __future__ import annotations
 
+import copy
+import threading
 import time as time_module
 
-from thoughtflow._util import event_stamp
+from thoughtflow._util import estimate_size, event_stamp, exchange_key
 
 
 class TOOL:
@@ -92,6 +94,56 @@ class TOOL:
         self.last_error = None
         self.execution_count = 0
         self.execution_history = []
+        self._record_memory = None
+        self._record_lock = threading.Lock()
+
+    def record(self, memory):
+        """
+        Start recording every execution of this tool into ``memory``.
+
+        Mirrors ``LLM.record(memory)`` and ``EMBED.record(memory)``: each call
+        appends an exchange event (``kind='tool'``) keyed by a deterministic
+        hash of ``(tool.name, arguments)``. Pair with ``tool.replay(memory)``
+        so offline tests never re-fire external side effects (tickets, refunds,
+        MCP calls) or drift on stateful IDs.
+
+        Args:
+            memory: A MEMORY instance, or ``None`` to stop recording.
+
+        Returns:
+            TOOL: ``self`` (for chaining).
+        """
+        self._record_memory = memory
+        return self
+
+    def _request_signature(self, arguments):
+        """Build the canonical ``(key, request)`` pair for a tool exchange."""
+        clean_args = dict(arguments or {})
+        request = {"tool": self.name, "arguments": clean_args}
+        return exchange_key("tool", self.name, request), request
+
+    def replay(self, memory, on_miss="raise"):
+        """
+        Build a ``ReplayTOOL`` that serves outputs recorded in ``memory``.
+
+        Args:
+            memory: A MEMORY containing recorded ``kind='tool'`` exchanges.
+            on_miss: ``'raise'`` (default) to raise ``ReplayMissError`` on an
+                unrecorded call, ``'live'`` to fall through to ``self`` (time-
+                travel splice mode), or any callable ``fn(arguments)``.
+
+        Returns:
+            ReplayTOOL: A drop-in ``TOOL`` with identical name and schema.
+        """
+        return ReplayTOOL(self, memory, on_miss=on_miss)
+
+    @classmethod
+    def replay_all(cls, tools, memory, on_miss="raise"):
+        """
+        Wrap an iterable of ``TOOL`` instances into ``ReplayTOOL`` instances
+        backed by ``memory``.
+        """
+        return [t.replay(memory, on_miss=on_miss) for t in tools]
 
     def _normalize_parameters(self, parameters):
         """
@@ -152,6 +204,10 @@ class TOOL:
         arguments = arguments or {}
         start_time = time_module.time()
         self.execution_count += 1
+        rec_mem = self._record_memory
+        rec_key = rec_request = None
+        if rec_mem is not None:
+            rec_key, rec_request = self._request_signature(arguments)
 
         try:
             result = self.fn(**arguments)
@@ -165,6 +221,26 @@ class TOOL:
                 'success': True,
                 'error': None,
             })
+            if rec_mem is not None:
+                with self._record_lock:
+                    threshold = getattr(rec_mem, "object_threshold", 10000)
+                    if (
+                        threshold is not None
+                        and hasattr(rec_mem, "set_obj")
+                        and estimate_size(result) > threshold
+                    ):
+                        obj_stamp = rec_mem.set_obj(copy.deepcopy(result))
+                        rec_entry = {"ok": True, "result_obj_ref": obj_stamp}
+                    else:
+                        rec_entry = {"ok": True, "result": copy.deepcopy(result)}
+                    rec_mem.add_exchange(
+                        kind="tool",
+                        key=rec_key,
+                        service="tool",
+                        model=self.name,
+                        request=copy.deepcopy(rec_request),
+                        response=[rec_entry],
+                    )
             return result
 
         except Exception as e:
@@ -176,6 +252,22 @@ class TOOL:
                 'success': False,
                 'error': str(e),
             })
+            if rec_mem is not None:
+                with self._record_lock:
+                    rec_mem.add_exchange(
+                        kind="tool",
+                        key=rec_key,
+                        service="tool",
+                        model=self.name,
+                        request=rec_request,
+                        response=[
+                            {
+                                "ok": False,
+                                "error_type": type(e).__name__,
+                                "error": str(e),
+                            }
+                        ],
+                    )
             raise
 
     def to_schema(self):
@@ -324,3 +416,102 @@ class TOOL:
         return "TOOL(name='{}', description='{}', params={})".format(
             self.name, self.description[:50], param_keys
         )
+
+
+class ReplayTOOL(TOOL):
+    """
+    Drop-in ``TOOL`` that serves recorded outputs from a ``MEMORY`` instance.
+
+    Completes ThoughtFlow's hermetic replay triad alongside ``ReplayLLM`` and
+    ``ReplayEMBED``: offline tests reproduce exact stateful tool outputs (such
+    as created ticket IDs or remote MCP responses) without touching external
+    systems. Pass ``on_miss='live'`` (or a callable) for time-travel splice
+    debugging where recorded prefix calls replay offline and diverged calls
+    fall through to the live tool.
+    """
+
+    def __init__(self, source_tool, memory, on_miss="raise"):
+        super().__init__(
+            name=source_tool.name,
+            description=source_tool.description,
+            parameters=source_tool.parameters,
+            fn=source_tool.fn,
+        )
+        self._source_tool = source_tool
+        self._memory = memory
+        self.on_miss = on_miss
+        self._lock = threading.Lock()
+        self._responses = {}
+        self._cursor = {}
+
+        for ex in memory.get_exchanges(kind="tool"):
+            if ex.get("model") != self.name:
+                continue
+            key = ex.get("key")
+            payload = ex.get("response") or []
+            if key and payload:
+                self._responses.setdefault(key, []).append(payload[0])
+                self._cursor.setdefault(key, 0)
+
+    def __call__(self, arguments=None):
+        arguments = arguments or {}
+        key, _request = self._request_signature(arguments)
+
+        entry = None
+        with self._lock:
+            bucket = self._responses.get(key)
+            if bucket:
+                idx = min(self._cursor[key], len(bucket) - 1)
+                self._cursor[key] += 1
+                entry = bucket[idx]
+
+        if entry is None:
+            if self.on_miss == "raise" or self.on_miss is None:
+                from thoughtflow.llm import ReplayMissError
+
+                raise ReplayMissError(
+                    "No recorded output for tool '{}' (key={}). The flow has "
+                    "drifted from the recording. Re-record the session, or "
+                    "pass on_miss='live' to fall back to the live tool.".format(
+                        self.name, key
+                    )
+                )
+            if self.on_miss == "live":
+                return self._source_tool(arguments)
+            if callable(self.on_miss):
+                return self.on_miss(arguments)
+            raise ValueError("Unsupported on_miss policy: {!r}".format(self.on_miss))
+
+        self.execution_count += 1
+        if not entry.get("ok", True):
+            err = RuntimeError(
+                "{}: {}".format(entry.get("error_type", "Error"), entry.get("error", ""))
+            )
+            self.last_error = err
+            self.execution_history.append({
+                "stamp": event_stamp(),
+                "duration_ms": 0.0,
+                "success": False,
+                "error": str(err),
+            })
+            raise err
+
+        if "result_obj_ref" in entry and hasattr(self._memory, "get_obj"):
+            result = copy.deepcopy(self._memory.get_obj(entry["result_obj_ref"]))
+        else:
+            result = copy.deepcopy(entry.get("result"))
+        self.last_result = result
+        self.last_error = None
+        self.execution_history.append({
+            "stamp": event_stamp(),
+            "duration_ms": 0.0,
+            "success": True,
+            "error": None,
+        })
+        return result
+
+
+__all__ = [
+    "TOOL",
+    "ReplayTOOL",
+]

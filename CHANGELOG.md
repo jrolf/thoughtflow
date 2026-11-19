@@ -20,11 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LLM.last_finish_reason` normalized across providers and `allow_reasoning_fallback=False` default so truncated chain-of-thought replies do not pass as valid completions.
 - `Harness.run(..., strict=False)` absorbed-error tracking (`TestResult.absorbed_errors`, `reason`, `observed`, preserved partial `memory`, and `summary()['cases_with_absorbed_errors']`).
 - `MEMORY` native tool-turn support: `'tool'` role, structured `tool_calls` on assistant messages, `tool_call_id` and `name` on tool messages, and `MEMORY.get_llm_msgs(format='openai')` for provider-valid `LLM.chat()` message histories (`Message.assistant(tool_calls=...)` and `Message.tool(...)` updated to match).
+- `MEMORY.scope(actor, read_rooms=None, write_room=None, public_keys=(), export_keys=())`: zero-copy scoped perspective over a shared `MEMORY` isolating room/channel visibility and `{actor}__{key}` scratchpad variables for multi-party and parallel flows; `get_llm_msgs` also gains `channel`, `metadata_filter`, and `exclude_metadata` passthrough.
+- `TOOL.record(memory)`, `tool.replay(memory, on_miss='raise')` (`ReplayTOOL`, exported), and `TOOL.replay_all(...)`: hermetic tool and MCP record/replay/splice (`on_miss='live'`) backed by `MEMORY` exchanges.
+- Declarative JSON-serializable rule lists on `THOUGHT(validation=[...])` (`in`, `non_empty`, `range`, `regex`, `has_keys`) that round-trip cleanly through `to_dict()` / `from_dict()`.
+- `MCP(..., prefix=None)` / `list_tools(prefix=None)` for multi-server tool namespacing and `list[str]` stdio argv support (`shell=False`).
 
 ### Changed
 - `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
 - `LLM` now defaults `request_timeout` to `120` seconds (pass `request_timeout=None` for blocking), rejects unsupported `n > 1` on providers/streaming that cannot honor it, and stops printing HTTP errors to stdout in `call()`.
 - `THOUGHT` now defaults `hold_msg=True` (keeping failed retry drafts out of chat history), defaults `add_reflection=False` (avoiding duplicate answer events), sets `{name}_attempts` to total attempts on both success and failure, and treats `finish_reason='length'`, empty replies, HTTP errors, and `ReplayMissError` as explicit failed attempts.
+- `THOUGHT.get_context()` resolves compressed `_obj_ref` variables lazily only when referenced by the prompt or explicit var lists, avoiding eager decompression of unrelated large objects.
 
 ### Fixed
 - `DELEGATE._copy_memory` now uses `memory.copy()` so delegated agents receive actual variable values, descriptions, and tombstones instead of nested `[stamp, value]` history lists.
@@ -32,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReactAgent` preserves multi-line `Final Answer:` responses and appends a policy-veto `Observation:` when `on_tool_call` returns `False`.
 - `WORKFLOW` treats exceptions raised inside `condition` callables as step errors honoring `on_error` rather than silently skipping as `condition_false`.
 - `CHRON` captures returned `MEMORY` objects from job actions, writes `state_file` atomically, and surfaces corrupt/failed state I/O via `RuntimeWarning` + `last_state_error` (or raises with `on_state_error='raise'`).
+- `MEMORY.from_events()` now persists and sorts by monotonic per-event `_seq` on sub-millisecond timestamp ties so unordered event rehydration preserves variable write order and deletion tombstones.
+- `THOUGHT.to_dict()` strips non-JSON-serializable callables from `config` and `THOUGHT.from_dict()` pops explicit constructor keys from `config` instead of raising `TypeError` on `max_retries`.
+- `CHAT._extract_response()` walks new assistant messages in reverse chronological order (skipping `metadata={'internal': True}`) instead of iterating an unordered `set` diff.
+- `MCP.call_tool()` raises `RuntimeError` when an MCP server returns `isError=True` instead of returning error text as a normal tool result.
+- `humanize_schema_error()` scrubs runtime `at 0x...` heap addresses so `ast.literal_eval` repair suffixes remain deterministic for replay.
 ## [0.2.5] - 2026-07-17
 
 Foundation Agent loop response: lifecycle emits on MEMORY, THOUGHT prompt/history improvements, PLAN normalization fix, and a copy-and-edit plan-commit-reflect reference recipe.

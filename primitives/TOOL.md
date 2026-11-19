@@ -16,6 +16,8 @@ When called with an arguments dict, TOOL unpacks it as keyword arguments and inv
 
 `from_action(action)` bridges ACTION to TOOL. It wraps the ACTION's function, passing `None` for the memory argument (ACTION fns expect `memory, **kwargs`; TOOL fns receive only `**kwargs` from the LLM). The agent loop is responsible for memory integration if needed. TOOL supports `to_dict()` and `from_dict()` for serialization; the function itself cannot be serialized, so a function registry is required for reconstruction.
 
+`tool.record(memory)` and `tool.replay(memory, on_miss='raise')` (`ReplayTOOL`, plus `TOOL.replay_all(tools, memory)`) mirror `LLM` and `EMBED` record/replay: each tool invocation is deep-copied and recorded as a `kind='tool'` exchange in `MEMORY` (automatically compressing payloads above `memory.object_threshold` into `memory.objects`), allowing offline tests to replay stateful tool outputs without touching external systems or mutating cached replay state. Pass `on_miss='live'` for time-travel splice debugging where recorded prefix calls replay offline and diverged calls fall through to the live tool.
+
 ## Inputs & Configuration
 
 | Parameter | Description |

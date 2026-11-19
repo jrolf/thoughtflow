@@ -2213,3 +2213,154 @@ class TestPlanCallable:
         result = memory.get_var("my_plan_result")
         
         assert result == [[{"action": "search", "reason": "Gather data."}]]
+
+
+class TestThoughtObjectLazinessAndPortability:
+    """
+    Tests for lazy compressed-object context resolution, JSON-safe to_dict/from_dict,
+    and pure-JSON declarative validation rule lists.
+    """
+
+    def test_unreferenced_compressed_object_is_never_decompressed(self, mock_llm, memory):
+        """
+        THOUGHT must not decompress >10 KB _obj_ref variables that are not
+        referenced by prompt, system_prompt, required_vars, or optional_vars.
+        """
+        import json
+
+        memory.set_var("big_dataset", {"rows": ["x" * 400 for _ in range(40)]})
+        memory.set_var("user_name", "Ada")
+
+        decompress_calls = []
+        original_get_obj = memory.get_obj
+
+        def spy_get_obj(stamp):
+            decompress_calls.append(stamp)
+            return original_get_obj(stamp)
+
+        memory.get_obj = spy_get_obj
+
+        step = THOUGHT(
+            name="greet",
+            llm=mock_llm(responses=["Hello Ada!"]),
+            prompt="Say hi to {user_name}",
+            include_history=False,
+        )
+        step(memory)
+
+        assert memory.get_var("greet_result") == "Hello Ada!"
+        assert decompress_calls == []
+
+        # When explicitly referenced in the prompt, it resolves once per attempt.
+        ref_step = THOUGHT(
+            name="inspect_big",
+            llm=mock_llm(responses=[json.dumps({"ok": True})]),
+            prompt="Summarize dataset size: {big_dataset}",
+            template_mode="substitute",
+            include_history=False,
+        )
+        ref_step(memory)
+        assert len(decompress_calls) == 1
+
+    def test_to_dict_with_callables_is_json_serializable_and_from_dict_roundtrips(self, mock_llm, memory):
+        """
+        json.dumps(thought.to_dict()) must succeed even when callable hooks/validators
+        are attached, and THOUGHT.from_dict() must not collide on max_retries.
+        """
+        import json
+
+        original = THOUGHT(
+            name="portable_step",
+            llm=mock_llm(responses=["valid"]),
+            prompt="Check {item}",
+            max_retries=3,
+            parsing_rules={"kind": "python", "format": {"name": str, "age?": int}},
+            validation=lambda r: (True, ""),
+            on_failure=lambda *a, **kw: None,
+            post_hook=lambda *a, **kw: None,
+        )
+        blob = json.dumps(original.to_dict())
+        reloaded_data = json.loads(blob)
+
+        restored = THOUGHT.from_dict(
+            reloaded_data,
+            llm=mock_llm(responses=['{"name": "Ada", "age": 36}']),
+            validation=lambda r: (r.get("name") == "Ada", "mismatch"),
+        )
+        memory.set_var("item", "ticket-1")
+        restored(memory)
+
+        assert restored.max_retries == 3
+        assert memory.get_var("portable_step_result") == {"name": "Ada", "age": 36}
+
+    def test_declarative_validation_rules_repair_and_survive_pure_json_roundtrip(self, mock_llm, memory):
+        """
+        Declarative validation rule lists must drive repair retries and survive
+        a pure json.dumps/json.loads round-trip without passing a Python callable.
+        """
+        import json
+
+        cartridge_thought = THOUGHT(
+            name="triage",
+            llm=mock_llm(),
+            prompt="Classify ticket: {ticket}",
+            template_mode="substitute",
+            include_history=False,
+            hold_msg=True,
+            parsing_rules={"kind": "json", "format": {"decision": "", "confidence": 0, "code": ""}},
+            validation=[
+                {"op": "in", "field": "decision", "allowed": ["approve", "deny"]},
+                {"op": "range", "field": "confidence", "min": 1, "max": 100},
+                {"op": "regex", "field": "code", "pattern": r"^POL-\d+$"},
+            ],
+            max_retries=2,
+        )
+
+        pure_json = json.dumps(cartridge_thought.to_dict())
+        rehydrated = THOUGHT.from_dict(
+            json.loads(pure_json),
+            llm=mock_llm(
+                responses=[
+                    '{"decision": "maybe", "confidence": 50, "code": "POL-1"}',
+                    '{"decision": "approve", "confidence": 95, "code": "POL-42"}',
+                ]
+            ),
+        )
+        rehydrated(memory, {"ticket": "broken mug"})
+
+        assert memory.get_var("triage_result") == {
+            "decision": "approve",
+            "confidence": 95,
+            "code": "POL-42",
+        }
+
+    def test_shared_thought_build_msgs_is_thread_safe_across_scopes(self, memory):
+        """
+        Sharing a single THOUGHT instance across worker threads over distinct
+        memory.scope() views must never mix per-thread context variables.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        class EchoLLM:
+            def call(self, msg_list, params=None):
+                return [msg_list[-1]["content"]]
+
+        shared_step = THOUGHT(
+            name="worker_echo",
+            llm=EchoLLM(),
+            prompt="actor={actor_tag}",
+            include_history=False,
+        )
+
+        def run_scoped(idx):
+            sc = memory.scope("actor_{}".format(idx))
+            sc.set_var("actor_tag", "TAG-{}".format(idx))
+            msgs = shared_step.build_msgs(sc)
+            return idx, msgs[-1]["content"]
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            pairs = list(pool.map(run_scoped, range(24)))
+
+        assert all(text == "actor=TAG-{}".format(idx) for idx, text in pairs)
+
+
