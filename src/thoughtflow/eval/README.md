@@ -45,6 +45,11 @@ harness = Harness([
     ),
 ])
 
-results = harness.run(build_support_flow(replay_llm), strict=True)
+results = harness.run(build_support_flow(replay_llm), strict=True, trials=3)
+results.save("tests/fixtures/baseline.json")
 assert results.failed_count == 0, results.summary()
+
+# Compare candidate prompt/model against a saved baseline with noise awareness
+comparison = results.compare("tests/fixtures/baseline.json")
+assert comparison["direction"] != "regressed" or not comparison["exceeds_noise"]
 ```

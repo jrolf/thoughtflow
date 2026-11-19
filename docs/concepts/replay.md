@@ -100,6 +100,15 @@ replay_llm = LLM.replay(recorded, on_miss=live)
 
 If the memory contains recordings from more than one model, pass `model_id="service:model"` to choose which one to replay as.
 
+`ReplayLLM` automatically adopts the constructor `default_params` (such as `temperature` or `max_tokens`) active when the session was recorded, exposes unmatched requests on `replay_llm.misses`, and summarizes offline token/cost totals via `replay_llm.total_usage()`. For test files that want one-line "record on first run, replay offline thereafter" ergonomics, use `LLM.cassette`:
+
+```python
+llm = LLM.cassette(
+    "tests/cassettes/support.json",
+    live=lambda: LLM("openai:gpt-4o", temperature=0.0),
+)
+```
+
 ---
 
 ## Replay in the Eval Harness

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `LLM.cassette(path, live=..., on_miss='raise', model_id=None)`: record-if-missing, else deterministic offline replay helper with atomic disk flushes (`save_cassette` and context-manager support).
+- `ReplayLLM` automatic adoption of recorded constructor `default_params` and `ReplayLLM.misses` inspection list for unmatched requests.
+- `LLM.usage` thread-safe cumulative token/cost ledger (`reset_usage()`), exchange-level `usage` persistence in `MEMORY.add_exchange(..., usage=...)`, automatic `'usage'` emits on recorded/agent `MEMORY` instances, and `ReplayLLM.total_usage()`.
+- `Harness.run(..., trials=N, pass_threshold=1.0)` multi-trial pass rates, per-case and suite `usage` / `total_cost` rollups, JSON baseline serialization (`results.save(path)`, `Harness.load(path)`), and noise-aware `results.compare(baseline, min_delta=None)`.
+
 ## [0.3.0] - 2026-11-19
 
 Major feature, governance, decision-model, and reliability release: adds System-One decision models (`DM` + 4-mode `DECIDE`), structured native tool completions (`LLM.chat`), governed write-ahead `AGENT` & `WORKFLOW` suspend/resume, zero-copy `MEMORY` scopes & token budgets, hermetic `TOOL` record/replay, structured `{name}_outcome` telemetry, and multi-level package documentation.

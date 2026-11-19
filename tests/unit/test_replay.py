@@ -209,6 +209,150 @@ class TestReplayLLM:
         assert calls["count"] == 1
         assert mem2.get_var("respond_result") == mem1.get_var("respond_result")
 
+    def test_replay_adopts_recorded_default_params_automatically(self, monkeypatch):
+        """Issue #34: ReplayLLM must adopt recorded sampling params without manual default_params.update."""
+        monkeypatch.setattr(LLM, "_call_openai", lambda self, m, p, transport=None: ["ParamHit"])
+
+        # Live LLM configured with constructor sampling defaults AND one per-call override
+        live = LLM("openai:gpt-4o", key="test-key", temperature=0.2, max_tokens=256)
+        recording = MEMORY()
+        live.record(recording)
+        live.call(MSGS)
+        live.call([{"role": "user", "content": "Override"}], params={"max_tokens": 512})
+
+        replay = LLM.replay(recording)
+        assert replay.default_params == {"temperature": 0.2, "max_tokens": 256}
+        assert replay.call(MSGS) == ["ParamHit"]
+        assert replay.call([{"role": "user", "content": "Override"}], params={"max_tokens": 512}) == ["ParamHit"]
+
+    def test_replay_adopts_legacy_shared_params_and_tracks_misses(self):
+        """Issue #34: Legacy recordings without default_params adopt shared request params; misses are recorded."""
+        memory = make_recorded_memory(params={"temperature": 0.7})
+        replay = LLM.replay(memory)
+
+        assert replay.default_params == {"temperature": 0.7}
+        assert replay.call(MSGS) == ["Forty-two."]
+        assert replay.misses == []
+
+        unrecorded_msgs = [{"role": "user", "content": "Unrecorded question"}]
+        with pytest.raises(ReplayMissError):
+            replay.call(unrecorded_msgs)
+
+        assert len(replay.misses) == 1
+        assert replay.misses[0]["kind"] == "call"
+        assert replay.misses[0]["request"]["messages"] == unrecorded_msgs
+
+    def test_cassette_records_when_missing_then_replays_when_present(self, tmp_path, monkeypatch):
+        """Issue #34: LLM.cassette records atomically on first run and replays offline on second run."""
+        calls = {"count": 0}
+
+        def fake_openai(self, msg_list, params, transport=None):
+            calls["count"] += 1
+            return ["CassetteAnswer"]
+
+        monkeypatch.setattr(LLM, "_call_openai", fake_openai)
+        cassette_file = tmp_path / "nested" / "greeting.json"
+
+        # First run: file missing -> calls live factory, records, and flushes to disk
+        llm1 = LLM.cassette(
+            cassette_file,
+            live=lambda: LLM("openai:gpt-4o", key="test-key", temperature=0.1),
+        )
+        assert llm1.cassette_mode == "record"
+        assert llm1.call(MSGS) == ["CassetteAnswer"]
+        assert cassette_file.is_file()
+        assert calls["count"] == 1
+
+        # Second run: file exists -> live factory is NOT called, replays offline with adopted params
+        def should_not_be_called():
+            raise AssertionError("live factory must not run when cassette exists")
+
+        with LLM.cassette(cassette_file, live=should_not_be_called) as llm2:
+            assert llm2.cassette_mode == "replay"
+            assert llm2.call(MSGS) == ["CassetteAnswer"]
+        assert calls["count"] == 1
+
+    def test_usage_ledger_exchange_storage_emits_and_replay_total_usage(self, monkeypatch):
+        """Issue #42: llm.usage accumulates calls/tokens/cost, stores usage in exchanges, emits on memory, and replays."""
+        responses = [
+            {
+                "choices": [{"message": {"content": "One"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 8,
+                    "prompt_tokens_details": {"cached_tokens": 4},
+                    "completion_tokens_details": {"reasoning_tokens": 3},
+                    "cost": 0.0015,
+                },
+            },
+            {
+                "choices": [{"message": {"content": "Two"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "cost": 0.0025,
+                },
+            },
+        ]
+        idx = {"i": 0}
+
+        class FakeResp:
+            def __init__(self, payload):
+                self._raw = payload
+
+            def read(self):
+                import json as _json
+                return _json.dumps(self._raw).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, **kwargs):
+            payload = responses[idx["i"]]
+            idx["i"] += 1
+            return FakeResp(payload)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        rec_mem = MEMORY()
+        live = LLM("openrouter:deepseek/deepseek-chat", key="test-key").record(rec_mem)
+        assert live.call(MSGS) == ["One"]
+        assert live.call([{"role": "user", "content": "Second"}]) == ["Two"]
+
+        assert live.usage == {
+            "calls": 2,
+            "prompt_tokens": 32,
+            "completion_tokens": 18,
+            "total_tokens": 50,
+            "reasoning_tokens": 3,
+            "cached_tokens": 4,
+            "cost": 0.004,
+        }
+
+        usage_emits = rec_mem.get_emits("usage")
+        assert len(usage_emits) == 2
+        assert usage_emits[0]["payload"]["prompt_tokens"] == 12
+        assert rec_mem.get_exchanges()[0]["usage"]["cost"] == 0.0015
+
+        # Offline total_usage() and replayed live ledger after JSON round-trip
+        restored = MEMORY.from_json(rec_mem.to_json())
+        replay = LLM.replay(restored)
+        assert replay.total_usage() == live.usage
+        assert replay.usage["calls"] == 0
+
+        assert replay.call(MSGS) == ["One"]
+        assert replay.last_usage["prompt_tokens"] == 12
+        assert replay.usage["calls"] == 1
+        assert replay.usage["total_tokens"] == 20
+
+        live.reset_usage()
+        assert live.usage["calls"] == 0
+        assert live.usage["cost"] == 0.0
+
 
 class TestReplayEMBED:
     """Tests for EMBED record/replay."""
