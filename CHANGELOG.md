@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ReplayLLM` automatic adoption of recorded constructor `default_params` and `ReplayLLM.misses` inspection list for unmatched requests.
 - `LLM.usage` thread-safe cumulative token/cost ledger (`reset_usage()`), exchange-level `usage` persistence in `MEMORY.add_exchange(..., usage=...)`, automatic `'usage'` emits on recorded/agent `MEMORY` instances, and `ReplayLLM.total_usage()`.
 - `Harness.run(..., trials=N, pass_threshold=1.0)` multi-trial pass rates, per-case and suite `usage` / `total_cost` rollups, JSON baseline serialization (`results.save(path)`, `Harness.load(path)`), and noise-aware `results.compare(baseline, min_delta=None)`.
+- `MEMORY.upsert(key, value, desc='', metadata=None, source=None)` no-op-when-unchanged variable writes, structured variable metadata (`get_var_meta`, `get_var_meta_history`), `MEMORY.find_vars(...)`, and `MEMORY.get_events(..., since=stamp)` (mirrored on `MEMORY.scope`).
+- `MEMORY.to_json(..., slim=True, keep_recent_turns=None)` lean serverless snapshots, monotonic `MEMORY.revision` counter, `MEMORY.merge(other)` branch union, and atomic file persistence across `MEMORY.save()` and `MEMORY.to_json(filename=...)`.
+- Decoupled `cosine_similarity(vec_a, vec_b)` and `cosine_retrieve(query_vec, items, ...)` helpers in `thoughtflow.embed`.
 
 ## [0.3.0] - 2026-11-19
 

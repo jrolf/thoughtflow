@@ -146,15 +146,18 @@ outcome = memory.get_var("locator_outcome")
 
 ---
 
-## Serialization
+## Serialization and Serverless Sessions
 
 State moves as easily as data:
 
 ```python
-memory.to_json("state.json")             # JSON export
+memory.save("state.json")                # atomic JSON export (or slim=True)
 restored = MEMORY.from_json("state.json")
 
-memory.save("state.pkl")                 # pickle, optionally compressed
+slim_str = memory.to_json(slim=True)     # strips logs/refs & compacts var history
+merged = branch_a.merge(branch_b)        # stamp-deduped union + monotonic memory.revision
+
+memory.save("state.pkl")                 # atomic pickle, optionally compressed
 restored = MEMORY()
 restored.load("state.pkl")
 
@@ -162,7 +165,9 @@ snap = memory.snapshot()                 # dict export
 restored = MEMORY.from_events(event_list)  # rehydrate from raw events
 ```
 
-This is what makes serverless deployment trivial: serialize at the end of one invocation, rehydrate at the start of the next.
+For belief tracking and checkpointing without history bloat, use `memory.upsert(key, val, source={...})` (no-op when unchanged), `memory.find_vars(prefix=..., changed_since=stamp)`, and `memory.get_events(since=stamp)`.
+
+This is what makes serverless deployment trivial: serialize at the end of one invocation, compare-and-swap on `memory.revision` (or `merge()` concurrent branches), and rehydrate at the start of the next.
 
 ---
 

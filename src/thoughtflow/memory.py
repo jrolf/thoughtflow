@@ -28,8 +28,10 @@ from __future__ import annotations
 import json
 import copy
 import bisect
+import os
 import pickle
 import pprint
+import tempfile
 import threading
 import datetime as dtt
 
@@ -213,12 +215,14 @@ class MEMORY:
         self.idx_all  = []          # Master index (all [timestamp, seq, stamp] triples)
         self._index_seq = 0         # Insertion tie-breaker when dt_utc collides
         self._event_seq = 0         # Monotonic per-event causal counter persisted on event dicts
+        self.revision = 0           # Monotonic session revision for compare-and-swap persistence
         
         # VARIABLE LAYER: Full history with timestamps
         # vars[key] = [[stamp1, value1], [stamp2, value2], ...]
         # Deleted variables have VAR_DELETED as value in their last entry
         self.vars = {}              # var_name → list of [stamp, value] pairs
         self.var_desc_history = {}  # var_name → list of [stamp, description] pairs
+        self.var_meta_history = {}  # var_name → list of [stamp, metadata_dict] pairs
         
         # OBJECT LAYER: Compressed storage for large data
         # objects[stamp] = {
@@ -292,6 +296,7 @@ class MEMORY:
         # unordered rehydration via from_events() preserves sub-millisecond
         # write order and variable deletion tombstones across sync/merge.
         self._event_seq += 1
+        self.revision += 1
         obj.setdefault("_seq", self._event_seq)
 
         # Store in data layer
@@ -344,6 +349,45 @@ class MEMORY:
         if not history:
             return ''
         return history[-1][1]  # Return description from last [stamp, desc] pair
+
+    def _get_latest_meta(self, key):
+        """Return a copy of the latest structured metadata dict for ``key``, or None."""
+        history = self.var_meta_history.get(key)
+        if not history:
+            return None
+        return copy.deepcopy(history[-1][1])
+
+    @staticmethod
+    def _normalize_var_metadata(metadata=None, source=None):
+        """Combine optional ``metadata`` dict and ``source`` provenance into one dict."""
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("Variable metadata must be a dict or None")
+        if metadata is None and source is None:
+            return None
+        combined = copy.deepcopy(metadata) if metadata is not None else {}
+        if source is not None:
+            combined['source'] = copy.deepcopy(source)
+        return combined
+
+    @staticmethod
+    def _atomic_write_bytes(filename, raw_bytes):
+        """Write ``raw_bytes`` atomically to ``filename`` via same-directory temp file + replace."""
+        target = os.path.abspath(os.fspath(filename))
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".memory_", suffix=".tmp", dir=parent or None)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw_bytes)
+            os.replace(tmp_path, target)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
 
     @staticmethod
     def _validate_emit_kind(kind):
@@ -1137,20 +1181,40 @@ class MEMORY:
 
         return result
 
-    def get_events(self, limit=-1, event_types=None, channel=None):
+    def get_events(self, limit=-1, event_types=None, channel=None, since=None):
         """
-        Get all events, optionally filtered by type and channel.
+        Get all events, optionally filtered by causal ``since`` stamp, type, and channel.
 
         Args:
             limit: Max events (-1 = all)
             event_types: List like ['msg', 'log', 'ref', 'var', 'llm', 'emit']
                 (None = all)
             channel: Filter by channel (None = all)
+            since: Optional event stamp; when provided, returns only events
+                recorded strictly after ``since`` in the master index.
 
         Returns:
             List of event dicts
+
+        Raises:
+            KeyError: When ``since`` is provided and does not exist in this memory.
         """
-        events = self._get_events_from_index(self.idx_all, -1)
+        pairs = self.idx_all
+        if since is not None:
+            found_idx = None
+            for idx, pair in enumerate(pairs):
+                if self._stamp_from_index_pair(pair) == since:
+                    found_idx = idx
+                    break
+            if found_idx is None:
+                raise KeyError("Event stamp {!r} not found in memory.".format(since))
+            pairs = pairs[found_idx + 1:]
+
+        events = [
+            self.events[self._stamp_from_index_pair(pair)]
+            for pair in pairs
+            if self._stamp_from_index_pair(pair) in self.events
+        ]
 
         if event_types:
             events = [e for e in events if e.get("type") in event_types]
@@ -1389,7 +1453,7 @@ class MEMORY:
         
         return result
 
-    def set_var(self, key, value, desc=''):
+    def set_var(self, key, value, desc='', metadata=None, source=None):
         """
         Store a variable by appending to its history list.
         Variable changes are first-class events in the event stream.
@@ -1398,14 +1462,18 @@ class MEMORY:
         Large values (exceeding object_threshold) are automatically converted
         to compressed objects, with an object reference stored in the history.
         
-        Descriptions are tracked separately in var_desc_history since they
-        change less frequently than values.
+        Descriptions and structured metadata (provenance, confidence, turn)
+        are tracked in dedicated histories paired by stamp.
         
         Args:
             key: Variable name
             value: Variable value (any type)
             desc: Optional description (appended to description history if provided)
+            metadata: Optional JSON-serializable dict of structured provenance
+            source: Optional shorthand provenance stored under ``metadata['source']``
         """
+        meta_dict = self._normalize_var_metadata(metadata=metadata, source=source)
+
         # Check if value should be stored as object (auto-conversion)
         value_size = estimate_size(value)
         if value_size > self.object_threshold:
@@ -1431,9 +1499,15 @@ class MEMORY:
             if key not in self.var_desc_history:
                 self.var_desc_history[key] = []
             self.var_desc_history[key].append([stamp, desc])
+
+        if meta_dict is not None:
+            if key not in self.var_meta_history:
+                self.var_meta_history[key] = []
+            self.var_meta_history[key].append([stamp, meta_dict])
         
-        # Get latest description from history (or the one we just set)
+        # Get latest description and metadata from history
         current_desc = desc if desc else self._get_latest_desc(key)
+        current_meta = meta_dict if meta_dict is not None else self._get_latest_meta(key)
         
         # Create variable-change event
         var_event = {
@@ -1448,7 +1522,45 @@ class MEMORY:
             'dt_bog'   : str(dtt.datetime.now(tz_bog))[:23],
             'dt_utc'   : str(dtt.datetime.now(tz_utc))[:23],
         }
+        if current_meta is not None:
+            var_event['var_meta'] = current_meta
         self._store_event('var', var_event)
+
+    def upsert(self, key, value, desc='', metadata=None, source=None):
+        """
+        Set ``key`` only when ``value`` (or provided ``desc`` / ``metadata``) actually changed.
+
+        Avoids bloating variable history and the event log when consolidators
+        or trackers repeatedly affirm the same value across turns.
+
+        Args:
+            key (str): Variable name.
+            value: Desired variable value.
+            desc (str, optional): Variable description.
+            metadata (dict, optional): Structured metadata dict.
+            source (Any, optional): Provenance stored under ``metadata['source']``.
+
+        Returns:
+            bool: ``True`` if a new entry was written; ``False`` if unchanged (no-op).
+
+        Example:
+            >>> memory.upsert("budget", 15000, source={"turn": 4})
+            True
+            >>> memory.upsert("budget", 15000, source={"turn": 4})
+            False
+        """
+        meta_dict = self._normalize_var_metadata(metadata=metadata, source=source)
+        history = self.vars.get(key)
+        if history and history[-1][1] is not VAR_DELETED:
+            current_val = self.get_var(key, resolve_refs=True)
+            same_val = (type(current_val) is type(value)) and (current_val == value)
+            same_desc = (not desc) or (desc == self._get_latest_desc(key))
+            same_meta = (meta_dict is None) or (meta_dict == self._get_latest_meta(key))
+            if same_val and same_desc and same_meta:
+                return False
+
+        self.set_var(key, value, desc=desc, metadata=metadata, source=source)
+        return True
 
     def del_var(self, key):
         """
@@ -1608,6 +1720,108 @@ class MEMORY:
         """
         return list(self.var_desc_history.get(key, []))
 
+    def get_var_meta(self, key):
+        """
+        Return a copy of the latest structured metadata dict for ``key``, or None.
+
+        Args:
+            key (str): Variable name.
+
+        Returns:
+            dict or None: Latest metadata dict when present and variable is active.
+        """
+        history = self.vars.get(key)
+        if not history or history[-1][1] is VAR_DELETED:
+            return None
+        return self._get_latest_meta(key)
+
+    def get_var_meta_history(self, key):
+        """Return full ``[[stamp, metadata_dict], ...]`` history for ``key``."""
+        return copy.deepcopy(self.var_meta_history.get(key, []))
+
+    def find_vars(
+        self,
+        prefix=None,
+        desc_contains=None,
+        changed_since=None,
+        metadata_filter=None,
+        include_meta=False,
+        resolve_refs=True,
+    ):
+        """
+        Query active variables by prefix, description text, causal stamp, or metadata.
+
+        Args:
+            prefix (str, optional): Keep variables whose name starts with ``prefix``.
+            desc_contains (str, optional): Case-insensitive substring match on description.
+            changed_since (str, optional): Event stamp; keep variables modified strictly
+                after ``changed_since`` in ``idx_all``.
+            metadata_filter (dict, optional): Key-value filter matched against latest
+                variable metadata (and nested ``metadata['source']`` when a dict).
+            include_meta (bool): When True, return ``{key: {'value', 'stamp', 'desc', 'metadata'}}``
+                instead of ``{key: value}``. Defaults to False.
+            resolve_refs (bool): Resolve compressed ``_obj_ref`` values (default True).
+
+        Returns:
+            dict: Matching active variables.
+
+        Raises:
+            KeyError: When ``changed_since`` is provided and not found in ``idx_all``.
+        """
+        stamps_after = None
+        if changed_since is not None:
+            after_events = self.get_events(since=changed_since)
+            stamps_after = {ev.get("stamp") for ev in after_events}
+
+        desc_needle = desc_contains.lower() if isinstance(desc_contains, str) else None
+        matches = {}
+
+        for key, history in self.vars.items():
+            if not history:
+                continue
+            last_stamp, last_raw = history[-1]
+            if last_raw is VAR_DELETED:
+                continue
+            if prefix is not None and not key.startswith(prefix):
+                continue
+            desc = self._get_latest_desc(key)
+            if desc_needle is not None and desc_needle not in (desc or "").lower():
+                continue
+            if stamps_after is not None:
+                if not any(entry_stamp in stamps_after for entry_stamp, _ in history):
+                    continue
+            meta = self._get_latest_meta(key)
+            if metadata_filter:
+                meta_map = meta or {}
+                src_map = meta_map.get("source") if isinstance(meta_map.get("source"), dict) else {}
+                matched_all = True
+                for mk, mv in metadata_filter.items():
+                    if mk in meta_map and meta_map[mk] == mv:
+                        continue
+                    if mk in src_map and src_map[mk] == mv:
+                        continue
+                    matched_all = False
+                    break
+                if not matched_all:
+                    continue
+
+            if resolve_refs and is_obj_ref(last_raw):
+                val = self.get_obj(last_raw["_obj_ref"])
+            else:
+                val = last_raw
+
+            if include_meta:
+                matches[key] = {
+                    "value": val,
+                    "stamp": last_stamp,
+                    "desc": desc,
+                    "metadata": meta,
+                }
+            else:
+                matches[key] = val
+
+        return matches
+
     def set_obj(self, data, name=None, desc='', content_type='auto'):
         """
         Store a large object in compressed form.
@@ -1722,54 +1936,79 @@ class MEMORY:
         Stores events and objects - indexes can be rehydrated from events.
         
         Returns:
-            dict with 'id', 'events', and 'objects' keys
+            dict with 'id', 'revision', 'events', 'objects', and 'var_meta_history' keys
         """
         return {
             'id': self.id,
+            'revision': self.revision,
             'events': dict(self.events),    # All events by stamp
             'objects': dict(self.objects),  # All objects by stamp (already JSON-serializable)
+            'var_meta_history': copy.deepcopy(self.var_meta_history),
         }
 
-    def save(self, filename, compressed=False):
+    def save(self, filename, compressed=False, slim=False, indent=2):
         """
-        Save memory to file.
-        
+        Atomically save memory to disk (JSON for ``.json`` paths, pickle otherwise).
+
+        Uses a same-directory temporary file plus ``os.replace`` so crashes or
+        process kills never leave half-written session files behind.
+
         Args:
-            filename: Path to save file
-            compressed: If True, use gzip compression
+            filename: Path to save file (``.json`` writes portable JSON; any
+                other extension writes binary pickle compatible with ``load``).
+            compressed: If True, use gzip compression on binary pickle output.
+            slim: Passed to ``to_json(slim=...)`` when saving a ``.json`` file.
+            indent: JSON indentation when saving a ``.json`` file (default 2).
         """
         import gzip
+        path_str = os.fspath(filename)
+        if not compressed and str(path_str).lower().endswith('.json'):
+            self.to_json(filename=path_str, indent=indent, slim=slim)
+            return
         data = self.snapshot()
+        raw_pickle = pickle.dumps(data)
         if compressed:
-            with gzip.open(filename, 'wb') as f:
-                pickle.dump(data, f)
+            raw_bytes = gzip.compress(raw_pickle)
         else:
-            with open(filename, 'wb') as f:
-                pickle.dump(data, f)
+            raw_bytes = raw_pickle
+        self._atomic_write_bytes(path_str, raw_bytes)
 
     def load(self, filename, compressed=False):
         """
-        Load memory from file by rehydrating from events.
-        
+        Load memory from file (supports both ``.json`` snapshots and binary pickle).
+
         Args:
             filename: Path to load file
-            compressed: If True, expect gzip compression
+            compressed: If True, expect gzip compression on binary pickle
         """
         import gzip
+        path_str = os.fspath(filename)
+        if not compressed and str(path_str).lower().endswith('.json'):
+            mem = MEMORY.from_json(path_str)
+            self._adopt_loaded_memory(mem)
+            return
+
         if compressed:
-            with gzip.open(filename, 'rb') as f:
+            with gzip.open(path_str, 'rb') as f:
                 data = pickle.load(f)
         else:
-            with open(filename, 'rb') as f:
+            with open(path_str, 'rb') as f:
                 data = pickle.load(f)
-        
+
         # Rehydrate from events (pass objects if present)
         event_list = list(data.get('events', {}).values())
         objects = data.get('objects', {})
         mem = MEMORY.from_events(event_list, data.get('id'), objects=objects)
-        
-        # Copy state to self
+        if 'var_meta_history' in data and isinstance(data['var_meta_history'], dict):
+            mem.var_meta_history = copy.deepcopy(data['var_meta_history'])
+        if 'revision' in data and isinstance(data['revision'], int):
+            mem.revision = data['revision']
+        self._adopt_loaded_memory(mem)
+
+    def _adopt_loaded_memory(self, mem):
+        """Copy internal layers from a rehydrated MEMORY ``mem`` onto ``self``."""
         self.id = mem.id
+        self.revision = mem.revision
         self.events = mem.events
         self.idx_msgs = mem.idx_msgs
         self.idx_refs = mem.idx_refs
@@ -1780,7 +2019,9 @@ class MEMORY:
         self._event_seq = mem._event_seq
         self.vars = mem.vars
         self.var_desc_history = mem.var_desc_history
+        self.var_meta_history = mem.var_meta_history
         self.objects = mem.objects
+        self.valid_channels = set(mem.valid_channels)
 
     def scope(
         self,
@@ -1835,61 +2076,150 @@ class MEMORY:
         """Return a deep copy of the MEMORY instance."""
         return copy.deepcopy(self)
 
-    def to_json(self, filename=None, indent=2):
+    def to_json(self, filename=None, indent=2, slim=False, keep_recent_turns=None):
         """
-        Export memory to JSON format.
+        Export memory to JSON format (optionally slimmed for serverless transport).
         
         Like DataFrame.to_csv(), this allows saving memory state to a portable
-        JSON format that can be loaded later with from_json().
+        JSON format that can be loaded later with from_json(). When ``filename``
+        is provided, writes atomically via a same-directory temporary file plus
+        ``os.replace``.
         
         Args:
-            filename: If provided, write to file. Otherwise return JSON string.
-            indent: JSON indentation level (default 2, use None for compact)
+            filename: If provided, write atomically to file. Otherwise return JSON string.
+            indent: JSON indentation level (default 2, use None for compact).
+            slim: When True, strips bookkeeping ``log`` and ``ref`` events (or drops
+                those older than ``keep_recent_turns`` user turns), trims variable
+                history to the latest entry per variable, and garbage-collects
+                unreferenced compressed objects.
+            keep_recent_turns: Optional non-negative integer; when provided (with or
+                without ``slim=True``), retains ``log`` and ``ref`` events at or after
+                the N-th most recent ``user`` message and drops older bookkeeping.
         
         Returns:
             JSON string if filename is None, else None
         
         Example:
-            # Save to file
+            # Save to file atomically
             memory.to_json('memory_backup.json')
             
-            # Get JSON string
-            json_str = memory.to_json()
+            # Export lean payload for serverless session store
+            slim_json = memory.to_json(slim=True, indent=None)
         """
-        # Prepare data for JSON serialization
-        # Need to handle VAR_DELETED sentinel in vars history
-        def serialize_var_history(var_dict):
+        def serialize_var_history(var_dict, latest_only=False):
             """Convert VAR_DELETED sentinel to JSON-safe marker."""
             result = {}
             for key, history in var_dict.items():
+                entries = history[-1:] if (latest_only and history) else history
                 serialized_history = []
-                for stamp, value in history:
+                for stamp, value in entries:
                     if value is VAR_DELETED:
                         serialized_history.append([stamp, '__VAR_DELETED__'])
                     else:
                         serialized_history.append([stamp, value])
                 result[key] = serialized_history
             return result
-        
+
+        use_slim = bool(slim) or (keep_recent_turns is not None)
+        if not use_slim:
+            events_out = self.events
+            objects_out = self.objects
+            vars_out = serialize_var_history(self.vars, latest_only=False)
+            desc_out = self.var_desc_history
+            meta_out = self.var_meta_history
+            idx_msgs_out = self.idx_msgs
+            idx_refs_out = self.idx_refs
+            idx_logs_out = self.idx_logs
+            idx_vars_out = self.idx_vars
+            idx_all_out = self.idx_all
+        else:
+            # Determine cutoff position in idx_all for log/ref retention
+            cutoff_idx = len(self.idx_all)
+            if keep_recent_turns is not None:
+                turns = int(keep_recent_turns)
+                if turns > 0:
+                    user_stamps = [
+                        self._stamp_from_index_pair(p)
+                        for p in self.idx_msgs
+                        if (self.events.get(self._stamp_from_index_pair(p)) or {}).get('role') == 'user'
+                    ]
+                    if user_stamps:
+                        anchor_stamp = user_stamps[-min(turns, len(user_stamps))]
+                        for pos, pair in enumerate(self.idx_all):
+                            if self._stamp_from_index_pair(pair) == anchor_stamp:
+                                cutoff_idx = pos
+                                break
+
+            latest_var_stamps = {
+                history[-1][0]
+                for history in self.vars.values()
+                if history
+            }
+            retained_stamps = set()
+            for pos, pair in enumerate(self.idx_all):
+                st = self._stamp_from_index_pair(pair)
+                ev = self.events.get(st)
+                if ev is None:
+                    continue
+                etype = ev.get('type', 'msg')
+                if etype in ('log', 'ref'):
+                    if pos >= cutoff_idx:
+                        retained_stamps.add(st)
+                elif etype == 'var':
+                    if st in latest_var_stamps:
+                        retained_stamps.add(st)
+                else:
+                    retained_stamps.add(st)
+
+            events_out = {st: self.events[st] for st in retained_stamps if st in self.events}
+            vars_out = serialize_var_history(self.vars, latest_only=True)
+            desc_out = {
+                k: hist[-1:] for k, hist in self.var_desc_history.items() if hist
+            }
+            meta_out = {
+                k: hist[-1:] for k, hist in self.var_meta_history.items() if hist
+            }
+            idx_msgs_out = [p for p in self.idx_msgs if self._stamp_from_index_pair(p) in retained_stamps]
+            idx_refs_out = [p for p in self.idx_refs if self._stamp_from_index_pair(p) in retained_stamps]
+            idx_logs_out = [p for p in self.idx_logs if self._stamp_from_index_pair(p) in retained_stamps]
+            idx_vars_out = [p for p in self.idx_vars if self._stamp_from_index_pair(p) in retained_stamps]
+            idx_all_out = [p for p in self.idx_all if self._stamp_from_index_pair(p) in retained_stamps]
+
+            # Garbage-collect unreferenced compressed objects
+            referenced_objs = set()
+            for history in self.vars.values():
+                if history:
+                    val = history[-1][1]
+                    if is_obj_ref(val):
+                        referenced_objs.add(val['_obj_ref'])
+            for ev in events_out.values():
+                vval = ev.get('var_value')
+                if is_obj_ref(vval):
+                    referenced_objs.add(vval['_obj_ref'])
+            objects_out = {
+                ost: obj for ost, obj in self.objects.items() if ost in referenced_objs
+            }
+
         data = {
             'version': '1.0',
+            'revision': self.revision,
             'id': self.id,
-            'events': self.events,
-            'objects': self.objects,
-            'vars': serialize_var_history(self.vars),
-            'var_desc_history': self.var_desc_history,
-            'idx_msgs': self.idx_msgs,
-            'idx_refs': self.idx_refs,
-            'idx_logs': self.idx_logs,
-            'idx_vars': self.idx_vars,
-            'idx_all': self.idx_all,
+            'events': events_out,
+            'objects': objects_out,
+            'vars': vars_out,
+            'var_desc_history': desc_out,
+            'var_meta_history': meta_out,
+            'idx_msgs': idx_msgs_out,
+            'idx_refs': idx_refs_out,
+            'idx_logs': idx_logs_out,
+            'idx_vars': idx_vars_out,
+            'idx_all': idx_all_out,
         }
         
         json_str = json.dumps(data, indent=indent, ensure_ascii=False)
         
         if filename:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(json_str)
+            self._atomic_write_bytes(filename, json_str.encode('utf-8'))
             return None
         return json_str
 
@@ -1914,14 +2244,12 @@ class MEMORY:
             # Load from JSON string
             memory = MEMORY.from_json(json_str)
         """
-        import os
-        
-        # Determine if source is a file or JSON string
-        if os.path.isfile(source):
-            with open(source, 'r', encoding='utf-8') as f:
+        source_path = os.fspath(source) if isinstance(source, os.PathLike) else source
+        if isinstance(source_path, str) and os.path.isfile(source_path):
+            with open(source_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         else:
-            data = json.loads(source)
+            data = json.loads(source_path)
         
         # Helper to restore VAR_DELETED sentinel
         def deserialize_var_history(var_dict):
@@ -1944,6 +2272,7 @@ class MEMORY:
         mem.objects = data.get('objects', {})
         mem.vars = deserialize_var_history(data.get('vars', {}))
         mem.var_desc_history = data.get('var_desc_history', {})
+        mem.var_meta_history = data.get('var_meta_history', {})
         mem.idx_msgs = data.get('idx_msgs', [])
         mem.idx_refs = data.get('idx_refs', [])
         mem.idx_logs = data.get('idx_logs', [])
@@ -1956,6 +2285,14 @@ class MEMORY:
             if isinstance(ev.get('_seq'), int)
         ]
         mem._event_seq = max(seq_values) if seq_values else len(mem.events)
+        if isinstance(data.get('revision'), int):
+            mem.revision = data['revision']
+        else:
+            mem.revision = len(mem.idx_all)
+        for ev in mem.events.values():
+            ch = ev.get('channel')
+            if isinstance(ch, str) and ch:
+                mem.valid_channels.add(ch)
 
         return mem
 
@@ -2050,12 +2387,68 @@ class MEMORY:
                         desc_hist = mem.var_desc_history[var_name]
                         if not desc_hist or desc_hist[-1][1] != var_desc:
                             desc_hist.append([stamp, var_desc])
+
+                    var_meta = ev.get('var_meta')
+                    if isinstance(var_meta, dict):
+                        if var_name not in mem.var_meta_history:
+                            mem.var_meta_history[var_name] = []
+                        meta_hist = mem.var_meta_history[var_name]
+                        if not meta_hist or meta_hist[-1][1] != var_meta:
+                            meta_hist.append([stamp, copy.deepcopy(var_meta)])
+
+            ch = ev.get('channel')
+            if isinstance(ch, str) and ch:
+                mem.valid_channels.add(ch)
             
             mem.idx_all.append(ts_pair)
 
         mem._index_seq = len(mem.idx_all)
         mem._event_seq = max(max_seq, len(mem.events))
+        mem.revision = len(mem.idx_all)
         return mem
+
+    def merge(self, other):
+        """
+        Union this MEMORY with ``other`` by event stamp, returning a new merged MEMORY.
+
+        Designed for serverless compare-and-swap conflict resolution: when two
+        concurrent invocations rehydrate the same base session (`revision` K),
+        append non-conflicting turns/events, and collide on write, calling
+        ``base_a.merge(base_b)`` deterministically unions their events,
+        compressed objects, and variable histories in causal order and advances
+        ``revision`` if ``other`` contributed unseen stamps.
+
+        Args:
+            other (MEMORY or _MemoryScope): Concurrent memory branch to union.
+
+        Returns:
+            MEMORY: New merged MEMORY instance preserving ``self.id``.
+
+        Example:
+            >>> merged = session_a.merge(session_b)
+        """
+        other_root = getattr(other, 'base', other)
+        if not isinstance(other_root, MEMORY):
+            raise TypeError(
+                "merge() expects a MEMORY instance, got {}.".format(type(other).__name__)
+            )
+
+        added_new = any(st not in self.events for st in other_root.events)
+        combined_events = list(self.events.values()) + [
+            ev for st, ev in other_root.events.items() if st not in self.events
+        ]
+        combined_objects = dict(other_root.objects)
+        combined_objects.update(self.objects)
+
+        merged = MEMORY.from_events(
+            combined_events,
+            memory_id=self.id,
+            objects=combined_objects,
+        )
+        merged.valid_channels = set(self.valid_channels) | set(other_root.valid_channels)
+        base_rev = max(int(self.revision), int(other_root.revision))
+        merged.revision = base_rev + (1 if added_new else 0)
+        return merged
 
     def render(
         self,
@@ -2775,10 +3168,75 @@ class _MemoryScope:
             for key in self.vars
         }
 
-    def set_var(self, key, value, desc=''):
+    def set_var(self, key, value, desc='', metadata=None, source=None):
         """Write ``key`` into ``{actor}__{key}`` (or export target when in ``export_keys``)."""
         target = self._resolve_write_key(key)
-        return self.base.set_var(target, value, desc=desc)
+        return self.base.set_var(target, value, desc=desc, metadata=metadata, source=source)
+
+    def upsert(self, key, value, desc='', metadata=None, source=None):
+        """Upsert ``key`` on this scope's write target; no-op returning False when unchanged."""
+        target = self._resolve_write_key(key)
+        return self.base.upsert(target, value, desc=desc, metadata=metadata, source=source)
+
+    def get_var_meta(self, key):
+        """Return latest structured variable metadata for visible ``key``, or None."""
+        real = self._resolve_read_key(key)
+        if real is None:
+            return None
+        return self.base.get_var_meta(real)
+
+    def find_vars(
+        self,
+        prefix=None,
+        desc_contains=None,
+        changed_since=None,
+        metadata_filter=None,
+        include_meta=False,
+        resolve_refs=True,
+    ):
+        """Query visible variables in this scope using logical (unprefixed) names."""
+        stamps_after = None
+        if changed_since is not None:
+            after_events = self.base.get_events(since=changed_since)
+            stamps_after = {ev.get("stamp") for ev in after_events}
+
+        desc_needle = desc_contains.lower() if isinstance(desc_contains, str) else None
+        out = {}
+        for logical_key in self.vars:
+            if prefix is not None and not logical_key.startswith(prefix):
+                continue
+            real_key = self._resolve_read_key(logical_key)
+            if real_key is None:
+                continue
+            history = self.base.vars.get(real_key) or []
+            if not history or history[-1][1] is VAR_DELETED:
+                continue
+            desc = self.base._get_latest_desc(real_key)
+            if desc_needle is not None and desc_needle not in (desc or "").lower():
+                continue
+            if stamps_after is not None:
+                if not any(st in stamps_after for st, _ in history):
+                    continue
+            meta = self.base._get_latest_meta(real_key)
+            if metadata_filter:
+                meta_map = meta or {}
+                src_map = meta_map.get("source") if isinstance(meta_map.get("source"), dict) else {}
+                if not all(
+                    (mk in meta_map and meta_map[mk] == mv) or (mk in src_map and src_map[mk] == mv)
+                    for mk, mv in metadata_filter.items()
+                ):
+                    continue
+            val = self.base.get_var(real_key, resolve_refs=resolve_refs)
+            if include_meta:
+                out[logical_key] = {
+                    "value": val,
+                    "stamp": history[-1][0],
+                    "desc": desc,
+                    "metadata": meta,
+                }
+            else:
+                out[logical_key] = val
+        return out
 
     def del_var(self, key):
         """Append a deletion tombstone on this scope's write target for ``key``."""
@@ -2885,11 +3343,13 @@ class _MemoryScope:
             return pprint.pformat(events, indent=1)
         raise ValueError("Invalid repr option. Choose from 'list', 'str', or 'pprint1'.")
 
-    def get_events(self, limit=-1, event_types=None, channel=None):
+    def get_events(self, limit=-1, event_types=None, channel=None, since=None):
         """Return master-index events filtered to those epistemically visible to this scope."""
         events = [
             e
-            for e in self.base.get_events(limit=-1, event_types=event_types, channel=channel)
+            for e in self.base.get_events(
+                limit=-1, event_types=event_types, channel=channel, since=since
+            )
             if self._event_visible(e)
         ]
         return events[-limit:] if limit > 0 else events

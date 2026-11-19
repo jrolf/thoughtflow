@@ -1907,3 +1907,99 @@ class TestToolPairBoundaries:
         scoped = memory.scope('x', read_rooms=['api'], write_room='cli')
         result = scoped.compact(keep=2)
         assert result['covered'] == 4 and result['stamp']
+
+    def test_upsert_noop_metadata_find_vars_and_events_since(self):
+        """Issue #47: upsert skips unchanged values, stores structured metadata, and supports find_vars + since=."""
+        mem = MEMORY()
+        mem.add_msg('user', 'Initial turn')
+        checkpoint_stamp = mem.last_user_msg()['stamp']
+
+        assert mem.upsert('plan_budget', 15000, desc='Approved cap', source={'turn': 1, 'confidence': 0.9}) is True
+        rev_after_first = mem.revision
+        # Identical write is a true no-op: no history bloat, no new event, revision unchanged
+        assert mem.upsert('plan_budget', 15000, desc='Approved cap', source={'turn': 1, 'confidence': 0.9}) is False
+        assert mem.revision == rev_after_first
+        assert len(mem.get_var_history('plan_budget')) == 1
+
+        # Type-distinct values (1 vs True) are NOT conflated
+        assert mem.upsert('flag', 1) is True
+        assert mem.upsert('flag', True) is True
+        assert len(mem.get_var_history('flag')) == 2
+
+        mem.upsert('plan_owner', 'alice', desc='Owner handle', metadata={'team': 'ops'})
+        mem.upsert('other_key', 'ignore')
+
+        assert mem.get_var_meta('plan_budget') == {'source': {'turn': 1, 'confidence': 0.9}}
+        assert mem.find_vars(prefix='plan_') == {'plan_budget': 15000, 'plan_owner': 'alice'}
+        assert mem.find_vars(desc_contains='approved') == {'plan_budget': 15000}
+        assert mem.find_vars(metadata_filter={'turn': 1}) == {'plan_budget': 15000}
+        assert mem.find_vars(changed_since=checkpoint_stamp, prefix='plan_') == {
+            'plan_budget': 15000,
+            'plan_owner': 'alice',
+        }
+
+        detailed = mem.find_vars(prefix='plan_budget', include_meta=True)
+        assert detailed['plan_budget']['value'] == 15000
+        assert detailed['plan_budget']['metadata']['source']['turn'] == 1
+
+        since_events = mem.get_events(since=checkpoint_stamp)
+        assert len(since_events) == 5
+        assert all(ev['stamp'] != checkpoint_stamp for ev in since_events)
+
+        # Scope forwarding works with logical names
+        scoped = mem.scope('worker', public_keys=['plan_budget'])
+        assert scoped.upsert('local_step', 'done', source={'worker': 'w1'}) is True
+        assert scoped.upsert('local_step', 'done', source={'worker': 'w1'}) is False
+        assert scoped.find_vars(prefix='local_') == {'local_step': 'done'}
+
+    def test_slim_json_revision_merge_and_atomic_json_save(self, tmp_path):
+        """Issues #39 & #51: to_json(slim=True), revision counter, merge(), and atomic .json save/load."""
+        base = MEMORY()
+        base.add_msg('user', 'Turn 1')
+        base.add_log('verbose log 1')
+        base.add_ref('old reflection 1')
+        for step in range(5):
+            base.set_var('counter', step, desc='step counter')
+        base.add_msg('assistant', 'Reply 1')
+        base.add_msg('user', 'Turn 2')
+        base.add_log('recent log 2')
+
+        full_json = base.to_json(indent=None)
+        slim_json = base.to_json(slim=True, indent=None)
+        assert len(slim_json) < len(full_json)
+
+        slim_restored = MEMORY.from_json(slim_json)
+        assert slim_restored.get_var('counter') == 4
+        assert len(slim_restored.get_var_history('counter')) == 1
+        assert slim_restored.get_logs() == []
+        assert slim_restored.get_refs() == []
+        assert len(slim_restored.get_msgs()) == 3
+        assert slim_restored.revision == base.revision
+
+        # keep_recent_turns=1 retains logs from Turn 2 onward while dropping Turn 1 logs
+        window_restored = MEMORY.from_json(base.to_json(slim=True, keep_recent_turns=1))
+        assert len(window_restored.get_logs()) == 1
+        assert 'recent log 2' in window_restored.get_logs()[0]['content']
+
+        # Concurrent serverless branches rehydrated from the same snapshot merge cleanly by stamp
+        branch_a = MEMORY.from_json(full_json)
+        branch_b = MEMORY.from_json(full_json)
+        base_rev = branch_a.revision
+        branch_a.set_var('from_a', 'alpha', source={'branch': 'a'})
+        branch_b.set_var('from_b', 'beta', source={'branch': 'b'})
+
+        merged = branch_a.merge(branch_b)
+        assert merged.id == base.id
+        assert merged.get_var('from_a') == 'alpha'
+        assert merged.get_var('from_b') == 'beta'
+        assert merged.get_var_meta('from_b') == {'source': {'branch': 'b'}}
+        assert merged.revision > base_rev
+
+        # Atomic save/load with .json path
+        json_file = tmp_path / 'session' / 'state.json'
+        merged.save(json_file, slim=True)
+        assert json_file.is_file()
+        loaded = MEMORY()
+        loaded.load(json_file)
+        assert loaded.get_var('from_a') == 'alpha'
+        assert loaded.get_var('from_b') == 'beta'
