@@ -12,9 +12,10 @@ Classes:
 from __future__ import annotations
 
 from thoughtflow.thoughts.decide import DECIDE
-from thoughtflow.thoughts.plan import PLAN
+from thoughtflow.thoughts.plan import PLAN, run_plan
 
 __all__ = [
     "DECIDE",
     "PLAN",
+    "run_plan",
 ]

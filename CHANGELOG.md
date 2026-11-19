@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `THOUGHT(..., output_schema={...}, reasoning={'effort': ...})` native provider structured output with automatic fallback to prompt-guided JSON + repair retries, cross-provider reasoning effort normalization, and `'usage'` emits on `MEMORY`.
 - Unified doubled-brace escaping (`{{` / `}}`) and field/spec lookup in `substitute` template mode, atomic `system_prompt` + `prompt` rendering, readable `{messages}` transcript formatting, and `THOUGHT.BUILTIN_TEMPLATE_VARS`.
 - `THOUGHT.run(vars=None, memory=None)` one-liner execution helper plus decoupled `render_vars(...)` and `require_grounded_quotes(...)` utilities in `thoughtflow._util`.
+- `ACTION` out-of-band `{name}_status` (`'ok'` | `'error'`), `{name}_error`, `{name}_outcome`, consistent `{name}_result` aliases across all 14 action verbs, identifier-only `_substitution.substitute(..., strict=False)` preserving JSON braces, and `TOOL.from_action(..., memory=None)` bound memory + `action.config` forwarding.
+- `run_plan(plan, memory, actions, on_error='stop', parallel_inner=False)` (exported) plan executor with `$step_N_result` / `$step_N.field` (and legacy `{step_N_result}`) reference resolution and `plan_receipts` tracking.
+- `PlanActAgent(..., max_replans=2)` bounded outer replan execution loop, single- and double-brace `{task}` / `{tool_list}` substitution, non-string step label coercion, structured tool failure detection, and `{name}_outcome` telemetry.
+- `DELEGATE(agents={'name': fn})` callable dict support, per-specialist structured outcomes (`ok`, `result`, `error`, `usage`, `messages`), optional `dispatch(..., merge_vars=, merge_msgs=)`, `broadcast(..., parallel=True)`, `delegate.dispatch_many(...)`, and `map_thought(...)` (exported) parallel fan-out.
 
 ## [0.3.0] - 2026-11-19
 

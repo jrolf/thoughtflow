@@ -372,3 +372,92 @@ class TestDelegateMemoryCopyFidelity:
         assert captured["desc"] == "Primary customer"
         assert captured["deleted"] is True
         assert memory.get_var("specialist_dispatch_result") == "handled C-77"
+
+
+class TestDelegateOutcomesDispatchManyAndMapThought:
+    """Tests for #41 (callable dicts, per-agent outcomes, merge-back) and #45 (dispatch_many, parallel broadcast, map_thought)."""
+
+    def test_callable_dict_outcomes_and_merge_back(self):
+        def billing_fn(mem):
+            mem.set_var("invoice_id", "INV-9")
+            mem.add_msg("assistant", "Checked invoice INV-9")
+            mem.emit("usage", {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001})
+            mem.set_var("billing_result", "Refund approved")
+            return mem
+
+        def broken_logistics(mem):
+            raise RuntimeError("warehouse API down")
+
+        delegate = DELEGATE(agents={"billing": billing_fn, "logistics": broken_logistics})
+        mem = MEMORY()
+        mem = delegate.dispatch(mem, "billing", "Check double charge", merge_vars=["invoice_id"], merge_msgs=True)
+
+        assert mem.get_var("billing_dispatch_result") == "Refund approved"
+        b_out = mem.get_var("billing_dispatch_outcome")
+        assert b_out["ok"] is True
+        assert b_out["usage"]["total_tokens"] == 15
+        assert mem.get_var("invoice_id") == "INV-9"
+        assert mem.last_asst_msg(content_only=True) == "Checked invoice INV-9"
+
+        # Parallel broadcast captures both success and specialist error without crashing
+        mem = delegate.broadcast(mem, "Status check", parallel=True)
+        outcomes = mem.get_var("delegate_broadcast_outcomes")
+        assert outcomes["billing"]["ok"] is True
+        assert outcomes["logistics"]["ok"] is False
+        assert "warehouse API down" in outcomes["logistics"]["error"]
+
+    def test_dispatch_many_parallel_preserves_assignment_order(self):
+        import time
+
+        def slow_fn(mem):
+            time.sleep(0.03)
+            return "slow:" + (mem.last_user_msg(content_only=True) or "")
+
+        def fast_fn(mem):
+            return "fast:" + (mem.last_user_msg(content_only=True) or "")
+
+        delegate = DELEGATE(agents={"slow": slow_fn, "fast": fast_fn})
+        mem = MEMORY()
+        reports = delegate.dispatch_many(
+            mem,
+            [
+                {"agent": "slow", "task": "A"},
+                {"agent": "fast", "task": "B"},
+            ],
+            parallel=True,
+        )
+
+        assert [r["agent"] for r in reports] == ["slow", "fast"]
+        assert reports[0]["ok"] is True and reports[0]["result"] == "slow:A"
+        assert reports[1]["ok"] is True and reports[1]["result"] == "fast:B"
+
+    def test_map_thought_voting_and_items_parallel(self):
+        from thoughtflow import THOUGHT, map_thought
+
+        class EchoVarsLLM:
+            last_error = None
+            last_finish_reason = "stop"
+            last_usage = {"prompt_tokens": 4, "completion_tokens": 2}
+
+            def call(self, msgs, params=None):
+                return [msgs[-1]["content"].upper()]
+
+        step = THOUGHT(
+            name="upper",
+            llm=EchoVarsLLM(),
+            prompt="Item={item}",
+            include_history=False,
+        )
+        base_mem = MEMORY()
+
+        item_outcomes = map_thought(step, base_mem, items=["one", "two", "three"], parallel=True)
+        assert [o["result"] for o in item_outcomes] == ["ITEM=ONE", "ITEM=TWO", "ITEM=THREE"]
+        assert all(o["ok"] for o in item_outcomes)
+        assert base_mem.get_var("item") is None  # base memory untouched
+
+        vote_step = THOUGHT(name="vote", llm=EchoVarsLLM(), prompt="Vote", include_history=False)
+        vote_outcomes = map_thought(vote_step, base_mem, n=4, parallel=True)
+        assert len(vote_outcomes) == 4
+        assert [o["index"] for o in vote_outcomes] == [0, 1, 2, 3]
+        assert all(o["result"] == "VOTE" for o in vote_outcomes)
+

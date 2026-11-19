@@ -39,25 +39,25 @@ Every module in `src/thoughtflow/` obeys five hard invariants. Any change that v
 
 | Module / Subpackage | Exports | Responsibility |
 |---------------------|---------|----------------|
-| `__init__.py` | All 49 public symbols | Single flat namespace (`from thoughtflow import ...`) |
-| `memory.py` | `MEMORY` (`_MemoryScope` via `.scope()`) | Event-sourced state log, causal `_seq` ordering, variable histories & tombstones, `>10KB` zlib object store, RAG augments, typed `emit()` events, token-budgeted `get_llm_msgs`, non-destructive `compact()`, idempotent `suspend()` / `resolve_suspension()`, and zero-copy multi-party scopes |
+| `__init__.py` | All 51 public symbols | Single flat namespace (`from thoughtflow import ...`) |
+| `memory.py` | `MEMORY` (`_MemoryScope` via `.scope()`) | Event-sourced state log, causal `_seq` ordering, variable histories, `upsert()` & metadata, `find_vars()`, `>10KB` zlib object store, RAG augments, typed `emit()` events, token-budgeted `get_llm_msgs`, non-destructive `compact()`, `to_json(slim=True)`, `merge()`, atomic `save()`, idempotent `suspend()` / `resolve_suspension()`, and zero-copy multi-party scopes |
 | `message.py` | `Message`, `MessageList`, `normalize_messages` | Optional structured message dataclass supporting `assistant` `tool_calls` and `tool` `tool_call_id` |
-| `llm.py` | `LLM`, `OpenAICompatibleLLM`, `ReplayLLM`, `ReplayMissError` | Multi-provider text generation (`call`), streaming, native `output_schema`, `last_finish_reason`, and `kind='chat'` record/replay |
+| `llm.py` | `LLM`, `OpenAICompatibleLLM`, `ReplayLLM`, `ReplayMissError` | Multi-provider text generation (`call`), streaming, native `output_schema`, `last_finish_reason`, thread-safe `usage` ledger, `LLM.cassette()`, and `kind='chat'` record/replay |
 | `llm_chat.py` | `ChatError` (+ `LLM.chat` internals) | Structured OpenAI-compatible completion (`content`, separate `reasoning`, native `tool_calls`, `finish_reason`, `usage`), typed SSE stream events, and cross-thread `cancel=` socket shutdown via `http.client` |
-| `llm_params.py` | Internal helpers | Unified parameter bucket pipeline (`LLM_RESERVED_KEYS`, `merge_call_params`, `split_call_params`, `normalize_usage`) |
+| `llm_params.py` | Internal helpers | Unified parameter bucket pipeline (`LLM_RESERVED_KEYS`, `merge_call_params`, `split_call_params`, `normalize_usage`, `normalize_reasoning_params`) |
 | `llm_cache.py` | `cached_system`, `cached_message` | Provider-agnostic prompt-caching message markers and Anthropic `cache_control` wire adapter |
 | `providers/` | `GroqLLM`, `CerebrasLLM`, `OpenRouterLLM` | Thin `LLM` subclasses encoding production provider defaults (see [`providers/README.md`](providers/README.md)) |
-| `embed.py` | `EMBED`, `ReplayEMBED` | Multi-provider vector embeddings (single & batch) with `kind='embed'` record/replay |
+| `embed.py` | `EMBED`, `ReplayEMBED`, `cosine_similarity`, `cosine_retrieve` | Multi-provider vector embeddings (single & batch), `kind='embed'` record/replay, and stdlib cosine retrieval helpers |
 | `dm.py` | `DM`, `ReplayDM`, `DecisionError` | Multi-provider structured System-One decision models (`choice`, `noul`, `score`, `box`), cross-vendor linear concentration & margin normalization, `DM.from_llm()` fallback, and `kind='decide'` record/replay |
-| `thought.py` | `THOUGHT` | Atomic cognitive step: template rendering (`format` / `substitute`), lazy `_obj_ref` context extraction, `valid_extract` schema parsing, declarative/callable validation, smart retry (`double_budget`, `backoff`, `fallback_llm`), `visibility`, and uniform `{name}_outcome` telemetry |
-| `thoughts/` | `DECIDE`, `PLAN` | Specialized `THOUGHT` subclasses for bounded decisions (`LLM` or `DM`) and multi-step DAG planning (see [`thoughts/README.md`](thoughts/README.md)) |
-| `action.py` | `ACTION` | Imperative external side-effect wrapper with timing, error containment, and `{name}_result` storage |
+| `thought.py` | `THOUGHT` | Atomic cognitive step: unified template rendering (`format` / `substitute`), `thought.run()`, native `output_schema` + `reasoning`, lazy `_obj_ref` context extraction, `valid_extract` schema parsing, declarative/callable validation, smart retry (`double_budget`, `backoff`, `fallback_llm`), `visibility`, and uniform `{name}_outcome` telemetry |
+| `thoughts/` | `DECIDE`, `PLAN`, `run_plan` | Specialized `THOUGHT` subclasses for bounded decisions (`LLM` or `DM`, `abstain=`, `{name}_source`) and multi-step DAG planning + `run_plan` executor (see [`thoughts/README.md`](thoughts/README.md)) |
+| `action.py` | `ACTION` | Imperative external side-effect wrapper with timing, out-of-band `{name}_status` / `{name}_error` / `{name}_outcome`, and canonical `{name}_result` storage |
 | `actions/` | 14 `ACTION` subclasses | Concrete stdlib verbs: `SAY`, `ASK`, `NOTIFY`, `SEARCH`, `FETCH`, `SCRAPE`, `READ`, `WRITE`, `POST`, `SLEEP`, `WAIT`, `NOOP`, `RUN`, `CALL` (see [`actions/README.md`](actions/README.md)) |
-| `tool.py` | `TOOL`, `ReplayTOOL` | JSON-Schema callable wrapper with `needs_context=True`, `TOOL.from_action()`, and hermetic `kind='tool'` record/replay/splice |
+| `tool.py` | `TOOL`, `ReplayTOOL` | JSON-Schema callable wrapper with `needs_context=True`, `TOOL.from_action(..., memory=)`, and hermetic `kind='tool'` record/replay/splice |
 | `mcp.py` | `MCP` | Stdlib JSON-RPC 2.0 Model Context Protocol client (`stdio` shell/argv + `http`, `prefix=` namespacing, `isError` surfacing) |
 | `agent.py` | `AGENT`, `tool_loop` | Autonomous tool loop: governed write-ahead native `LLM.chat()` protocol (`allow`, `policy`, `budget`, `checkpoint`, `decision=` resume) with automatic text-JSON fallback |
 | `agents/` | `ReactAgent`, `ReflectAgent`, `PlanActAgent` | Methodology subclasses extending `AGENT` (see [`agents/README.md`](agents/README.md)) |
-| `delegate.py` | `DELEGATE` | Multi-agent routing (`handoff`, `dispatch`, `broadcast`) over isolated `memory.copy()` clones |
+| `delegate.py` | `DELEGATE`, `map_thought` | Multi-agent routing (`handoff`, `dispatch`, `dispatch_many`, `broadcast`) and parallel `map_thought` fan-out over isolated `memory.copy()` clones |
 | `workflow.py` | `WORKFLOW` | Step pipeline with conditions, `ok=` outcome checks, status branching, bounded `while_`, persisted `{name}_log`, and suspend/resume |
 | `chron.py`, `_cron_expr.py` | `CHRON` | Recurring job scheduler supporting 5-field cron, `@daily`-style aliases, intervals, serverless `tick()`, daemon threads, and atomic state persistence |
 | `chat.py` | `CHAT` | Interactive terminal/notebook turn loop skipping `internal=True` scratchpad messages |

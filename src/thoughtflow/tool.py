@@ -314,53 +314,45 @@ class TOOL:
         }
 
     @classmethod
-    def from_action(cls, action, description=None, parameters=None):
+    def from_action(cls, action, description=None, parameters=None, memory=None):
         """
         Create a TOOL from an existing ACTION instance.
 
         This bridges the imperative ACTION world (your code calls it) with the
-        declarative TOOL world (the LLM selects it). The ACTION's function is
-        wrapped so that it can be called without a memory object — the TOOL
-        receives keyword arguments from the LLM, not a memory.
-
-        The resulting TOOL declares ``needs_context=True``: when an agent loop
-        passes ``context={"memory": memory, ...}`` the ACTION's function
-        receives that memory; when called directly it receives ``None``.
+        declarative TOOL world (the LLM selects it). The resulting TOOL declares
+        ``needs_context=True``: when an agent loop passes ``context={"memory": m}``
+        (or ``context=m``), the ACTION receives that memory; otherwise it uses
+        any ``memory=`` bound at ``from_action`` time.
 
         Args:
             action (ACTION): The ACTION instance to promote.
             description (str, optional): Override description. Defaults to
                 the ACTION's existing description.
             parameters (dict, optional): JSON Schema for the tool's parameters.
-                Required — ACTION does not carry schema information.
+            memory (MEMORY, optional): Default bound ``MEMORY`` used when the
+                tool is invoked outside an ``AGENT`` context.
 
         Returns:
             TOOL: A new TOOL instance wrapping the ACTION's function.
-
-        Example:
-            >>> from thoughtflow import ACTION
-            >>> search = ACTION(name="search", fn=search_fn)
-            >>> tool = TOOL.from_action(
-            ...     search,
-            ...     description="Search the web",
-            ...     parameters={"query": {"type": "string"}},
-            ... )
         """
         default_desc = 'Tool: {}'.format(action.name)
         desc = description or getattr(action, 'description', default_desc)
         params = parameters or {"type": "object", "properties": {}}
         name = action.name
 
-        # Wrap the ACTION's fn. ACTION fns expect (memory, **kwargs), but
-        # TOOL fns receive just **kwargs from the LLM. We pass None for the
-        # memory argument since TOOL execution is memory-independent — the
-        # agent loop is responsible for memory integration.
         raw_fn = action.fn
+        bound_memory = memory
 
         def tool_fn(context=None, **kwargs):
-            """Wrapper that calls the ACTION's fn with the context memory (or None)."""
-            memory = (context or {}).get("memory")
-            return raw_fn(memory, **kwargs)
+            """Wrapper that calls the ACTION's fn with context or bound memory plus action.config."""
+            if isinstance(context, dict):
+                active_mem = context.get("memory")
+            else:
+                active_mem = context
+            if active_mem is None:
+                active_mem = bound_memory
+            merged_kwargs = {**(getattr(action, "config", None) or {}), **kwargs}
+            return raw_fn(active_mem, **merged_kwargs)
 
         # Preserve the original function name for debugging
         tool_fn.__name__ = getattr(raw_fn, '__name__', name)

@@ -2728,3 +2728,76 @@ class TestStructuredOutputReasoningTemplatesAndRun:
         assert outcome["error_class"] == "template"
         assert "system_prompt:" in outcome["error"]
 
+
+class TestRunPlanExecutor:
+    """Tests for #48: run_plan executor and $step_N_result / $step_N.field syntax."""
+
+    def test_run_plan_resolves_dollar_and_legacy_refs_and_parallel_inner(self, mock_llm):
+        from thoughtflow import PLAN, run_plan, TOOL
+
+        planner = PLAN(
+            name="research_plan",
+            llm=mock_llm(),
+            prompt="Plan for {topic}",
+            actions={"search": "Find URL", "fetch_a": "Fetch A", "fetch_b": "Fetch B", "combine": "Combine"},
+        )
+        assert "$step_0_result" in planner._format_instructions()
+
+        plan_data = [
+            [{"action": "search", "params": {"q": "mars"}, "reason": "Locate primary endpoints."}],
+            [
+                {"action": "fetch_a", "params": {"url": "$step_0.primary"}, "reason": "Fetch primary."},
+                {"action": "fetch_b", "params": {"url": "$step_0.secondary"}, "reason": "Fetch secondary."},
+            ],
+            [{"action": "combine", "params": {"parts": "$step_1_result", "legacy": "got {step_0_result}"}, "reason": "Merge both."}],
+        ]
+
+        actions = {
+            "search": TOOL(
+                name="search",
+                description="Search",
+                parameters={"q": {"type": "string"}},
+                fn=lambda q: {"primary": "https://a.example/" + q, "secondary": "https://b.example/" + q},
+            ),
+            "fetch_a": lambda url: "A(" + url + ")",
+            "fetch_b": lambda url: "B(" + url + ")",
+            "combine": lambda memory, parts, legacy: {"merged": "|".join(parts), "note": legacy},
+        }
+
+        mem = MEMORY()
+        receipts = run_plan(plan_data, mem, actions, parallel_inner=True)
+
+        assert len(receipts) == 4
+        assert all(r["ok"] for r in receipts)
+        assert mem.get_var("step_1_result") == [
+            "A(https://a.example/mars)",
+            "B(https://b.example/mars)",
+        ]
+        assert mem.get_var("step_2_result")["merged"] == "A(https://a.example/mars)|B(https://b.example/mars)"
+        assert "https://a.example/mars" in mem.get_var("step_2_result")["note"]
+        assert len(mem.get_var("plan_receipts")) == 4
+
+    def test_run_plan_on_error_stop_continue_and_raise(self):
+        from thoughtflow import run_plan
+
+        plan_data = [
+            [{"action": "boom", "params": {}, "reason": "Fails first."}],
+            [{"action": "after", "params": {}, "reason": "Runs only on continue."}],
+        ]
+        actions = {
+            "boom": lambda: (_ for _ in ()).throw(RuntimeError("kaboom")),
+            "after": lambda: "recovered",
+        }
+
+        mem_stop = MEMORY()
+        rec_stop = run_plan(plan_data, mem_stop, actions, on_error="stop")
+        assert len(rec_stop) == 1 and rec_stop[0]["ok"] is False
+
+        mem_cont = MEMORY()
+        rec_cont = run_plan(plan_data, mem_cont, actions, on_error="continue")
+        assert len(rec_cont) == 2 and rec_cont[0]["ok"] is False and rec_cont[1]["result"] == "recovered"
+
+        with pytest.raises(RuntimeError, match="kaboom"):
+            run_plan(plan_data, MEMORY(), actions, on_error="raise")
+
+
