@@ -19,6 +19,7 @@ import json
 import re
 
 from thoughtflow._util import event_stamp
+from thoughtflow.llm_chat import CHAT_SERVICES
 
 _FENCED_JSON_RE = re.compile(
     r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
@@ -80,6 +81,11 @@ class AGENT:
         name="agent",
         on_tool_call=None,
         merge_augments=False,
+        allow=None,
+        policy=None,
+        budget=None,
+        checkpoint=None,
+        protocol="auto",
     ):
         """
         Initialize an AGENT with an LLM, tools, and configuration.
@@ -95,7 +101,29 @@ class AGENT:
                 on_tool_call(tool_name, arguments). Return False to block.
             merge_augments (bool): Fold augmenting memory events into user
                 messages for LLM calls only. Default False.
+            allow (list[str], optional): Tool names the model may run. Calls to
+                any other tool get an error ``tool`` message instead.
+            policy (dict or callable, optional): Governance per tool. A dict maps
+                tool name (or ``"*"``) to ``"allow"``, ``"deny"``, ``"approve"``,
+                or ``{"mode": "approve_over", "field": "amount", "limit": 100}``.
+                A callable ``policy(name, arguments)`` returns the same values.
+                ``{"mode": "deny", "halt": True}`` ends the run as ``vetoed``.
+            budget (dict, optional): Hard limits ``max_model_calls``,
+                ``max_tool_calls``, ``max_tokens`` (prompt + completion).
+            checkpoint (callable, optional): ``checkpoint(memory)`` called after
+                the assistant tool_calls are written and after every tool result.
+            protocol (str): ``"native"`` (``llm.chat`` tool calls), ``"text"``
+                (JSON tool calls parsed from ``llm.call`` text), or ``"auto"``
+                (native when the llm has ``chat``, otherwise text). Governance
+                options need the native protocol.
         """
+        if protocol not in ("auto", "native", "text"):
+            raise ValueError("protocol must be 'auto', 'native', or 'text', got: {!r}".format(protocol))
+        self.allow = list(allow) if allow is not None else None
+        self.policy = policy
+        self.budget = dict(budget or {})
+        self.checkpoint = checkpoint
+        self.protocol = protocol
         self.name = name
         self.id = event_stamp()
         self.llm = llm
@@ -107,9 +135,53 @@ class AGENT:
         self.iteration_count = 0
         self._tool_map = {t.name: t for t in self.tools}
 
-    def __call__(self, memory):
+    def _governed(self):
+        """True when any governance option needs the native protocol."""
+        return bool(
+            self.allow is not None or self.policy or self.budget or self.checkpoint
+        )
+
+    def _use_native(self):
+        """Resolve ``protocol`` to a boolean for this run."""
+        if self.protocol == "native":
+            return True
+        if self.protocol == "text":
+            return False
+        if self.llm is not None and callable(getattr(self.llm, "chat", None)):
+            # ThoughtFlow's LLM has chat() for every service, but only some
+            # services support it; unknown custom objects with chat() are trusted.
+            service = getattr(self.llm, "service", None)
+            if service is None or service in CHAT_SERVICES:
+                return True
+        if self._governed():
+            raise ValueError(
+                "allow/policy/budget/checkpoint need native tool calls, but this llm has no "
+                "usable chat() (LLM.chat supports the openai, openrouter and groq services). "
+                "Use one of those or drop the governance options."
+            )
+        return False
+
+    def __call__(self, memory, decision=None):
         """
-        Run the autonomous agent loop on the given memory.
+        Run the agent loop; native tool calls when available, else text JSON.
+
+        Args:
+            memory: A MEMORY instance with the conversation so far.
+            decision (dict, optional): Resolution for a suspended run, for
+                example ``{"approve": True}``. Only used by the native protocol.
+
+        Returns:
+            MEMORY: The updated memory. ``{name}_status`` records how the run
+            ended: final, suspended, max_iterations, budget_exhausted, vetoed,
+            or error.
+        """
+        if self._use_native():
+            return self._run_native(memory, decision)
+        return self._run_text(memory)
+
+    def _run_text(self, memory):
+        """
+        Run the legacy text-protocol agent loop on the given memory.
 
         The loop:
         1. Build messages from memory (system prompt + conversation history)
@@ -166,7 +238,11 @@ class AGENT:
                             memory.add_log(msg)
                         continue
 
-                result = self._execute_tool(tool_name, arguments)
+                result = self._execute_tool(
+                    tool_name,
+                    arguments,
+                    context={"call_id": None, "memory": memory, "agent": self},
+                )
 
                 # Add the tool interaction to memory for context.
                 # Uses "action" role for the tool request and "result" role
@@ -320,7 +396,7 @@ class AGENT:
 
         return []
 
-    def _execute_tool(self, tool_name, arguments):
+    def _execute_tool(self, tool_name, arguments, context=None):
         """
         Execute a single tool by name with the given arguments.
 
@@ -340,9 +416,283 @@ class AGENT:
             return "Error: Tool '{}' not found.".format(tool_name)
 
         try:
-            return tool(arguments)
+            return tool(arguments, context=context)
         except Exception as e:
             return "Error executing tool '{}': {}".format(tool_name, str(e))
+
+    # ------------------------------------------------------------------
+    # Native tool-call protocol (write-ahead, governed, resumable)
+    # ------------------------------------------------------------------
+
+    def _run_native(self, memory, decision=None):
+        """
+        Run the native ``llm.chat`` tool loop.
+
+        Contract: the assistant message with its ``tool_calls`` is written to
+        MEMORY before any tool runs, every ``tool_call_id`` is answered (even
+        when vetoed), and pending work is derived from the transcript, so a
+        crashed or suspended run resumes exactly where it stopped.
+        """
+        state = self._load_run_state(memory)
+        self.iteration_count = 0
+        status = None
+
+        if memory.is_suspended():
+            if decision is None:
+                return self._finish(memory, "suspended", state)
+            record = memory.resolve_suspension(decision)["suspension"]
+            decision = record.get("decision") if record else decision
+
+        pending = self._unanswered_calls(memory)
+        if pending:
+            status = self._process_calls(memory, pending, decision, state)
+
+        iterations = 0
+        while status is None:
+            if iterations >= self.max_iterations:
+                status = "max_iterations"
+                memory.add_log("Agent '{}' reached max iterations ({}).".format(
+                    self.name, self.max_iterations
+                ))
+                break
+            if self._over_budget(state, "max_model_calls", "model_calls", extra=0):
+                status = "budget_exhausted"
+                break
+            iterations += 1
+            self.iteration_count = iterations
+
+            messages = self._native_messages(memory)
+            tools = [t.to_schema() for t in self.tools] or None
+            try:
+                message = self.llm.chat(messages, tools=tools)
+            except Exception as e:
+                memory.add_log("Agent '{}' model error: {}".format(self.name, e))
+                state["error"] = str(e)
+                status = "error"
+                break
+            state["model_calls"] += 1
+            self._add_usage(state, message.get("usage"))
+
+            calls = list(message.get("tool_calls") or [])
+            content = message.get("content") or ""
+            if not calls:
+                memory.add_msg("assistant", content)
+                memory.set_var(
+                    "{}_result".format(self.name), content,
+                    desc="Final response from agent: {}".format(self.name),
+                )
+                status = "final"
+                break
+
+            stamp = event_stamp()[:8]
+            for idx, call in enumerate(calls):
+                if not call.get("id"):
+                    call["id"] = "call_{}_{}".format(stamp, idx)
+            memory.add_msg("assistant", content, tool_calls=calls)
+            self._run_checkpoint(memory)
+            if self._over_budget(state, "max_tokens", "total_tokens", extra=0):
+                self._answer_remaining(memory, calls, "Error: token budget exhausted.")
+                status = "budget_exhausted"
+                break
+            status = self._process_calls(memory, self._unanswered_calls(memory), None, state)
+
+        return self._finish(memory, status, state)
+
+    def _native_messages(self, memory):
+        """System prompt plus provider-valid history for ``llm.chat``."""
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.extend(
+            memory.get_llm_msgs(format="openai", merge_augments=self.merge_augments)
+        )
+        return messages
+
+    @staticmethod
+    def _unanswered_calls(memory):
+        """Tool calls in the latest assistant tool_calls message with no tool result yet."""
+        msgs = memory.get_msgs(include=["assistant", "tool"])
+        last_idx = None
+        for i, msg in enumerate(msgs):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                last_idx = i
+        if last_idx is None:
+            return []
+        answered = {
+            m.get("tool_call_id") for m in msgs[last_idx + 1:] if m.get("role") == "tool"
+        }
+        return [tc for tc in msgs[last_idx]["tool_calls"] if tc.get("id") not in answered]
+
+    def _load_run_state(self, memory):
+        """Counters for budgets; carried over when resuming a suspended run."""
+        state = {
+            "model_calls": 0, "tool_calls": 0, "total_tokens": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "vetoed": 0, "error": None,
+        }
+        prior = memory.get_var("{}_outcome".format(self.name)) or {}
+        if prior.get("status") == "suspended":
+            for key in state:
+                if key in prior and key != "error":
+                    state[key] = prior[key]
+        return state
+
+    @staticmethod
+    def _add_usage(state, usage):
+        """Accumulate provider usage into run state."""
+        if not isinstance(usage, dict):
+            return
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        state["prompt_tokens"] += prompt
+        state["completion_tokens"] += completion
+        state["total_tokens"] += prompt + completion
+
+    def _over_budget(self, state, limit_key, counter_key, extra=0):
+        """True when ``counter + extra`` would exceed the configured limit."""
+        limit = self.budget.get(limit_key)
+        if limit is None:
+            return False
+        return state[counter_key] + extra >= limit
+
+    def _run_checkpoint(self, memory):
+        """Invoke the user checkpoint hook, never letting it break the run."""
+        if self.checkpoint is None:
+            return
+        try:
+            self.checkpoint(memory)
+        except Exception as e:
+            memory.add_log("Agent '{}' checkpoint error: {}".format(self.name, e))
+
+    def _answer_remaining(self, memory, calls, text):
+        """Give every still-unanswered call a tool message (strict providers need it)."""
+        answered = {
+            m.get("tool_call_id") for m in memory.get_msgs(include=["tool"])
+        }
+        for call in calls:
+            if call.get("id") not in answered:
+                memory.add_msg("tool", text, tool_call_id=call["id"], name=call.get("name"))
+        self._run_checkpoint(memory)
+
+    def _policy_for(self, name, arguments):
+        """Resolve the policy entry for one call into ``(mode, spec)``."""
+        entry = None
+        if callable(self.policy):
+            entry = self.policy(name, arguments)
+        elif isinstance(self.policy, dict):
+            entry = self.policy.get(name, self.policy.get("*"))
+        if entry is None:
+            return "allow", {}
+        if isinstance(entry, str):
+            return entry, {}
+        return entry.get("mode", "allow"), entry
+
+    def _needs_approval(self, mode, spec, arguments):
+        """True when the policy mode demands a human decision for these arguments."""
+        if mode == "approve":
+            return True
+        if mode == "approve_over":
+            try:
+                return float((arguments or {}).get(spec.get("field"), 0)) > float(spec.get("limit", 0))
+            except (TypeError, ValueError):
+                return True
+        return False
+
+    @staticmethod
+    def _approved(decision, call_id):
+        """Interpret a resume decision for one call id."""
+        if not isinstance(decision, dict) or "approve" not in decision:
+            return None
+        verdict = decision["approve"]
+        if isinstance(verdict, dict):
+            return verdict.get(call_id)
+        if isinstance(verdict, (list, tuple, set)):
+            return call_id in verdict
+        return bool(verdict)
+
+    def _process_calls(self, memory, calls, decision, state):
+        """
+        Answer each pending tool call; return a terminal status or ``None``.
+
+        ``None`` means every call was answered and the model should run again.
+        """
+        for idx, call in enumerate(calls):
+            call_id = call.get("id")
+            name = call.get("name", "")
+            arguments = call.get("arguments") or {}
+            if isinstance(call.get("function"), dict):
+                # Wire-format call (hand-built or imported transcript).
+                name = call["function"].get("name", "")
+                raw = call["function"].get("arguments", "")
+                try:
+                    arguments = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+                except ValueError as e:
+                    call = dict(call, arguments_error=str(e))
+
+            def answer(text):
+                memory.add_msg("tool", text, tool_call_id=call_id, name=name)
+                self._run_checkpoint(memory)
+
+            if call.get("arguments_error"):
+                answer("Error: invalid arguments for '{}': {}".format(name, call["arguments_error"]))
+                continue
+            if name not in self._tool_map or (self.allow is not None and name not in self.allow):
+                answer("Error: tool '{}' is not available.".format(name))
+                continue
+            if self.on_tool_call and self.on_tool_call(name, arguments) is False:
+                state["vetoed"] += 1
+                memory.add_log("Tool call blocked by hook: {}".format(name))
+                answer("Blocked: '{}' was not permitted by the host.".format(name))
+                continue
+
+            mode, spec = self._policy_for(name, arguments)
+            if mode == "deny":
+                state["vetoed"] += 1
+                answer("Denied: policy does not allow '{}'.".format(name))
+                if spec.get("halt"):
+                    self._answer_remaining(memory, calls[idx + 1:], "Error: run halted by policy.")
+                    return "vetoed"
+                continue
+            if self._needs_approval(mode, spec, arguments):
+                verdict = self._approved(decision, call_id)
+                if verdict is None:
+                    memory.suspend(
+                        "approval_required",
+                        pending={
+                            "call_id": call_id, "name": name, "arguments": arguments,
+                            "remaining": [c.get("id") for c in calls[idx + 1:]],
+                        },
+                    )
+                    return "suspended"
+                if not verdict:
+                    state["vetoed"] += 1
+                    answer("Denied: approver rejected '{}'.".format(name))
+                    continue
+
+            if self._over_budget(state, "max_tool_calls", "tool_calls", extra=0):
+                self._answer_remaining(memory, calls[idx:], "Error: tool budget exhausted.")
+                return "budget_exhausted"
+
+            result = self._execute_tool(
+                name, arguments,
+                context={"call_id": call_id, "memory": memory, "agent": self},
+            )
+            state["tool_calls"] += 1
+            text = result if isinstance(result, str) else json.dumps(result, default=str)
+            answer(text)
+        return None
+
+    def _finish(self, memory, status, state):
+        """Record status and outcome on MEMORY and return it."""
+        status = status or "error"
+        outcome = dict(state)
+        outcome["status"] = status
+        outcome["iterations"] = self.iteration_count
+        outcome["ok"] = status == "final"
+        memory.set_var("{}_status".format(self.name), status,
+                       desc="Run status for agent: {}".format(self.name))
+        memory.set_var("{}_outcome".format(self.name), outcome,
+                       desc="Structured outcome for agent: {}".format(self.name))
+        return memory
 
     def __str__(self):
         """Return a concise string representation."""
@@ -354,3 +704,41 @@ class AGENT:
         return "AGENT(name='{}', tools={}, max_iterations={})".format(
             self.name, tool_names, self.max_iterations
         )
+
+
+def tool_loop(
+    memory,
+    llm,
+    tools,
+    system_prompt="You are a helpful assistant.",
+    policy=None,
+    budget=None,
+    allow=None,
+    checkpoint=None,
+    decision=None,
+    name="agent",
+    max_iterations=10,
+):
+    """
+    Run a governed, write-ahead tool loop in one call.
+
+    A thin helper over ``AGENT``: build an agent with the given governance
+    options and run it on ``memory``. Pass ``decision={"approve": True}`` with a
+    rehydrated MEMORY to resume a run that suspended for approval.
+
+    Returns:
+        MEMORY: The updated memory; read ``{name}_status`` and ``{name}_outcome``.
+    """
+    agent = AGENT(
+        llm=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+        max_iterations=max_iterations,
+        name=name,
+        allow=allow,
+        policy=policy,
+        budget=budget,
+        checkpoint=checkpoint,
+        protocol="native",
+    )
+    return agent(memory, decision=decision)

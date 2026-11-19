@@ -286,6 +286,21 @@ class THOUGHT:
         self.validation_mode = kwargs.get("validation_mode", "strict")
         self.strict_schema = kwargs.get("strict_schema", False)
         self.hold_msg = kwargs.get("hold_msg", True)
+        self.instruct_schema = kwargs.get("instruct_schema", True)
+        self.record_prompt = kwargs.get("record_prompt", False)
+        visibility = kwargs.get("visibility", "public")
+        if visibility not in ("public", "internal", "silent"):
+            raise ValueError(
+                "visibility must be 'public', 'internal', or 'silent', got: {!r}".format(visibility)
+            )
+        self.visibility = visibility
+        retry = dict(kwargs.get("retry") or {})
+        retry.setdefault("on", {})
+        retry.setdefault("backoff_base", 0.5)
+        retry.setdefault("max_backoff", 8.0)
+        retry.setdefault("fallback_llm", None)
+        self.retry = retry
+        self._used_fallback_llm = False
 
         template_mode = kwargs.get("template_mode", "format")
         if template_mode not in ("format", "substitute"):
@@ -496,6 +511,35 @@ class THOUGHT:
             )
         return friendly
 
+    def _add_assistant_msg(self, memory, response, channel):
+        """Write the assistant turn unless visibility is 'internal' or 'silent'."""
+        if self.visibility != "public":
+            return
+        memory.add_msg("assistant", response, channel=channel)
+
+    def _schema_instruction(self):
+        """Return the first-attempt 'Expected format' line, or '' when not applicable."""
+        parsing_rules = self.config.get("parsing_rules")
+        if not self.instruct_schema or not parsing_rules:
+            return ""
+        schema = parsing_rules.get("format")
+        if schema is None:
+            return ""
+        return "\n\nExpected format: {}".format(format_schema_annotation(schema))
+
+    def _backoff_sleep(self, failure_count):
+        """Sleep with exponential backoff after a transport failure when enabled."""
+        import time as time_module
+
+        if self.retry["on"].get("http") != "backoff":
+            return
+        delay = min(
+            float(self.retry["max_backoff"]),
+            float(self.retry["backoff_base"]) * (2 ** max(0, failure_count - 1)),
+        )
+        if delay > 0:
+            time_module.sleep(delay)
+
     def _build_outcome(
         self,
         ok,
@@ -516,6 +560,8 @@ class THOUGHT:
             "attempts": int(attempts),
             "validation_messages": list(validation_messages or []),
         }
+        if self._used_fallback_llm:
+            outcome["used_fallback_llm"] = True
         return outcome
 
     def __call__(self, memory, vars={}, **kwargs):
@@ -547,6 +593,7 @@ class THOUGHT:
         self._last_finish_reason = None
         self._last_call_usage = None
         self._validation_messages = []
+        self._used_fallback_llm = False
         
         # Dispatch to appropriate handler based on operation type
         if operation == 'llm_call':
@@ -734,7 +781,20 @@ class THOUGHT:
         # never tries to .format() braces inside schema annotations on retry.
         pending_repair = None
 
-        while retries_left > 0:
+        primary_llm = self.llm
+        http_failures = 0
+        attempt_max_tokens = None
+        double_on_length = self.retry["on"].get("length") == "double_budget"
+
+        while True:
+            if retries_left <= 0:
+                fallback = self.retry.get("fallback_llm")
+                if fallback is not None and not self._used_fallback_llm:
+                    self._used_fallback_llm = True
+                    self.llm = fallback
+                    retries_left = 1
+                else:
+                    break
             attempts_made += 1
             self._pending_schema_error = None
             response = None
@@ -742,6 +802,13 @@ class THOUGHT:
                 # Stage 1: prompt + context — working_prompt may carry repair suffix (dict prompts)
                 self.prompt = working_prompt
                 msgs = self.build_msgs(memory, vars)
+                instruction = self._schema_instruction() if attempts_made == 1 else ""
+                if instruction and instruction.strip() not in str(self.last_prompt or ""):
+                    if msgs and msgs[-1].get("role") == "user" and isinstance(msgs[-1].get("content"), str):
+                        msgs[-1]["content"] = msgs[-1]["content"].rstrip() + instruction
+                        if isinstance(self.last_prompt, str):
+                            self.last_prompt = self.last_prompt.rstrip() + instruction
+                        self.last_msgs = msgs
                 if pending_repair and isinstance(original_prompt, str):
                     if isinstance(self.last_prompt, str) and self.last_prompt:
                         self.last_prompt = self.last_prompt.rstrip() + pending_repair
@@ -754,8 +821,10 @@ class THOUGHT:
                     self.last_msgs = msgs
 
                 # Stage 2: LLM call
-                llm_kwargs = self.config.get("llm_params", {})
+                llm_kwargs = dict(self.config.get("llm_params", {}))
                 llm_kwargs.update(kwargs)
+                if attempt_max_tokens is not None:
+                    llm_kwargs["max_tokens"] = attempt_max_tokens
                 response = self.run_llm(msgs, **llm_kwargs)
                 self.last_response = response
                 self._last_finish_reason = getattr(self.llm, "last_finish_reason", None)
@@ -797,11 +866,22 @@ class THOUGHT:
                             "Thought '{}' HTTP/provider error: {}".format(self.name, last_error)
                         )
                     retries_left -= 1
+                    http_failures += 1
+                    self._backoff_sleep(http_failures)
                     if self.retry_delay:
                         time_module.sleep(self.retry_delay)
                     continue
 
                 if self._last_finish_reason == "length":
+                    if double_on_length:
+                        base_budget = (
+                            attempt_max_tokens
+                            or llm_kwargs.get("max_tokens")
+                            or (getattr(self.llm, "default_params", None) or {}).get("max_tokens")
+                            or getattr(self.llm, "max_tokens", None)
+                            or 1024
+                        )
+                        attempt_max_tokens = int(base_budget) * 2
                     why_len = "Model output truncated at max_tokens (finish_reason='length')"
                     last_error = why_len
                     self.last_error = last_error
@@ -816,7 +896,7 @@ class THOUGHT:
                         if hasattr(memory, "add_msg") and callable(
                             getattr(memory, "add_msg", None)
                         ):
-                            memory.add_msg("assistant", response, channel=channel)
+                            self._add_assistant_msg(memory, response, channel)
                     if hasattr(memory, "add_log") and callable(
                         getattr(memory, "add_log", None)
                     ):
@@ -886,7 +966,7 @@ class THOUGHT:
                         if hasattr(memory, "add_msg") and callable(
                             getattr(memory, "add_msg", None)
                         ):
-                            memory.add_msg("assistant", response, channel=channel)
+                            self._add_assistant_msg(memory, response, channel)
                     repair_suffix = self._build_repair_suffix(last_error)
                     if isinstance(original_prompt, str):
                         pending_repair = repair_suffix
@@ -920,7 +1000,7 @@ class THOUGHT:
                     if hasattr(memory, "add_msg") and callable(
                         getattr(memory, "add_msg", None)
                     ):
-                        memory.add_msg("assistant", response, channel=channel)
+                        self._add_assistant_msg(memory, response, channel)
                     # Add reflection only when explicitly requested (default False
                     # to avoid duplicating the assistant reply on every turn, #17)
                     if self.config.get("add_reflection", False):
@@ -963,7 +1043,7 @@ class THOUGHT:
                         if hasattr(memory, "add_msg") and callable(
                             getattr(memory, "add_msg", None)
                         ):
-                            memory.add_msg("assistant", response, channel=channel)
+                            self._add_assistant_msg(memory, response, channel)
             except TemplateRenderError as e:
                 # Deterministic template/variable errors cannot heal across retries;
                 # record once and exit before sleeping or calling the LLM.
@@ -1012,6 +1092,9 @@ class THOUGHT:
                     failure_kind = "exception"
                 if failure_kind == "schema":
                     had_schema_rejection = True
+                if failure_kind == "http":
+                    http_failures += 1
+                    self._backoff_sleep(http_failures)
                 self._record_failure(
                     memory,
                     attempts_made,
@@ -1025,7 +1108,7 @@ class THOUGHT:
                         and hasattr(memory, "add_msg")
                         and callable(getattr(memory, "add_msg", None))
                     ):
-                        memory.add_msg("assistant", response, channel=channel)
+                        self._add_assistant_msg(memory, response, channel)
                 if hasattr(memory, "add_log") and callable(
                     getattr(memory, "add_log", None)
                 ):
@@ -1043,8 +1126,17 @@ class THOUGHT:
             if self.retry_delay:
                 time_module.sleep(self.retry_delay)
 
-        # Restore original prompt after execution (prevents permanent mutation)
+        # Restore original prompt and primary llm after execution
         self.prompt = original_prompt
+        self.llm = primary_llm
+
+        if self.record_prompt and self.name and result is not None and self.last_prompt is not None:
+            if hasattr(memory, "set_var") and callable(getattr(memory, "set_var", None)):
+                memory.set_var(
+                    "{}_prompt".format(self.name),
+                    self.last_prompt,
+                    desc="Rendered prompt for thought: {}".format(self.name),
+                )
 
         return result, last_error, attempts_made
 
@@ -1270,6 +1362,19 @@ class THOUGHT:
                     }
                     for event in raw_events
                 ]
+
+        # The rendered prompt already carries the latest user message when the
+        # template references {last_user_msg}; drop the history copy so the
+        # model does not see it twice.
+        referenced = self._referenced_template_vars()
+        if (
+            msgs
+            and msgs[-1].get("role") == "user"
+            and referenced is not None
+            and "last_user_msg" in referenced
+            and msgs[-1].get("content") == ctx.get("last_user_msg")
+        ):
+            msgs = msgs[:-1]
 
         msgs_out = construct_msgs(
             usr_prompt=usr_prompt,
@@ -1749,7 +1854,11 @@ class THOUGHT:
         Returns:
             dict: Serializable representation of this thought.
         """
-        clean_config = self._sanitize_for_json(self.config)
+        config = dict(self.config)
+        if isinstance(config.get("retry"), dict):
+            # LLM objects are never serialized; has_fallback_llm records the fact.
+            config["retry"] = {k: v for k, v in config["retry"].items() if k != "fallback_llm"}
+        clean_config = self._sanitize_for_json(config)
         serializable_validation = (
             self.validation
             if self.validation is not None and not callable(self.validation)
@@ -1771,6 +1880,7 @@ class THOUGHT:
             "execution_history": self.execution_history,
             # Store metadata about non-serializable items
             "llm_type": type(self.llm).__name__ if self.llm else None,
+            "has_fallback_llm": self.retry.get("fallback_llm") is not None,
             "has_parse_fn": self.parse_fn is not None,
             "has_validation": self.validation is not None,
             "has_pre_hook": self.pre_hook is not None,
@@ -1778,7 +1888,7 @@ class THOUGHT:
         }
 
     @classmethod
-    def from_dict(cls, data, llm=None, parse_fn=None, validation=None, pre_hook=None, post_hook=None):
+    def from_dict(cls, data, llm=None, parse_fn=None, validation=None, pre_hook=None, post_hook=None, fallback_llm=None):
         """
         Reconstruct a THOUGHT from a dictionary representation.
         
@@ -1790,6 +1900,8 @@ class THOUGHT:
                 declarative validation stored in ``data`` when provided).
             pre_hook: Optional pre-execution hook.
             post_hook: Optional post-execution hook.
+            fallback_llm: Optional LLM for ``retry['fallback_llm']`` (LLM objects
+                are not serialized; ``has_fallback_llm`` in the dict says one was set).
             
         Returns:
             THOUGHT: Reconstructed THOUGHT object.
@@ -1841,6 +1953,9 @@ class THOUGHT:
             **config
         )
         
+        if fallback_llm is not None:
+            thought.retry["fallback_llm"] = fallback_llm
+
         # Restore ID if provided
         if data.get("id"):
             thought.id = data["id"]
@@ -1849,6 +1964,20 @@ class THOUGHT:
         thought.execution_history = data.get("execution_history", [])
         
         return thought
+
+    def _copy_config(self):
+        """Deep-copy config, sharing (not copying) the fallback LLM object."""
+        import copy as copy_module
+
+        config = dict(self.config)
+        retry = config.pop("retry", None)
+        copied = copy_module.deepcopy(config)
+        if retry is not None:
+            fallback = retry.get("fallback_llm")
+            copied["retry"] = dict(copy_module.deepcopy(
+                {k: v for k, v in retry.items() if k != "fallback_llm"}
+            ), fallback_llm=fallback)
+        return copied
 
     def copy(self):
         """
@@ -1877,9 +2006,14 @@ class THOUGHT:
             validation=self.validation,
             pre_hook=self.pre_hook,
             post_hook=self.post_hook,
-            **copy_module.deepcopy(self.config)
+            **self._copy_config()
         )
         
+        new_thought.visibility = self.visibility
+        new_thought.instruct_schema = self.instruct_schema
+        new_thought.record_prompt = self.record_prompt
+        new_thought.retry = dict(self.retry)
+
         # Copy internal state
         new_thought.id = event_stamp()  # Generate new ID for the copy
         new_thought.execution_history = copy_module.deepcopy(self.execution_history)

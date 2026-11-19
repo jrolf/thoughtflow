@@ -74,6 +74,18 @@ parsing_rules={
 }
 ```
 
+### Schema dialect additions
+
+Inside `parsing_rules['format']`, a string that names a type is treated as that type: `"int"`, `"str"`, `"float"`, `"bool"`, `"null"`, `"list"`, `"dict"` (plus `"number"`). Join names with a pipe for a union, such as `"int|null"`. `{"enum": ["pos", "neg"]}` accepts only those literals, inline or at the top level (a bare word reply like `pos` is accepted for a top-level enum). Ordinary exemplar strings such as `"Ada"` still mean "any str". On the first attempt THOUGHT appends `Expected format: ...` to the final user message so the model sees the schema before it fails; pass `instruct_schema=False` to turn that off.
+
+### Retry policy
+
+`retry={"on": {"length": "double_budget", "http": "backoff"}, "backoff_base": 0.5, "max_backoff": 8.0, "fallback_llm": other_llm}` is opt-in. On `finish_reason == "length"` the next attempt doubles `max_tokens`; on transport errors it sleeps with exponential backoff; after retries are exhausted one final attempt runs on `fallback_llm` and `{name}_outcome` gains `"used_fallback_llm": True`. Without `retry`, behavior is unchanged.
+
+### Visibility
+
+`visibility="public"` (default) writes the assistant reply to MEMORY. `"internal"` and `"silent"` keep the result in `output_var` but skip the transcript write, so classifier or router thoughts do not leak into chat history. `record_prompt=True` stores the rendered prompt at `{name}_prompt`. When the template references `{last_user_msg}`, the history copy of that message is dropped so the model does not see it twice.
+
 ## Validation
 
 Validation is configured via the canonical `validation=` parameter (config alias `validator=`). Accepts built-in strings (`any`, `has_keys:k1,k2`, `list_min_len:N`, `summary_v1`), a callable returning `(bool, why)` or bare `bool`, or a JSON-serializable list of declarative rule dicts (`in`, `non_empty`, `range`, `regex`, `has_keys`):
