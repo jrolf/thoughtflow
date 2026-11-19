@@ -14,7 +14,7 @@ TOOL wraps a callable with metadata: name, description, and parameters. Paramete
 
 When called with an arguments dict, TOOL unpacks it as keyword arguments and invokes the wrapped function. Execution is tracked: `execution_count`, `execution_history`, `last_result`, and `last_error` are updated on each call. Unlike ACTION, TOOL does not catch exceptions; it re-raises them for the agent loop to handle.
 
-`from_action(action)` bridges ACTION to TOOL. The resulting TOOL declares `needs_context=True`, so when an agent loop calls `tool(arguments, context={'memory': memory, ...})` the ACTION's function receives that memory (it receives `None` when the tool is called directly).
+`from_action(action, description=..., parameters=..., memory=None)` bridges ACTION to TOOL, merging `action.config` defaults under runtime tool arguments. The resulting TOOL declares `needs_context=True`, so when an agent loop calls `tool(arguments, context={'memory': memory, ...})` (or `context=memory`), the ACTION's function receives that memory; when called directly without context, it falls back to the bound `memory=` if supplied (or `None`).
 
 `TOOL(..., needs_context=True)` makes `fn` receive a `context` keyword argument: AGENT passes `{'call_id', 'memory', 'agent'}`. Context never appears in the schema or in the record/replay signature, and `to_dict()` / `from_dict()` preserve the flag. TOOL supports `to_dict()` and `from_dict()` for serialization; the function itself cannot be serialized, so a function registry is required for reconstruction.
 

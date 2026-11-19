@@ -136,7 +136,7 @@ memory = agent(memory)
 
 ### PlanActAgent
 
-Plan, then execute. The LLM first generates a structured plan (a JSON list of steps, each naming a tool and its arguments), then the agent executes the steps in order. If a step fails and `replan_on_failure` is True (the default), it regenerates a plan for the remaining work, and finishes with an LLM-written summary.
+Plan, then execute. The LLM first generates a structured plan (a JSON list of steps, each naming a tool and its arguments), then the agent executes the steps in order. If a step fails structurally and `replan_on_failure` is `True` (the default), it regenerates and executes a revised plan up to `max_replans` (default `2`) times, records `{name}_status` and `{name}_outcome`, and finishes with an LLM-written summary.
 
 ```python
 from thoughtflow import PlanActAgent
