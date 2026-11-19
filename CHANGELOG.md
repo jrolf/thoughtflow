@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TOOL.record(memory)`, `tool.replay(memory, on_miss='raise')` (`ReplayTOOL`, exported), and `TOOL.replay_all(...)`: hermetic tool and MCP record/replay/splice (`on_miss='live'`) backed by `MEMORY` exchanges.
 - Declarative JSON-serializable rule lists on `THOUGHT(validation=[...])` (`in`, `non_empty`, `range`, `regex`, `has_keys`) that round-trip cleanly through `to_dict()` / `from_dict()`.
 - `MCP(..., prefix=None)` / `list_tools(prefix=None)` for multi-server tool namespacing and `list[str]` stdio argv support (`shell=False`).
+- `AGENT` native tool-call protocol with `allow`, `policy` (`allow`/`deny`/`approve`/`approve_over`), `budget`, `checkpoint`, and `protocol="auto"|"native"|"text"`: write-ahead assistant `tool_calls`, every `tool_call_id` answered, transcript-derived resume, `{name}_status` / `{name}_outcome`, and `agent(memory, decision=...)` to resume after approval. `tool_loop(...)` (exported) is a one-call helper. LLMs without `chat()` keep the text-JSON loop.
+- `TOOL(..., needs_context=True)` and `tool(arguments, context=...)`; `TOOL.from_action` now hands the ACTION the context memory.
+- `MEMORY.get_llm_msgs(budget_tokens=, pinned=, summarizer=, token_counter=)`, `MEMORY.compact(keep=, summarizer=)`, and `MEMORY.suspend` / `resolve_suspension` / `is_suspended` / `get_suspension` (idempotent resolution, JSON round trip).
+- `THOUGHT` schema dialect: type-name strings, pipe unions (`"int|null"`), `{"enum": [...]}` literals, and a first-attempt `Expected format:` line (`instruct_schema=False` to disable).
+- `THOUGHT(retry={"on": {"length": "double_budget", "http": "backoff"}, "fallback_llm": ...})` and `visibility="public"|"internal"|"silent"`, `record_prompt=True`; the history copy of the user message is dropped when the template references `{last_user_msg}`.
+- `WORKFLOW.step(ok=...)`, `branch(on="previous_status"|"previous_failed")`, `while_(...)`, persisted `{name}_log`, and suspend/resume with `workflow(memory, decision=...)`.
+- `ReflectAgent` critic sees the task (`{task}`, `{system_prompt}` placeholders), negation-safe approval, revisions synced into `MEMORY`, and a final verification recorded in `{name}_outcome`.
 
 ### Changed
 - `THOUGHT` (and `DECIDE`/`PLAN`) fail loudly before calling the LLM when `template_mode='format'` cannot render a prompt or when `required_vars` are missing, recording `failure_kind='template'`.
