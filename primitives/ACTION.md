@@ -14,7 +14,14 @@ Within the ThoughtFlow ecosystem, ACTION is the execution layer. THOUGHT and DEC
 
 An ACTION is constructed with a name, a callable `fn`, optional default `config`, and optional `result_key` (defaults to `{name}_result`). On call, `config` is merged with call-specific `kwargs`, and `fn(memory, **merged_kwargs)` is invoked. The return value is stored in memory at `result_key` and logged as a JSON event.
 
-If the function raises, the exception is caught. Error details are logged, stored in memory at `result_key`, and recorded in `execution_history`. The action does not re-raise; the caller receives the updated memory and can inspect `action.last_error` or `action.was_successful()`.
+Every run also writes out-of-band status variables on `MEMORY`:
+- `{name}_status`: `'ok'` or `'error'`
+- `{name}_error`: error string on failure, or `None` on success
+- `{name}_outcome`: structured dict (`ok`, `error`, `duration_ms`, `result_key`)
+
+ACTION detects both raised exceptions and structured verb failure dicts (`success is False`, non-empty `'error'`, or `status in ('error', 'timeout')`). Built-in information-retrieval verbs (`READ`, `FETCH`, `SEARCH`, `SCRAPE`) write a canonical `{name}_result` alias alongside their verb-specific keys (`read_content`, `fetch_response`, `search_results`, `scrape_content`). Template substitution across all built-in verbs (`actions/_substitution.py`) matches identifier placeholders (`{var}`) and unescapes doubled braces (`{{` / `}}`) while leaving literal JSON payloads untouched.
+
+If the function raises, the exception is caught. Error details are logged, stored in memory at `result_key` alongside `{name}_status='error'` / `{name}_error`, and recorded in `execution_history`. The action does not re-raise; the caller receives the updated memory and can inspect `memory.get_var("{name}_status")`, `action.last_error`, or `action.was_successful()`.
 
 `execution_count` and `execution_history` track every run: stamp, memory id, duration, success flag, and error message. `copy()` creates a new instance with a fresh id and reset stats. `to_dict`/`from_dict` support serialization (the function is represented by name; a registry is required for deserialization).
 

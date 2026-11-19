@@ -38,6 +38,7 @@ All four modes work on both `DM` and `LLM` instances (multi-question `questions=
 | `threshold` | Probability threshold for `choices=bool` / `noul` questions (default `0.5`). |
 | `min_confidence` | Optional minimum normalized concentration (`0.0..1.0`) required to accept a `DM` answer; below this threshold `DECIDE` substitutes `default` with `outcome["source"] = "low_confidence"`. |
 | `min_margin` | Optional minimum top-2 probability gap (`p_top1 - p_top2`) required to accept a `DM` answer. |
+| `abstain` | Optional explicit abstention option for categorical `choices` (`True` reserves `'none'`, or pass a custom token such as `'unsure'`). Sets `outcome['abstained'] = True` and `{name}_source = 'abstain'` when selected. |
 | `default` | Fallback value used when retries exhaust, the model refuses, or confidence/margin falls below threshold. |
 | `case_sensitive` | Case-sensitive choice matching on the `LLM` path (default `False`). |
 | `max_retries` | Maximum attempts (default `5`). On `DM` calls, only transient `429`/`5xx`/timeout errors retry; `4xx` errors and refusals finish in 1 attempt. |
@@ -45,14 +46,15 @@ All four modes work on both `DM` and `LLM` instances (multi-question `questions=
 | `visibility` | Inherited `THOUGHT` transcript visibility (`"public"` writes the decision as an assistant message so `CHAT` works seamlessly; `"internal"` / `"silent"` suppresses assistant-message writes). |
 | `record_prompt` | When `True`, records the rendered instructions (or question map) to `{name}_prompt` on both `DM` and `LLM` paths. |
 
-## Structured Outcome (`{name}_outcome`)
+## Structured Outcome (`{name}_outcome` and `{name}_source`)
 
-Every `DECIDE` run writes `{name}_outcome` extending `THOUGHT`'s standard outcome keys (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`) with decision provenance:
+Every `DECIDE` run writes `{name}_source` (`'model'`, `'abstain'`, `'low_confidence'`, `'default'`, `'refusal'`, or `'error'`) and `{name}_outcome`, extending `THOUGHT`'s standard outcome keys (`ok`, `error_class`, `error`, `finish_reason`, `usage`, `attempts`, `validation_messages`) with decision provenance:
 
 - `kind`: `'choice'`, `'noul'`, `'score'`, or `'multi'`
 - `value`: Final stored result (after any `default` fallback)
 - `raw_value`: Model's un-gated selection before `min_confidence` / `min_margin`
-- `source`: `'model'`, `'low_confidence'`, `'default'`, `'refusal'`, or `'error'`
+- `source`: `'model'`, `'abstain'`, `'low_confidence'`, `'default'`, `'refusal'`, or `'error'`
+- `abstained`: `True` when the model selected the configured `abstain` option, else `False`
 - `probability`: Winning option probability or $P(\text{true})$ (`DM` path)
 - `probabilities`: Full discrete probability map (`DM` path)
 - `confidence`: Cross-vendor normalized concentration in `[0.0, 1.0]` (`DM` path)

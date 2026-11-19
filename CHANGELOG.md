@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-19
+
+Ergonomics, evaluation, serverless state, and orchestration release: adds `LLM.cassette` and thread-safe token/cost ledgers, multi-trial `Harness` baselines and comparisons, `MEMORY` belief upserts, prefix/stamp queries, slim snapshots, and branch merges, `DECIDE` explicit abstention and provenance, `THOUGHT(output_schema=, reasoning=)` and `.run()`, decoupled `run_plan` and `map_thought` combinators, bounded `PlanActAgent` replanning, and structured `ACTION` / `DELEGATE` outcome envelopes.
+
 ### Added
 - `LLM.cassette(path, live=..., on_miss='raise', model_id=None)`: record-if-missing, else deterministic offline replay helper with atomic disk flushes (`save_cassette` and context-manager support).
 - `ReplayLLM` automatic adoption of recorded constructor `default_params` and `ReplayLLM.misses` inspection list for unmatched requests.
@@ -291,7 +295,8 @@ grown from MEMORY itself, with zero new concepts.
 ---
 
 <!-- Release links -->
-[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jrolf/thoughtflow/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/jrolf/thoughtflow/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jrolf/thoughtflow/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/jrolf/thoughtflow/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/jrolf/thoughtflow/compare/v0.2.3...v0.2.4

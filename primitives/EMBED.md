@@ -67,7 +67,7 @@ assert replayed.call("Hello") == vector   # offline, deterministic
 
 ## Relationship to Other Primitives
 
-EMBED is a sibling to LLM. It does not depend on MEMORY, THOUGHT, or ACTION. Higher-level primitives (semantic memory, retrieval layers, similarity routing) can use EMBED as a building block. AGENT and WORKFLOW may eventually consume embeddings for context selection or RAG, but EMBED itself remains a standalone primitive.
+EMBED is a sibling to LLM. It does not depend on MEMORY, THOUGHT, or ACTION. `thoughtflow.embed` also provides pure-Python `cosine_similarity(vec_a, vec_b)` and `cosine_retrieve(query_vec, items, key='embedding', top_k=5, min_score=None)` helpers for lightweight retrieval without NumPy. Higher-level primitives (semantic memory, retrieval layers, similarity routing) can use EMBED as a building block. AGENT and WORKFLOW may eventually consume embeddings for context selection or RAG, but EMBED itself remains a standalone primitive.
 
 ## Considerations for Future Development
 

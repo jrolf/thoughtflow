@@ -88,7 +88,7 @@ search_tool = TOOL.from_action(
 )
 ```
 
-`TOOL.from_action()` marks the resulting `TOOL` with `needs_context=True`. When an `AGENT` loop invokes the tool (`tool(arguments, context={"call_id": ..., "memory": memory, "agent": agent})`), the underlying `ACTION` function automatically receives the live `MEMORY` as its first argument (`None` when invoked directly without context).
+`TOOL.from_action(..., memory=None)` merges `action.config` defaults under runtime arguments and marks the resulting `TOOL` with `needs_context=True`. When an `AGENT` loop invokes the tool (`tool(arguments, context={"call_id": ..., "memory": memory, "agent": agent})` or `context=memory`), the underlying `ACTION` function automatically receives the live `MEMORY` as its first argument (falling back to the bound `memory=` or `None` when invoked directly without context).
 
 You can also set `needs_context=True` directly on any `TOOL(..., needs_context=True)` so your function receives `context={"call_id", "memory", "agent"}` as a keyword argument without exposing `context` in `tool.to_schema()` or in replay keys.
 

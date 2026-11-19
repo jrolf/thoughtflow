@@ -16,7 +16,11 @@ PLAN builds a prompt by appending a formatted list of available actions (with de
 
 `parse_response` extracts JSON from the LLM output, handling markdown code blocks and stray text. Subclasses may override `normalize_plan(parsed)` to apply deterministic repairs before validation (unwrap string plans, lift params, etc.). The normalized value is what THOUGHT validates, assigns to `last_result`, returns from the retry loop, and stores in MEMORY. `validate()` still normalizes once for direct callers via the shared internal path. `validate` checks: the result is a list, step count does not exceed `max_steps`, task count per step does not exceed `max_parallel`, each task has a valid `action` from the actions dict, all missing required params are reported together when schemas exist, and `reason` is a non-empty string without newlines.
 
-On validation failure, PLAN appends a repair suffix and retries (default `max_retries` 3). Repair text is humanized (no raw JSONPath or `NoneType` noise) via the shared THOUGHT repair helpers. The result is stored at `{name}_result`. Tasks can reference previous step results via `{step_N_result}` in parameter values.
+On validation failure, PLAN appends a repair suffix and retries (default `max_retries` 3). Repair text is humanized (no raw JSONPath or `NoneType` noise) via the shared THOUGHT repair helpers. The result is stored at `{name}_result`. Tasks can reference previous step results via `$step_N_result` or `$step_N.field` (avoiding JSON brace collision; legacy `{step_N_result}` also remains supported).
+
+### Executing a plan with `run_plan`
+
+ThoughtFlow provides a decoupled `run_plan(plan, memory, actions, on_error='stop', parallel_inner=False, max_workers=None)` combinator (exported at `thoughtflow.run_plan` and `thoughtflow.thoughts.run_plan`) that walks a validated `PLAN` output against a dict of `ACTION` instances or `fn(memory, **params)` callables, resolves `$step_N_result`, `$step_N.field`, `$step_N_M_result`, and `{step_N_result}` references across nested parameter dicts/lists, merges isolated parallel `ACTION` branch state back onto `memory` when `parallel_inner=True`, and records `step_{N}_result` plus `plan_receipts` on `MEMORY`.
 
 ### `normalize_plan()` hook
 
@@ -107,7 +111,7 @@ memory.set_var("goal", "Research and summarize ThoughtFlow")
 memory.set_var("context", "Focus on API design")
 memory = planner(memory)
 plan = memory.get_var("workflow_result")
-# Tasks can use {step_0_result} in params to reference previous step output
+# Tasks can use $step_0_result or $step_0.field in params, then execute via run_plan(plan, memory, actions)
 ```
 
 ```python
